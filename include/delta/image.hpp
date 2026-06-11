@@ -37,6 +37,11 @@ public:
   T* data() { return data_.data(); }
   const T* data() const { return data_.data(); }
 
+  // Underlying contiguous buffer (row-major). Exposed so callers can move it
+  // out, e.g. into a zero-copy NumPy array at the Python boundary.
+  std::vector<T>& pixels() { return data_; }
+  const std::vector<T>& pixels() const { return data_; }
+
   T& operator()(std::size_t x, std::size_t y) { return data_[y * width_ + x]; }
   const T& operator()(std::size_t x, std::size_t y) const {
     return data_[y * width_ + x];

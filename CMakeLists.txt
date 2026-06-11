@@ -27,20 +27,23 @@ find_package(nanobind CONFIG REQUIRED)
 # ---------------------------------------------------------------------------
 # Core numeric / IO dependencies
 #   Eigen, CFITSIO and FFTW are resolved via pkg-config (robust across versions).
-#   CFITSIO/FFTW are wired now but only exercised from later milestones (M5/M7).
+#   FFTW is wired now but only exercised from a later milestone (M7).
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(EIGEN REQUIRED IMPORTED_TARGET eigen3)
-pkg_check_modules(CFITSIO IMPORTED_TARGET cfitsio)
+pkg_check_modules(CFITSIO REQUIRED IMPORTED_TARGET cfitsio)
 pkg_check_modules(FFTWF IMPORTED_TARGET fftw3f)
 find_package(OpenMP)
 
 # ---------------------------------------------------------------------------
 # Python extension module
 # ---------------------------------------------------------------------------
-nanobind_add_module(_core src/bindings.cpp)
+nanobind_add_module(_core
+  src/bindings.cpp
+  src/io.cpp
+)
 target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(_core PRIVATE PkgConfig::EIGEN)
+target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(_core PRIVATE OpenMP::OpenMP_CXX)
 endif()

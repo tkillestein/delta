@@ -1,3 +1,4 @@
+#include <nanobind/eigen/dense.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
@@ -15,6 +16,7 @@
 #include "delta/detect.hpp"
 #include "delta/image.hpp"
 #include "delta/io.hpp"
+#include "delta/spatial.hpp"
 #include "delta/version.hpp"
 
 namespace nb = nanobind;
@@ -293,6 +295,29 @@ nb::dict select_stamps(InArray<float> science, InArray<float> reference,
   return out;
 }
 
+// ---- spatial (thin-plate regression spline) --------------------------------
+
+Eigen::MatrixXd tps_design(const Eigen::MatrixXd& knots,
+                           const Eigen::MatrixXd& points) {
+  return delta::ThinPlateBasis(knots).design(points);
+}
+
+Eigen::MatrixXd tps_penalty(const Eigen::MatrixXd& knots) {
+  return delta::ThinPlateBasis(knots).penalty();
+}
+
+Eigen::VectorXd tps_fit(const Eigen::MatrixXd& knots,
+                        const Eigen::MatrixXd& points,
+                        const Eigen::VectorXd& values, double lam) {
+  return delta::tps_fit(delta::ThinPlateBasis(knots), points, values, lam);
+}
+
+Eigen::VectorXd tps_evaluate(const Eigen::MatrixXd& knots,
+                             const Eigen::MatrixXd& points,
+                             const Eigen::VectorXd& coeffs) {
+  return delta::ThinPlateBasis(knots).design(points) * coeffs;
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -332,4 +357,15 @@ NB_MODULE(_core, m) {
         "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
         "Select matched stamps across both images and the convolution "
         "direction.");
+
+  m.def("grid_knots", &delta::grid_knots, "x0"_a, "y0"_a, "x1"_a, "y1"_a,
+        "nx"_a, "ny"_a, "Regular nx*ny grid of knots over [x0,x1]x[y0,y1].");
+  m.def("tps_design", &tps_design, "knots"_a, "points"_a,
+        "Thin-plate regression-spline design matrix (m, n_basis).");
+  m.def("tps_penalty", &tps_penalty, "knots"_a,
+        "Thin-plate bending-energy penalty matrix (n_basis, n_basis).");
+  m.def("tps_fit", &tps_fit, "knots"_a, "points"_a, "values"_a, "lam"_a,
+        "Unweighted penalised fit: (D^T D + lam P) theta = D^T values.");
+  m.def("tps_evaluate", &tps_evaluate, "knots"_a, "points"_a, "coeffs"_a,
+        "Evaluate a fitted TPS field at points: design(points) @ coeffs.");
 }

@@ -95,3 +95,27 @@ def select_stamps(
     border: int = ...,
 ) -> StampSelection:
     """Select matched stamps across both images and the convolution direction."""
+
+def grid_knots(x0: float, y0: float, x1: float, y1: float, nx: int, ny: int) -> NDArray[np.float64]:
+    """Regular nx*ny grid of knots over [x0,x1]x[y0,y1], shape (nx*ny, 2)."""
+
+def tps_design(knots: NDArray[np.float64], points: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Thin-plate regression-spline design matrix, shape (m, n_basis)."""
+
+def tps_penalty(knots: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Thin-plate bending-energy penalty, shape (n_basis, n_basis)."""
+
+def tps_fit(
+    knots: NDArray[np.float64],
+    points: NDArray[np.float64],
+    values: NDArray[np.float64],
+    lam: float,
+) -> NDArray[np.float64]:
+    """Unweighted penalised fit: (D^T D + lam P) theta = D^T values."""
+
+def tps_evaluate(
+    knots: NDArray[np.float64],
+    points: NDArray[np.float64],
+    coeffs: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate a fitted TPS field at points: design(points) @ coeffs."""

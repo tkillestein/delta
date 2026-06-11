@@ -39,6 +39,16 @@ uv run ruff check # lint
 uv run ty check  # type-check
 ```
 
+### Git hooks
+
+A pre-commit hook (`.githooks/pre-commit`) auto-runs `ruff check --fix`,
+`ruff format`, and `ty check --fix` on staged Python, and blocks the commit on
+any remaining lint/type errors. Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).

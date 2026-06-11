@@ -41,6 +41,8 @@ find_package(OpenMP)
 nanobind_add_module(_core
   src/bindings.cpp
   src/io.cpp
+  src/basis.cpp
+  src/convolve.cpp
 )
 target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO)

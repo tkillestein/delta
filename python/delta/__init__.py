@@ -6,6 +6,22 @@ PSF-matching algorithm. See ``docs/SPEC.md`` for the design.
 
 from __future__ import annotations
 
-from ._core import __version__, read_fits, weighted_mean, write_fits
+from ._core import (
+    __version__,
+    basis_convolve,
+    gauss_hermite_basis1d,
+    gauss_hermite_kernels,
+    read_fits,
+    weighted_mean,
+    write_fits,
+)
 
-__all__ = ["__version__", "read_fits", "weighted_mean", "write_fits"]
+__all__ = [
+    "__version__",
+    "basis_convolve",
+    "gauss_hermite_basis1d",
+    "gauss_hermite_kernels",
+    "read_fits",
+    "weighted_mean",
+    "write_fits",
+]

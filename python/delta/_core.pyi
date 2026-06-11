@@ -33,3 +33,18 @@ def write_fits(
     mask: NDArray[np.uint8] | None = ...,
 ) -> None:
     """Write data plus optional variance/mask layers to a FITS file."""
+
+def gauss_hermite_basis1d(
+    beta: float, n_max: int, radius: int = ...
+) -> NDArray[np.float64]:
+    """1-D sampled Gauss-Hermite basis functions, shape (n_max+1, ksize)."""
+
+def gauss_hermite_kernels(
+    beta: float, n_max: int, radius: int = ...
+) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+    """(orders, kernels) for the 2-D Gauss-Hermite components."""
+
+def basis_convolve(
+    image: NDArray[np.float32], beta: float, n_max: int, radius: int = ...
+) -> NDArray[np.float32]:
+    """Convolve image with each basis component; returns (ncomp, H, W)."""

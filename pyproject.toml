@@ -1,0 +1,40 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "delta"
+version = "0.0.1"
+description = "High-performance astronomical difference imaging (modern Alard & Lupton)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Tom Killestein", email = "thomas.killestein@gmail.com" }]
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+astropy = ["astropy>=5"]
+
+[dependency-groups]
+dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["python/delta"]
+cmake.build-type = "Release"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ty.environment]
+python-version = "3.10"
+root = ["python"]

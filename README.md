@@ -29,11 +29,14 @@ See [`docs/SPEC.md`](docs/SPEC.md) for the full design and roadmap.
 ## Building
 
 Requires a C++20 compiler, CMake ≥ 3.18, and CFITSIO, Eigen, and FFTW
-(via `pkg-config`).
+(via `pkg-config`). The Python dev stack uses [uv](https://docs.astral.sh/uv/),
+[ruff](https://docs.astral.sh/ruff/), and [ty](https://github.com/astral-sh/ty).
 
 ```sh
-pip install -e .          # build the C++ core and install the Python package
-pytest                    # run the smoke tests
+uv sync          # create the venv, build the C++ core, install dev tools
+uv run pytest    # run the smoke tests
+uv run ruff check # lint
+uv run ty check  # type-check
 ```
 
 ## License

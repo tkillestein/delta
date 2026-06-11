@@ -1,0 +1,23 @@
+# Build artifacts
+/build/
+/_skbuild/
+/dist/
+/wheelhouse/
+*.egg-info/
+*.so
+*.dylib
+*.pyd
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+compile_commands.json

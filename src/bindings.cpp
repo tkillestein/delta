@@ -12,6 +12,7 @@
 
 #include "delta/basis.hpp"
 #include "delta/convolve.hpp"
+#include "delta/detect.hpp"
 #include "delta/image.hpp"
 #include "delta/io.hpp"
 #include "delta/version.hpp"
@@ -24,6 +25,39 @@ namespace {
 template <typename T>
 using InArray =
     nb::ndarray<const T, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+
+template <typename T>
+using InArray1D =
+    nb::ndarray<const T, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+
+// Build an ImageF from a 2-D float array and an optional bad-pixel mask.
+delta::ImageF make_image(InArray<float> data,
+                         std::optional<InArray<std::uint8_t>> mask) {
+  const std::size_t h = data.shape(0);
+  const std::size_t w = data.shape(1);
+  delta::ImageF img(w, h);
+  std::copy(data.data(), data.data() + h * w, img.pixels().begin());
+  if (mask) {
+    if (mask->shape(0) != h || mask->shape(1) != w)
+      throw std::runtime_error("mask shape does not match data");
+    img.allocate_mask();
+    std::copy(mask->data(), mask->data() + h * w, img.mask().begin());
+  }
+  return img;
+}
+
+delta::DetectParams make_params(int stamp_radius, double threshold_sigma,
+                                int max_stamps, double saturation,
+                                int isolation_radius, int border) {
+  delta::DetectParams p;
+  p.stamp_radius = stamp_radius;
+  p.threshold_sigma = threshold_sigma;
+  p.max_stamps = max_stamps;
+  p.saturation = saturation;
+  p.isolation_radius = isolation_radius;
+  p.border = border;
+  return p;
+}
 
 // Move a std::vector into a NumPy array that owns the buffer (zero copy).
 template <typename T>
@@ -173,6 +207,92 @@ nb::ndarray<nb::numpy, float> basis_convolve(InArray<float> image, double beta,
   return to_numpy<float>(std::move(flat), {nc, h, w});
 }
 
+// ---- detect ----------------------------------------------------------------
+
+// Robust (median, MAD-sigma) background over unmasked pixels.
+nb::object estimate_background(InArray<float> data,
+                               std::optional<InArray<std::uint8_t>> mask) {
+  const delta::ImageF img = make_image(data, mask);
+  const delta::BackgroundStats bg = delta::estimate_background(img);
+  return nb::make_tuple(bg.median, bg.sigma);
+}
+
+// Detect stamps -> {'x','y','flux','snr','fwhm'} arrays.
+nb::dict detect_stamps(InArray<float> data,
+                       std::optional<InArray<std::uint8_t>> mask,
+                       int stamp_radius, double threshold_sigma, int max_stamps,
+                       double saturation, int isolation_radius, int border) {
+  const delta::ImageF img = make_image(data, mask);
+  const delta::DetectParams p = make_params(stamp_radius, threshold_sigma,
+                                            max_stamps, saturation,
+                                            isolation_radius, border);
+  const std::vector<delta::Stamp> stamps = delta::detect_stamps(img, p);
+  const std::size_t n = stamps.size();
+
+  std::vector<std::int32_t> xs, ys;
+  std::vector<double> flux, snr, fwhm;
+  xs.reserve(n);
+  ys.reserve(n);
+  flux.reserve(n);
+  snr.reserve(n);
+  fwhm.reserve(n);
+  for (const delta::Stamp& s : stamps) {
+    xs.push_back(s.x);
+    ys.push_back(s.y);
+    flux.push_back(s.flux);
+    snr.push_back(s.snr);
+    fwhm.push_back(s.fwhm);
+  }
+
+  nb::dict out;
+  out["x"] = to_numpy<std::int32_t>(std::move(xs), {n});
+  out["y"] = to_numpy<std::int32_t>(std::move(ys), {n});
+  out["flux"] = to_numpy<double>(std::move(flux), {n});
+  out["snr"] = to_numpy<double>(std::move(snr), {n});
+  out["fwhm"] = to_numpy<double>(std::move(fwhm), {n});
+  return out;
+}
+
+// Select matched stamps across both images (detection or supplied catalog) and
+// the resulting convolution direction.
+nb::dict select_stamps(InArray<float> science, InArray<float> reference,
+                       std::optional<InArray<std::uint8_t>> science_mask,
+                       std::optional<InArray<std::uint8_t>> reference_mask,
+                       std::optional<InArray1D<std::int32_t>> catalog_x,
+                       std::optional<InArray1D<std::int32_t>> catalog_y,
+                       int stamp_radius, double threshold_sigma, int max_stamps,
+                       double saturation, int isolation_radius, int border) {
+  const delta::ImageF sci = make_image(science, science_mask);
+  const delta::ImageF ref = make_image(reference, reference_mask);
+  const delta::DetectParams p = make_params(stamp_radius, threshold_sigma,
+                                            max_stamps, saturation,
+                                            isolation_radius, border);
+
+  delta::StampSelection sel;
+  if (catalog_x && catalog_y) {
+    const std::vector<int> xs(catalog_x->data(),
+                              catalog_x->data() + catalog_x->size());
+    const std::vector<int> ys(catalog_y->data(),
+                              catalog_y->data() + catalog_y->size());
+    sel = delta::select_stamps_from_catalog(sci, ref, xs, ys, p);
+  } else {
+    sel = delta::select_stamps(sci, ref, p);
+  }
+
+  const std::size_t n = sel.x.size();
+  nb::dict out;
+  out["x"] = to_numpy<std::int32_t>(
+      std::vector<std::int32_t>(sel.x.begin(), sel.x.end()), {n});
+  out["y"] = to_numpy<std::int32_t>(
+      std::vector<std::int32_t>(sel.y.begin(), sel.y.end()), {n});
+  out["fwhm_science"] = to_numpy<double>(std::move(sel.fwhm_science), {n});
+  out["fwhm_reference"] = to_numpy<double>(std::move(sel.fwhm_reference), {n});
+  out["median_fwhm_science"] = sel.median_fwhm_science;
+  out["median_fwhm_reference"] = sel.median_fwhm_reference;
+  out["direction"] = delta::to_string(sel.direction);
+  return out;
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -197,4 +317,19 @@ NB_MODULE(_core, m) {
   m.def("basis_convolve", &basis_convolve, "image"_a, "beta"_a, "n_max"_a,
         "radius"_a = 0,
         "Convolve image with each basis component; returns (ncomp, H, W).");
+
+  m.def("estimate_background", &estimate_background, "data"_a,
+        "mask"_a = nb::none(),
+        "Robust (median, MAD-sigma) background over unmasked pixels.");
+  m.def("detect_stamps", &detect_stamps, "data"_a, "mask"_a = nb::none(),
+        "stamp_radius"_a = 15, "threshold_sigma"_a = 5.0, "max_stamps"_a = 200,
+        "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
+        "Detect bright, isolated, unsaturated point-source stamps.");
+  m.def("select_stamps", &select_stamps, "science"_a, "reference"_a,
+        "science_mask"_a = nb::none(), "reference_mask"_a = nb::none(),
+        "catalog_x"_a = nb::none(), "catalog_y"_a = nb::none(),
+        "stamp_radius"_a = 15, "threshold_sigma"_a = 5.0, "max_stamps"_a = 200,
+        "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
+        "Select matched stamps across both images and the convolution "
+        "direction.");
 }

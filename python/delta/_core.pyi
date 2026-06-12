@@ -23,6 +23,21 @@ class DetectedStamps(TypedDict):
     snr: NDArray[np.float64]
     fwhm: NDArray[np.float64]
 
+GlsResult = TypedDict(
+    "GlsResult",
+    {
+        "theta": NDArray[np.float64],
+        "n_components": int,
+        "n_spatial": int,
+        "lambda": float,
+        "gcv": float,
+        "effective_dof": float,
+        "rss": float,
+        "lambda_grid": NDArray[np.float64],
+        "gcv_curve": NDArray[np.float64],
+    },
+)
+
 class StampSelection(TypedDict):
     x: NDArray[np.int32]
     y: NDArray[np.int32]
@@ -119,3 +134,23 @@ def tps_evaluate(
     coeffs: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Evaluate a fitted TPS field at points: design(points) @ coeffs."""
+
+def solve_gls(
+    knots: NDArray[np.float64],
+    points: NDArray[np.float64],
+    target: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    bn: NDArray[np.float64],
+    lam: float,
+) -> GlsResult:
+    """Penalised GLS at fixed lambda over the factorized A&L model."""
+
+def solve_gls_gcv(
+    knots: NDArray[np.float64],
+    points: NDArray[np.float64],
+    target: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    bn: NDArray[np.float64],
+    lambda_grid: NDArray[np.float64],
+) -> GlsResult:
+    """Penalised GLS selecting lambda by GCV over lambda_grid."""

@@ -45,6 +45,7 @@ nanobind_add_module(_core
   src/convolve.cpp
   src/detect.cpp
   src/spatial.cpp
+  src/solve.cpp
 )
 target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO)

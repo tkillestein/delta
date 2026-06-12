@@ -16,6 +16,7 @@
 #include "delta/detect.hpp"
 #include "delta/image.hpp"
 #include "delta/io.hpp"
+#include "delta/solve.hpp"
 #include "delta/spatial.hpp"
 #include "delta/version.hpp"
 
@@ -318,6 +319,51 @@ Eigen::VectorXd tps_evaluate(const Eigen::MatrixXd& knots,
   return delta::ThinPlateBasis(knots).design(points) * coeffs;
 }
 
+// ---- solve (penalised GLS + GCV) -------------------------------------------
+
+// Pack a GlsResult into a Python dict. The GCV-curve fields are only filled by
+// the GCV search; for a fixed-lambda solve they come back empty.
+nb::dict gls_result_to_dict(const delta::GlsResult& r) {
+  nb::dict out;
+  out["theta"] = Eigen::VectorXd(r.theta);
+  out["n_components"] = r.n_components;
+  out["n_spatial"] = r.n_spatial;
+  out["lambda"] = r.lambda;
+  out["gcv"] = r.gcv;
+  out["effective_dof"] = r.effective_dof;
+  out["rss"] = r.rss;
+  out["lambda_grid"] = to_numpy<double>(
+      std::vector<double>(r.lambda_grid), {r.lambda_grid.size()});
+  out["gcv_curve"] =
+      to_numpy<double>(std::vector<double>(r.gcv_curve), {r.gcv_curve.size()});
+  return out;
+}
+
+// Penalised GLS at a fixed smoothing lambda. `bn` is the per-pixel
+// basis-convolved template stack (N, nc); see delta::solve_gls.
+nb::dict solve_gls(const Eigen::MatrixXd& knots, const Eigen::MatrixXd& points,
+                   const Eigen::VectorXd& target,
+                   const Eigen::VectorXd& weights, const Eigen::MatrixXd& bn,
+                   double lam) {
+  const delta::ThinPlateBasis basis(knots);
+  return gls_result_to_dict(
+      delta::solve_gls(points, target, weights, bn, basis, lam));
+}
+
+// Penalised GLS selecting lambda by GCV over `lambda_grid`.
+nb::dict solve_gls_gcv(const Eigen::MatrixXd& knots,
+                       const Eigen::MatrixXd& points,
+                       const Eigen::VectorXd& target,
+                       const Eigen::VectorXd& weights,
+                       const Eigen::MatrixXd& bn,
+                       const Eigen::VectorXd& lambda_grid) {
+  const delta::ThinPlateBasis basis(knots);
+  const std::vector<double> grid(lambda_grid.data(),
+                                 lambda_grid.data() + lambda_grid.size());
+  return gls_result_to_dict(
+      delta::solve_gls_gcv(points, target, weights, bn, basis, grid));
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -368,4 +414,11 @@ NB_MODULE(_core, m) {
         "Unweighted penalised fit: (D^T D + lam P) theta = D^T values.");
   m.def("tps_evaluate", &tps_evaluate, "knots"_a, "points"_a, "coeffs"_a,
         "Evaluate a fitted TPS field at points: design(points) @ coeffs.");
+
+  m.def("solve_gls", &solve_gls, "knots"_a, "points"_a, "target"_a, "weights"_a,
+        "bn"_a, "lam"_a,
+        "Penalised GLS at fixed lambda over the factorized A&L model.");
+  m.def("solve_gls_gcv", &solve_gls_gcv, "knots"_a, "points"_a, "target"_a,
+        "weights"_a, "bn"_a, "lambda_grid"_a,
+        "Penalised GLS selecting lambda by GCV over lambda_grid.");
 }

@@ -19,6 +19,9 @@ __pycache__/
 # Test visual previews
 /tests/artifacts/
 
+# Benchmark / validation figures
+/artifacts/
+
 # Editors / OS
 .vscode/
 .idea/

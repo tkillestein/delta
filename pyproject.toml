@@ -14,9 +14,10 @@ dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
 astropy = ["astropy>=5"]
+benchmarks = ["astropy>=5", "matplotlib>=3.6"]
 
 [dependency-groups]
-dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1", "astropy>=5", "pillow>=10"]
+dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1", "astropy>=5", "pillow>=10", "matplotlib>=3.6"]
 
 [tool.scikit-build]
 minimum-version = "0.10"

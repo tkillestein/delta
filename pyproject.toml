@@ -16,7 +16,7 @@ dependencies = ["numpy>=1.23"]
 astropy = ["astropy>=5"]
 
 [dependency-groups]
-dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1", "astropy>=5"]
+dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1", "astropy>=5", "pillow>=10"]
 
 [tool.scikit-build]
 minimum-version = "0.10"
@@ -26,6 +26,7 @@ cmake.build-type = "Release"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
@@ -38,3 +39,4 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.ty.environment]
 python-version = "3.10"
 root = ["python"]
+extra-paths = ["."]

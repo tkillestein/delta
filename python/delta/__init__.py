@@ -6,6 +6,7 @@ PSF-matching algorithm. See ``docs/SPEC.md`` for the design.
 
 from __future__ import annotations
 
+from . import validation
 from ._core import (
     __version__,
     basis_convolve,
@@ -67,6 +68,7 @@ __all__ = [
     "tps_evaluate",
     "tps_fit",
     "tps_penalty",
+    "validation",
     "weighted_mean",
     "write_fits",
 ]

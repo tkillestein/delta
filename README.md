@@ -22,9 +22,31 @@ Python bindings.
   match-filtered S/N score image.
 - **Modern engineering**: multicore + SIMD, NumPy/astropy interop.
 
-See [`docs/SPEC.md`](docs/SPEC.md) for the full design and roadmap.
+See [`docs/SPEC.md`](docs/SPEC.md) for the full design and roadmap, and
+[`docs/USAGE.md`](docs/USAGE.md) for the user guide.
 
-> **Status:** early development (M0 scaffold). APIs are unstable.
+> **Status:** end-to-end pipeline working (kernel solve → spatially-varying
+> subtraction → variance/mask propagation → noise decorrelation → match-filtered
+> score), with astropy interop. APIs may still change.
+
+## Quickstart
+
+```python
+import delta
+
+result = delta.subtract(
+    science, reference,          # numpy arrays or astropy CCDData / HDU
+    gain=1.5, read_noise=4.0,    # or pass science_var / reference_var
+    decorrelate=True, score=True,
+)
+result.difference   # PSF-matched difference (transients positive)
+result.score        # match-filtered S/N detection map
+result.write("diff.fits")
+```
+
+The convolution direction is auto-selected from the measured seeing and the
+smoothing parameter is chosen by GCV — no per-field tuning. See
+[`docs/USAGE.md`](docs/USAGE.md).
 
 ## Building
 

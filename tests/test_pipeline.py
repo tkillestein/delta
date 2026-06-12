@@ -39,9 +39,10 @@ def _window_max(img, xy, r=8):
     return img[y - r : y + r + 1, x - r : x + r + 1].max()
 
 
-def test_subtract_removes_statics_keeps_transient_reference_sharper():
+def test_subtract_removes_statics_keeps_transient_reference_sharper(preview):
     ref, sci, amp_t = _pair(sig_ref=1.6, sig_sci=2.4)
     res = delta.subtract(sci, ref, gain=1.5, read_noise=4.0, n_knots=4, stamp_radius=12)
+    preview("pipeline_reference_sharper", science=sci, reference=ref, difference=res.difference)
 
     assert isinstance(res, delta.DiffResult)
     # Reference is sharper -> it is the convolved image.
@@ -55,11 +56,12 @@ def test_subtract_removes_statics_keeps_transient_reference_sharper():
     assert transient_peak > 0.4 * amp_t
 
 
-def test_direction_flips_when_science_sharper():
+def test_direction_flips_when_science_sharper(preview):
     # Swap seeings: science sharper -> it is convolved, sign handled so the
     # transient still comes out positive.
     ref, sci, amp_t = _pair(sig_ref=2.4, sig_sci=1.6, transient_xy=(140, 60), seed=1)
     res = delta.subtract(sci, ref, gain=1.5, read_noise=4.0, n_knots=4, stamp_radius=12)
+    preview("pipeline_science_sharper", science=sci, reference=ref, difference=res.difference)
 
     assert res.solution.direction == "science"
     assert _window_max(res.difference, (140, 60)) > 0.4 * amp_t
@@ -76,7 +78,7 @@ def test_variance_and_mask_propagate():
     assert res.mask[100, 100] & 1  # science bad pixel propagated
 
 
-def test_decorrelate_and_score_paths_run():
+def test_decorrelate_and_score_paths_run(preview):
     ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
     res = delta.subtract(
         sci,
@@ -88,6 +90,13 @@ def test_decorrelate_and_score_paths_run():
         decorrelate=True,
         score=True,
         block=64,
+    )
+    preview(
+        "pipeline_decorrelate_score",
+        science=sci,
+        reference=ref,
+        difference=res.difference,
+        score=res.score,
     )
     assert res.score is not None and res.score.shape == sci.shape
     assert np.all(np.isfinite(res.difference))

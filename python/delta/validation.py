@@ -26,9 +26,82 @@ def gaussian_psf(
 def inject(image, positions, fluxes, sigma) -> NDArray:
     """Return a copy of `image` with Gaussian sources added at `positions`."""
     out = np.array(image, dtype=np.float64, copy=True)
-    for (x, y), f in zip(positions, fluxes, strict=True):
-        out += gaussian_psf(out.shape, x, y, f, sigma)
+    out += render_stars(out.shape, positions, fluxes, sigma)
     return out.astype(image.dtype, copy=False)
+
+
+def render_stars(shape, positions, fluxes, sigma, radius: int | None = None) -> NDArray[np.float64]:
+    """Render Gaussian point sources onto a blank frame.
+
+    Each source is drawn only within a local box (``radius`` ~ ``5*sigma`` by
+    default), so this stays cheap on survey-scale frames where a full-frame mgrid
+    per star would be prohibitive. Positions may be sub-pixel.
+    """
+    h, w = shape
+    out = np.zeros((h, w), dtype=np.float64)
+    if radius is None:
+        radius = int(np.ceil(5.0 * sigma))
+    norm = 1.0 / (2.0 * np.pi * sigma**2)
+    two_s2 = 2.0 * sigma**2
+    for (x, y), f in zip(positions, fluxes, strict=True):
+        ix, iy = int(round(x)), int(round(y))
+        x0, x1 = max(0, ix - radius), min(w, ix + radius + 1)
+        y0, y1 = max(0, iy - radius), min(h, iy + radius + 1)
+        if x0 >= x1 or y0 >= y1:
+            continue
+        ys, xs = np.mgrid[y0:y1, x0:x1]
+        out[y0:y1, x0:x1] += (f * norm) * np.exp(-((xs - x) ** 2 + (ys - y) ** 2) / two_s2)
+    return out
+
+
+def sample_starfield(
+    shape,
+    n_stars: int,
+    rng,
+    flux_range: tuple[float, float] = (200.0, 60000.0),
+    slope: float = 1.8,
+    border: int = 16,
+    min_separation: float = 0.0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Sample a realistic star field: random positions, power-law fluxes.
+
+    Returns ``(positions (N, 2), fluxes (N,))``. Fluxes follow a bounded power law
+    ``p(F) ∝ F**-slope`` over ``flux_range`` (many faint, few bright — a stellar
+    luminosity function), far more realistic than a regular grid of equal-flux
+    sources. Positions are uniform within a ``border`` margin; ``min_separation``
+    rejection-samples to limit crowding so stamp selection has isolated sources.
+    """
+    rng = np.random.default_rng(rng)
+    h, w = shape
+    fmin, fmax = flux_range
+
+    # Inverse-CDF sampling of a bounded power law p(F) ∝ F**-slope.
+    u = rng.random(n_stars)
+    if abs(slope - 1.0) < 1e-9:
+        fluxes = fmin * (fmax / fmin) ** u
+    else:
+        a = 1.0 - slope
+        fluxes = (fmin**a + u * (fmax**a - fmin**a)) ** (1.0 / a)
+
+    xs = np.empty(n_stars)
+    ys = np.empty(n_stars)
+    min_sep2 = min_separation**2
+    count = 0
+    attempts = 0
+    max_attempts = 100 * n_stars
+    while count < n_stars and attempts < max_attempts:
+        attempts += 1
+        x = rng.uniform(border, w - 1 - border)
+        y = rng.uniform(border, h - 1 - border)
+        if min_sep2 > 0.0 and count > 0:
+            d2 = (xs[:count] - x) ** 2 + (ys[:count] - y) ** 2
+            if d2.min() < min_sep2:
+                continue
+        xs[count], ys[count] = x, y
+        count += 1
+
+    positions = np.column_stack([xs[:count], ys[:count]])
+    return positions, fluxes[:count]
 
 
 def peak_near(image, xy, radius: int) -> tuple[float, tuple[int, int]]:

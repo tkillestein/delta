@@ -14,6 +14,7 @@
 #include "delta/basis.hpp"
 #include "delta/convolve.hpp"
 #include "delta/detect.hpp"
+#include "delta/fit.hpp"
 #include "delta/image.hpp"
 #include "delta/io.hpp"
 #include "delta/solve.hpp"
@@ -424,6 +425,67 @@ nb::dict subtract(InArray<float> science, InArray<float> reference,
   return out;
 }
 
+// ---- fit (kernel solve from stamps) + photometric scale --------------------
+
+// Fit the matching kernel from stamp pixels -> solver result + reporting.
+nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
+                    const Eigen::MatrixXd& knots,
+                    InArray1D<std::int32_t> stamp_x,
+                    InArray1D<std::int32_t> stamp_y, int stamp_radius,
+                    double beta, int n_max,
+                    const Eigen::VectorXd& lambda_grid, int radius,
+                    std::optional<InArray<float>> science_var,
+                    std::optional<InArray<float>> reference_var,
+                    std::optional<InArray<std::uint8_t>> science_mask,
+                    std::optional<InArray<std::uint8_t>> reference_mask) {
+  const delta::ImageF sci = make_image_vm(science, science_var, science_mask);
+  const delta::ImageF ref =
+      make_image_vm(reference, reference_var, reference_mask);
+  const delta::ThinPlateBasis spatial(knots);
+  const delta::GaussHermiteBasis basis(beta, n_max,
+                                       resolve_radius(beta, n_max, radius));
+  const std::vector<int> sx(stamp_x.data(), stamp_x.data() + stamp_x.size());
+  const std::vector<int> sy(stamp_y.data(), stamp_y.data() + stamp_y.size());
+  const std::vector<double> grid(lambda_grid.data(),
+                                 lambda_grid.data() + lambda_grid.size());
+
+  const delta::KernelFit fit =
+      delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid);
+
+  nb::dict out = gls_result_to_dict(fit.gls);
+  out["component_sums"] = to_numpy<double>(
+      std::vector<double>(fit.component_sums), {fit.component_sums.size()});
+  out["n_pixels"] = fit.n_pixels;
+  out["n_stamps_used"] = fit.n_stamps_used;
+  return out;
+}
+
+// Per-pixel photometric scale field, shape (height, width).
+nb::ndarray<nb::numpy, float> photometric_scale(
+    const Eigen::MatrixXd& knots, const Eigen::VectorXd& theta,
+    InArray1D<double> component_sums, int height, int width) {
+  const delta::ThinPlateBasis spatial(knots);
+  const std::vector<double> sums(component_sums.data(),
+                                 component_sums.data() + component_sums.size());
+  delta::ImageF scale = delta::photometric_scale(
+      spatial, theta, sums, static_cast<std::size_t>(width),
+      static_cast<std::size_t>(height));
+  const std::size_t h = scale.height();
+  const std::size_t w = scale.width();
+  return to_numpy<float>(std::move(scale.pixels()), {h, w});
+}
+
+// Photometric scale at arbitrary points (m,).
+Eigen::VectorXd photometric_scale_at(const Eigen::MatrixXd& knots,
+                                     const Eigen::VectorXd& theta,
+                                     InArray1D<double> component_sums,
+                                     const Eigen::MatrixXd& points) {
+  const delta::ThinPlateBasis spatial(knots);
+  const std::vector<double> sums(component_sums.data(),
+                                 component_sums.data() + component_sums.size());
+  return delta::photometric_scale_at(spatial, theta, sums, points);
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -488,4 +550,18 @@ NB_MODULE(_core, m) {
         "reference_mask"_a = nb::none(),
         "Full-frame spatially-varying subtraction with variance/mask "
         "propagation; returns {'difference','variance','mask'}.");
+
+  m.def("fit_kernel", &fit_kernel, "science"_a, "reference"_a, "knots"_a,
+        "stamp_x"_a, "stamp_y"_a, "stamp_radius"_a, "beta"_a, "n_max"_a,
+        "lambda_grid"_a, "radius"_a = 0, "science_var"_a = nb::none(),
+        "reference_var"_a = nb::none(), "science_mask"_a = nb::none(),
+        "reference_mask"_a = nb::none(),
+        "Fit the matching kernel + background from stamp pixels via penalised "
+        "GLS; returns the solver result plus component_sums/n_pixels.");
+  m.def("photometric_scale", &photometric_scale, "knots"_a, "theta"_a,
+        "component_sums"_a, "height"_a, "width"_a,
+        "Per-pixel photometric scale field sum_n a_n(x,y) S_n, shape (H,W).");
+  m.def("photometric_scale_at", &photometric_scale_at, "knots"_a, "theta"_a,
+        "component_sums"_a, "points"_a,
+        "Photometric scale evaluated at points, shape (m,).");
 }

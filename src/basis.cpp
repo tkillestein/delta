@@ -78,4 +78,18 @@ std::vector<float> GaussHermiteBasis::kernel2d(int c) const {
   return k;
 }
 
+std::vector<double> GaussHermiteBasis::component_sums() const {
+  // Separable footprint -> sum factorises: S_c = (sum gx)(sum gy).
+  std::vector<double> sum1d(n_max_ + 1, 0.0);
+  for (int n = 0; n <= n_max_; ++n) {
+    double s = 0.0;
+    for (double v : basis1d_[n]) s += v;
+    sum1d[n] = s;
+  }
+  std::vector<double> sums;
+  sums.reserve(orders_.size());
+  for (const auto& [nx, ny] : orders_) sums.push_back(sum1d[nx] * sum1d[ny]);
+  return sums;
+}
+
 }  // namespace delta

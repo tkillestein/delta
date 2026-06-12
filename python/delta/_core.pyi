@@ -38,6 +38,24 @@ GlsResult = TypedDict(
     },
 )
 
+KernelFit = TypedDict(
+    "KernelFit",
+    {
+        "theta": NDArray[np.float64],
+        "n_components": int,
+        "n_spatial": int,
+        "lambda": float,
+        "gcv": float,
+        "effective_dof": float,
+        "rss": float,
+        "lambda_grid": NDArray[np.float64],
+        "gcv_curve": NDArray[np.float64],
+        "component_sums": NDArray[np.float64],
+        "n_pixels": int,
+        "n_stamps_used": int,
+    },
+)
+
 class DiffProducts(TypedDict):
     difference: NDArray[np.float32]
     variance: NDArray[np.float32] | None
@@ -174,3 +192,38 @@ def subtract(
     reference_mask: NDArray[np.uint8] | None = ...,
 ) -> DiffProducts:
     """Full-frame spatially-varying subtraction with variance/mask propagation."""
+
+def fit_kernel(
+    science: NDArray[np.float32],
+    reference: NDArray[np.float32],
+    knots: NDArray[np.float64],
+    stamp_x: NDArray[np.int32],
+    stamp_y: NDArray[np.int32],
+    stamp_radius: int,
+    beta: float,
+    n_max: int,
+    lambda_grid: NDArray[np.float64],
+    radius: int = ...,
+    science_var: NDArray[np.float32] | None = ...,
+    reference_var: NDArray[np.float32] | None = ...,
+    science_mask: NDArray[np.uint8] | None = ...,
+    reference_mask: NDArray[np.uint8] | None = ...,
+) -> KernelFit:
+    """Fit the matching kernel + background from stamp pixels via penalised GLS."""
+
+def photometric_scale(
+    knots: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    component_sums: NDArray[np.float64],
+    height: int,
+    width: int,
+) -> NDArray[np.float32]:
+    """Per-pixel photometric scale field sum_n a_n(x,y) S_n, shape (H, W)."""
+
+def photometric_scale_at(
+    knots: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    component_sums: NDArray[np.float64],
+    points: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Photometric scale evaluated at points, shape (m,)."""

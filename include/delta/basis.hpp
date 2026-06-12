@@ -42,6 +42,11 @@ class GaussHermiteBasis {
   // Full 2-D footprint for component c, row-major (y-major), length ksize^2.
   std::vector<float> kernel2d(int c) const;
 
+  // Footprint sum of each component, S_c = sum_{u,v} phi_c(u,v). This is the
+  // per-unit-coefficient photometric scale: the kernel sum at a location is
+  // sum_n a_n(x,y) S_n (SPEC §3.3, kernel-sum flux scale).
+  std::vector<double> component_sums() const;
+
  private:
   double beta_;
   int n_max_;

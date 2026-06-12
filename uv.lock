@@ -113,6 +113,8 @@ astropy = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "astropy", version = "7.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
@@ -127,6 +129,7 @@ provides-extras = ["astropy"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "astropy", specifier = ">=5" },
     { name = "pytest", specifier = ">=7" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "ty", specifier = ">=0.0.1a1" },

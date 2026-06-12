@@ -46,7 +46,7 @@ def test_difference_matches_numpy_model():
     ncomp = bn.shape[0]
     theta = 0.1 * rng.standard_normal((ncomp + 1) * knots.shape[0])
 
-    res = delta.subtract(sci, ref, knots, theta, beta, n_max)
+    res = delta.subtract_model(sci, ref, knots, theta, beta, n_max)
     assert res["variance"] is None and res["mask"] is None
 
     fields = _fields(knots, theta, ncomp, h, w)
@@ -71,7 +71,7 @@ def test_self_subtraction_is_zero():
     for n in range(ncomp):
         model += fields[:, :, n] * bn[n]
 
-    res = delta.subtract(model.astype(np.float32), ref, knots, theta, beta, n_max)
+    res = delta.subtract_model(model.astype(np.float32), ref, knots, theta, beta, n_max)
     np.testing.assert_allclose(res["difference"], 0.0, atol=1e-3)
 
 
@@ -93,7 +93,9 @@ def test_variance_propagation_constant_kernel():
     theta = np.zeros(2 * k)
     theta[k - 3] = amp  # intercept of the c_0 field
 
-    res = delta.subtract(sci, ref, knots, theta, beta, 0, science_var=var_s, reference_var=var_r)
+    res = delta.subtract_model(
+        sci, ref, knots, theta, beta, 0, science_var=var_s, reference_var=var_r
+    )
     assert res["variance"] is not None
 
     orders, kernels = delta.gauss_hermite_kernels(beta, 0)
@@ -113,7 +115,7 @@ def test_variance_science_only_passthrough():
     ncomp = delta.basis_convolve(ref, beta, n_max).shape[0]
     theta = np.zeros((ncomp + 1) * knots.shape[0])
 
-    res = delta.subtract(sci, ref, knots, theta, beta, n_max, science_var=var_s)
+    res = delta.subtract_model(sci, ref, knots, theta, beta, n_max, science_var=var_s)
     assert res["variance"] is not None
     np.testing.assert_allclose(res["variance"], var_s, rtol=1e-6, atol=1e-6)
 
@@ -133,7 +135,7 @@ def test_mask_growth_dilation_and_edge():
     sci_mask = np.zeros((h, w), np.uint8)
     sci_mask[10, 30] = 1
 
-    res = delta.subtract(
+    res = delta.subtract_model(
         sci,
         ref,
         knots,

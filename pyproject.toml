@@ -16,7 +16,7 @@ dependencies = ["numpy>=1.23"]
 astropy = ["astropy>=5"]
 
 [dependency-groups]
-dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1"]
+dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1", "astropy>=5"]
 
 [tool.scikit-build]
 minimum-version = "0.10"

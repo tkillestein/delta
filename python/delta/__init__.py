@@ -25,7 +25,6 @@ from ._core import (
     select_stamps,
     solve_gls,
     solve_gls_gcv,
-    subtract,
     tps_design,
     tps_evaluate,
     tps_fit,
@@ -33,9 +32,17 @@ from ._core import (
     weighted_mean,
     write_fits,
 )
+from ._core import subtract as subtract_model
+from ._inputs import as_layers, synth_variance
+from .pipeline import DiffResult, Subtractor, subtract
+from .solution import KernelSolution
 
 __all__ = [
+    "DiffResult",
+    "KernelSolution",
+    "Subtractor",
     "__version__",
+    "as_layers",
     "basis_convolve",
     "decorrelate",
     "decorrelate_block",
@@ -54,6 +61,8 @@ __all__ = [
     "solve_gls",
     "solve_gls_gcv",
     "subtract",
+    "subtract_model",
+    "synth_variance",
     "tps_design",
     "tps_evaluate",
     "tps_fit",

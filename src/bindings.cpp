@@ -18,6 +18,7 @@
 #include "delta/io.hpp"
 #include "delta/solve.hpp"
 #include "delta/spatial.hpp"
+#include "delta/subtract.hpp"
 #include "delta/version.hpp"
 
 namespace nb = nanobind;
@@ -364,6 +365,65 @@ nb::dict solve_gls_gcv(const Eigen::MatrixXd& knots,
       delta::solve_gls_gcv(points, target, weights, bn, basis, grid));
 }
 
+// ---- subtract (full-frame spatially-varying subtraction) -------------------
+
+// Build an ImageF from data with optional variance and mask layers.
+delta::ImageF make_image_vm(InArray<float> data,
+                            std::optional<InArray<float>> variance,
+                            std::optional<InArray<std::uint8_t>> mask) {
+  const std::size_t h = data.shape(0);
+  const std::size_t w = data.shape(1);
+  delta::ImageF img(w, h);
+  std::copy(data.data(), data.data() + h * w, img.pixels().begin());
+  if (variance) {
+    if (variance->shape(0) != h || variance->shape(1) != w)
+      throw std::runtime_error("variance shape does not match data");
+    img.allocate_variance();
+    std::copy(variance->data(), variance->data() + h * w,
+              img.variance().begin());
+  }
+  if (mask) {
+    if (mask->shape(0) != h || mask->shape(1) != w)
+      throw std::runtime_error("mask shape does not match data");
+    img.allocate_mask();
+    std::copy(mask->data(), mask->data() + h * w, img.mask().begin());
+  }
+  return img;
+}
+
+// Full-frame subtraction -> {'difference', 'variance', 'mask'} (the latter two
+// present only when the inputs carry the corresponding layers).
+nb::dict subtract(InArray<float> science, InArray<float> reference,
+                  const Eigen::MatrixXd& knots, const Eigen::VectorXd& theta,
+                  double beta, int n_max, int radius,
+                  std::optional<InArray<float>> science_var,
+                  std::optional<InArray<float>> reference_var,
+                  std::optional<InArray<std::uint8_t>> science_mask,
+                  std::optional<InArray<std::uint8_t>> reference_mask) {
+  const delta::ImageF sci = make_image_vm(science, science_var, science_mask);
+  const delta::ImageF ref =
+      make_image_vm(reference, reference_var, reference_mask);
+  const delta::ThinPlateBasis spatial(knots);
+  const delta::GaussHermiteBasis basis(beta, n_max,
+                                       resolve_radius(beta, n_max, radius));
+
+  delta::ImageF diff = delta::subtract(sci, ref, spatial, theta, basis);
+  const std::size_t h = diff.height();
+  const std::size_t w = diff.width();
+
+  nb::dict out;
+  out["difference"] = to_numpy<float>(std::move(diff.pixels()), {h, w});
+  if (diff.has_variance())
+    out["variance"] = to_numpy<float>(std::move(diff.variance()), {h, w});
+  else
+    out["variance"] = nb::none();
+  if (diff.has_mask())
+    out["mask"] = to_numpy<std::uint8_t>(std::move(diff.mask()), {h, w});
+  else
+    out["mask"] = nb::none();
+  return out;
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -421,4 +481,11 @@ NB_MODULE(_core, m) {
   m.def("solve_gls_gcv", &solve_gls_gcv, "knots"_a, "points"_a, "target"_a,
         "weights"_a, "bn"_a, "lambda_grid"_a,
         "Penalised GLS selecting lambda by GCV over lambda_grid.");
+
+  m.def("subtract", &subtract, "science"_a, "reference"_a, "knots"_a, "theta"_a,
+        "beta"_a, "n_max"_a, "radius"_a = 0, "science_var"_a = nb::none(),
+        "reference_var"_a = nb::none(), "science_mask"_a = nb::none(),
+        "reference_mask"_a = nb::none(),
+        "Full-frame spatially-varying subtraction with variance/mask "
+        "propagation; returns {'difference','variance','mask'}.");
 }

@@ -38,6 +38,11 @@ GlsResult = TypedDict(
     },
 )
 
+class DiffProducts(TypedDict):
+    difference: NDArray[np.float32]
+    variance: NDArray[np.float32] | None
+    mask: NDArray[np.uint8] | None
+
 class StampSelection(TypedDict):
     x: NDArray[np.int32]
     y: NDArray[np.int32]
@@ -154,3 +159,18 @@ def solve_gls_gcv(
     lambda_grid: NDArray[np.float64],
 ) -> GlsResult:
     """Penalised GLS selecting lambda by GCV over lambda_grid."""
+
+def subtract(
+    science: NDArray[np.float32],
+    reference: NDArray[np.float32],
+    knots: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    beta: float,
+    n_max: int,
+    radius: int = ...,
+    science_var: NDArray[np.float32] | None = ...,
+    reference_var: NDArray[np.float32] | None = ...,
+    science_mask: NDArray[np.uint8] | None = ...,
+    reference_mask: NDArray[np.uint8] | None = ...,
+) -> DiffProducts:
+    """Full-frame spatially-varying subtraction with variance/mask propagation."""

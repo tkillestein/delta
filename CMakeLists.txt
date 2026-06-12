@@ -32,7 +32,7 @@ find_package(nanobind CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(EIGEN REQUIRED IMPORTED_TARGET eigen3)
 pkg_check_modules(CFITSIO REQUIRED IMPORTED_TARGET cfitsio)
-pkg_check_modules(FFTWF IMPORTED_TARGET fftw3f)
+pkg_check_modules(FFTWF REQUIRED IMPORTED_TARGET fftw3f)
 find_package(OpenMP)
 
 # ---------------------------------------------------------------------------
@@ -48,9 +48,10 @@ nanobind_add_module(_core
   src/solve.cpp
   src/subtract.cpp
   src/fit.cpp
+  src/noise.cpp
 )
 target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO)
+target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO PkgConfig::FFTWF)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(_core PRIVATE OpenMP::OpenMP_CXX)
 endif()

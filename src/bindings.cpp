@@ -17,6 +17,7 @@
 #include "delta/fit.hpp"
 #include "delta/image.hpp"
 #include "delta/io.hpp"
+#include "delta/noise.hpp"
 #include "delta/solve.hpp"
 #include "delta/spatial.hpp"
 #include "delta/subtract.hpp"
@@ -486,6 +487,89 @@ Eigen::VectorXd photometric_scale_at(const Eigen::MatrixXd& knots,
   return delta::photometric_scale_at(spatial, theta, sums, points);
 }
 
+// ---- noise (decorrelation + match-filtered score) --------------------------
+
+// Decorrelate a single square (n x n) block with a constant kernel/noise: the
+// FFT whitening core (one circular block), useful for QA and as a building unit.
+nb::ndarray<nb::numpy, float> decorrelate_block(InArray<float> image,
+                                                InArray<float> kernel,
+                                                double var_science,
+                                                double var_reference) {
+  const std::size_t n = image.shape(0);
+  if (image.shape(1) != n)
+    throw std::runtime_error("decorrelate_block: image must be square");
+  const int ks = static_cast<int>(kernel.shape(0));
+  if (kernel.shape(1) != static_cast<std::size_t>(ks))
+    throw std::runtime_error("decorrelate_block: kernel must be square");
+
+  delta::ImageF block(n, n);
+  std::copy(image.data(), image.data() + n * n, block.pixels().begin());
+  const std::vector<float> kern(kernel.data(),
+                                kernel.data() + kernel.size());
+  const std::vector<float> filter = delta::decorrelation_filter(
+      kern, ks, var_science, var_reference, static_cast<int>(n));
+  delta::ImageF out =
+      delta::apply_filter_fft(block, filter, static_cast<int>(n));
+  return to_numpy<float>(std::move(out.pixels()), {n, n});
+}
+
+// Real-space decorrelation kernel (centred, n x n) for QA.
+nb::ndarray<nb::numpy, float> decorrelation_kernel(InArray<float> kernel,
+                                                   double var_science,
+                                                   double var_reference, int n) {
+  const int ks = static_cast<int>(kernel.shape(0));
+  const std::vector<float> kern(kernel.data(),
+                                kernel.data() + kernel.size());
+  const std::vector<float> filter =
+      delta::decorrelation_filter(kern, ks, var_science, var_reference, n);
+  delta::ImageF out = delta::decorrelation_kernel_image(filter, n);
+  return to_numpy<float>(std::move(out.pixels()),
+                         {static_cast<std::size_t>(n),
+                          static_cast<std::size_t>(n)});
+}
+
+// Spatially-varying decorrelation of a difference image (apodized FFT blocks).
+nb::ndarray<nb::numpy, float> decorrelate(
+    InArray<float> difference, const Eigen::MatrixXd& knots,
+    const Eigen::VectorXd& theta, double beta, int n_max,
+    InArray<float> var_science, InArray<float> var_reference, int block,
+    int radius) {
+  const std::size_t h = difference.shape(0);
+  const std::size_t w = difference.shape(1);
+  delta::ImageF diff(w, h);
+  std::copy(difference.data(), difference.data() + h * w,
+            diff.pixels().begin());
+  delta::ImageF vs(w, h), vr(w, h);
+  std::copy(var_science.data(), var_science.data() + h * w,
+            vs.pixels().begin());
+  std::copy(var_reference.data(), var_reference.data() + h * w,
+            vr.pixels().begin());
+
+  const delta::ThinPlateBasis spatial(knots);
+  const delta::GaussHermiteBasis basis(beta, n_max,
+                                       resolve_radius(beta, n_max, radius));
+  delta::ImageF out =
+      delta::decorrelate(diff, spatial, theta, basis, vs, vr, block);
+  return to_numpy<float>(std::move(out.pixels()), {h, w});
+}
+
+// Match-filtered score image (S/N map).
+nb::ndarray<nb::numpy, float> matched_filter(InArray<float> image,
+                                             InArray<float> psf,
+                                             double noise_var) {
+  const std::size_t h = image.shape(0);
+  const std::size_t w = image.shape(1);
+  const int ps = static_cast<int>(psf.shape(0));
+  if (psf.shape(1) != static_cast<std::size_t>(ps))
+    throw std::runtime_error("matched_filter: psf must be square");
+
+  delta::ImageF img(w, h);
+  std::copy(image.data(), image.data() + h * w, img.pixels().begin());
+  const std::vector<float> p(psf.data(), psf.data() + psf.size());
+  delta::ImageF out = delta::matched_filter(img, p, ps, noise_var);
+  return to_numpy<float>(std::move(out.pixels()), {h, w});
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -564,4 +648,17 @@ NB_MODULE(_core, m) {
   m.def("photometric_scale_at", &photometric_scale_at, "knots"_a, "theta"_a,
         "component_sums"_a, "points"_a,
         "Photometric scale evaluated at points, shape (m,).");
+
+  m.def("decorrelate_block", &decorrelate_block, "image"_a, "kernel"_a,
+        "var_science"_a, "var_reference"_a,
+        "Whiten one square block with a constant kernel/noise (FFT core).");
+  m.def("decorrelation_kernel", &decorrelation_kernel, "kernel"_a,
+        "var_science"_a, "var_reference"_a, "n"_a,
+        "Real-space decorrelation kernel (centred, n x n) for QA.");
+  m.def("decorrelate", &decorrelate, "difference"_a, "knots"_a, "theta"_a,
+        "beta"_a, "n_max"_a, "var_science"_a, "var_reference"_a, "block"_a = 256,
+        "radius"_a = 0,
+        "Spatially-varying noise decorrelation via apodized FFT blocks.");
+  m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "noise_var"_a,
+        "Match-filtered score image (per-pixel S/N map).");
 }

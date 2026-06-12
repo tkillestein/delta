@@ -227,3 +227,39 @@ def photometric_scale_at(
     points: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Photometric scale evaluated at points, shape (m,)."""
+
+def decorrelate_block(
+    image: NDArray[np.float32],
+    kernel: NDArray[np.float32],
+    var_science: float,
+    var_reference: float,
+) -> NDArray[np.float32]:
+    """Whiten one square block with a constant kernel/noise (FFT core)."""
+
+def decorrelation_kernel(
+    kernel: NDArray[np.float32],
+    var_science: float,
+    var_reference: float,
+    n: int,
+) -> NDArray[np.float32]:
+    """Real-space decorrelation kernel (centred, n x n) for QA."""
+
+def decorrelate(
+    difference: NDArray[np.float32],
+    knots: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    beta: float,
+    n_max: int,
+    var_science: NDArray[np.float32],
+    var_reference: NDArray[np.float32],
+    block: int = ...,
+    radius: int = ...,
+) -> NDArray[np.float32]:
+    """Spatially-varying noise decorrelation via apodized FFT blocks."""
+
+def matched_filter(
+    image: NDArray[np.float32],
+    psf: NDArray[np.float32],
+    noise_var: float,
+) -> NDArray[np.float32]:
+    """Match-filtered score image (per-pixel S/N map)."""

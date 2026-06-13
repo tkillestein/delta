@@ -18,9 +18,11 @@ void check(int status, const std::string& context) {
   if (status != 0) throw_fits(status, context);
 }
 
-// Move to a named 2-D IMAGE extension, reading its pixels into `dst` with the
+// Move to a named 2-D image extension, reading its pixels into `dst` with the
 // given CFITSIO datatype. Returns false (without error) if no such extension
-// exists; the search always restarts from the primary HDU.
+// exists; the search always restarts from the primary HDU. ANY_HDU is used so
+// tile-compressed images (CompImageHDU, stored as binary tables) are matched
+// transparently alongside plain image extensions.
 template <typename T>
 bool read_named_extension(fitsfile* fptr, const char* extname, int datatype,
                           T* dst, long nelements) {
@@ -29,7 +31,7 @@ bool read_named_extension(fitsfile* fptr, const char* extname, int datatype,
   fits_movabs_hdu(fptr, 1, &hdutype, &status);  // back to primary first
   check(status, "rewind to primary");
 
-  if (fits_movnam_hdu(fptr, IMAGE_HDU, const_cast<char*>(extname), 0, &status)) {
+  if (fits_movnam_hdu(fptr, ANY_HDU, const_cast<char*>(extname), 0, &status)) {
     return false;  // extension absent; status intentionally ignored
   }
   long fpixel[2] = {1, 1};
@@ -48,14 +50,28 @@ ImageF read_image(const std::string& path) {
   fits_open_file(&fptr, path.c_str(), READONLY, &status);
   check(status, "open " + path);
 
+  // The difference frame normally lives in the primary HDU, but the compressed
+  // layout (CompImageHDU cannot be primary) leaves a dataless primary and moves
+  // it to a "DIFFERENCE" extension. Fall back to that when the primary is empty.
   int naxis = 0;
   fits_get_img_dim(fptr, &naxis, &status);
   check(status, "image dimensions");
   if (naxis != 2) {
-    fits_close_file(fptr, &status);
-    throw std::runtime_error(
-        "delta::io::read_image expects a 2-D primary image, got NAXIS=" +
-        std::to_string(naxis));
+    if (fits_movnam_hdu(fptr, ANY_HDU, const_cast<char*>("DIFFERENCE"), 0,
+                        &status)) {
+      fits_close_file(fptr, &status);
+      throw std::runtime_error(
+          "delta::io::read_image: primary is not a 2-D image (NAXIS=" +
+          std::to_string(naxis) + ") and no DIFFERENCE extension was found");
+    }
+    fits_get_img_dim(fptr, &naxis, &status);
+    check(status, "DIFFERENCE dimensions");
+    if (naxis != 2) {
+      fits_close_file(fptr, &status);
+      throw std::runtime_error(
+          "delta::io::read_image: DIFFERENCE extension is not 2-D, got NAXIS=" +
+          std::to_string(naxis));
+    }
   }
 
   long naxes[2] = {0, 0};

@@ -59,6 +59,13 @@ orchestrated by the Python package in `python/delta/`.
   (basis params, knots, `theta`, GCV diagnostics) + FITS provenance header cards.
 - `_inputs.py` — input coercion (`as_layers`, `synth_variance`); numpy/astropy interop.
 - `validation.py` — QA/validation helpers.
+- `cli.py` — standalone `delta` CLI (Typer + Rich, `cli` extra): `subtract` and
+  `info` commands over the pipeline. Entry point `delta.cli:run`
+  (`[project.scripts]`). Errors/tables print to stderr via Rich.
+- `_log.py` — loguru logging plumbing. The library logs through loguru's global
+  `logger` and is silent by default (`logger.disable("delta")`); the CLI calls
+  `configure_logging(verbosity)` to add a stderr sink and `enable` the namespace.
+  `log_timing(label)` is the per-stage timing context manager used in `pipeline.py`.
 - `_core.pyi` — type stub for the compiled extension.
 
 ### The central algorithmic idea (SPEC §3.2)

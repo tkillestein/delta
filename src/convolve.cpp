@@ -6,11 +6,17 @@ namespace delta {
 namespace {
 
 // 1-D convolution along x (fast axis), zero-padded, 'same' size.
-// out[y,x] = sum_m k[m+h] * in[y, x-m].
+// out[y,x] = sum_j k[j] * in[y, x + h - j]   (j = m + h, h = ksize/2).
+//
+// Tap-outer accumulation: for each kernel tap we add a shifted, scaled copy of
+// the row. The inner loop is a contiguous float axpy that the compiler
+// auto-vectorises (SIMD); out-of-range source indices are simply skipped, which
+// is exactly the zero-padding contract.
 ImageF convolve_x(const ImageF& in, const std::vector<float>& k) {
   const int width = static_cast<int>(in.width());
   const int height = static_cast<int>(in.height());
-  const int h = static_cast<int>(k.size() - 1) / 2;
+  const int ks = static_cast<int>(k.size());
+  const int h = (ks - 1) / 2;
 
   ImageF out(in.width(), in.height());
   const float* src = in.data();
@@ -19,25 +25,28 @@ ImageF convolve_x(const ImageF& in, const std::vector<float>& k) {
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < height; ++y) {
     const std::size_t row = static_cast<std::size_t>(y) * width;
-    for (int x = 0; x < width; ++x) {
-      double acc = 0.0;
-      const int m_lo = (x - (width - 1) > -h) ? (x - (width - 1)) : -h;
-      const int m_hi = (x < h) ? x : h;
-      for (int m = m_lo; m <= m_hi; ++m) {
-        acc += static_cast<double>(k[m + h]) * src[row + (x - m)];
-      }
-      dst[row + x] = static_cast<float>(acc);
+    float* drow = dst + row;
+    const float* srow = src + row;
+    for (int x = 0; x < width; ++x) drow[x] = 0.0f;
+    for (int j = 0; j < ks; ++j) {
+      const float kc = k[j];
+      const int sh = h - j;  // src index = x + sh
+      const int xlo = sh < 0 ? -sh : 0;
+      const int xhi = (width - 1 - sh) < (width - 1) ? (width - 1 - sh) : (width - 1);
+      for (int x = xlo; x <= xhi; ++x) drow[x] += kc * srow[x + sh];
     }
   }
   return out;
 }
 
 // 1-D convolution along y, zero-padded, 'same' size.
-// out[y,x] = sum_n k[n+h] * in[y-n, x].
+// out[y,x] = sum_j k[j] * in[y + h - j, x].  Tap-outer over input rows so the
+// inner loop stays a contiguous float axpy across x (SIMD-friendly).
 ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
   const int width = static_cast<int>(in.width());
   const int height = static_cast<int>(in.height());
-  const int h = static_cast<int>(k.size() - 1) / 2;
+  const int ks = static_cast<int>(k.size());
+  const int h = (ks - 1) / 2;
 
   ImageF out(in.width(), in.height());
   const float* src = in.data();
@@ -45,16 +54,14 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
 
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < height; ++y) {
-    const std::size_t row = static_cast<std::size_t>(y) * width;
-    const int n_lo = (y - (height - 1) > -h) ? (y - (height - 1)) : -h;
-    const int n_hi = (y < h) ? y : h;
-    for (int x = 0; x < width; ++x) {
-      double acc = 0.0;
-      for (int n = n_lo; n <= n_hi; ++n) {
-        acc += static_cast<double>(k[n + h]) *
-               src[static_cast<std::size_t>(y - n) * width + x];
-      }
-      dst[row + x] = static_cast<float>(acc);
+    float* drow = dst + static_cast<std::size_t>(y) * width;
+    for (int x = 0; x < width; ++x) drow[x] = 0.0f;
+    for (int j = 0; j < ks; ++j) {
+      const int sy = y + h - j;
+      if (sy < 0 || sy >= height) continue;
+      const float kc = k[j];
+      const float* srow = src + static_cast<std::size_t>(sy) * width;
+      for (int x = 0; x < width; ++x) drow[x] += kc * srow[x];
     }
   }
   return out;

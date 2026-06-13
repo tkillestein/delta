@@ -48,6 +48,25 @@ The convolution direction is auto-selected from the measured seeing and the
 smoothing parameter is chosen by GCV — no per-field tuning. See
 [`docs/USAGE.md`](docs/USAGE.md).
 
+## Command line
+
+Install the `cli` extra (Typer + Rich) for a standalone `delta` command:
+
+```sh
+uv sync --extra cli            # or: pip install 'delta[cli]'
+
+delta subtract science.fits reference.fits -o diff.fits \
+    --gain 1.5 --read-noise 4 --decorrelate --score -v
+delta info science.fits        # inspect data/variance/mask layers
+delta subtract --help          # full option list
+```
+
+It reads FITS inputs, runs the pipeline, and writes a multi-extension FITS
+(difference + variance/mask/score) with provenance header cards. Progress and
+per-stage timings are logged to stderr ([loguru](https://github.com/Delgan/loguru));
+control verbosity with `-v` (debug) / `-q` (warnings only). The library itself
+stays silent unless a host enables the `delta` log namespace.
+
 ## Building
 
 Requires a C++20 compiler, CMake ≥ 3.18, and CFITSIO, Eigen, and FFTW

@@ -10,14 +10,27 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Tom Killestein", email = "thomas.killestein@gmail.com" }]
-dependencies = ["numpy>=1.23"]
+dependencies = ["numpy>=1.23", "loguru>=0.7"]
 
 [project.optional-dependencies]
 astropy = ["astropy>=5"]
+cli = ["typer>=0.12", "rich>=13"]
 benchmarks = ["astropy>=5", "matplotlib>=3.6"]
 
+[project.scripts]
+delta = "delta.cli:run"
+
 [dependency-groups]
-dev = ["pytest>=7", "ruff>=0.6", "ty>=0.0.1a1", "astropy>=5", "pillow>=10", "matplotlib>=3.6"]
+dev = [
+    "pytest>=7",
+    "ruff>=0.6",
+    "ty>=0.0.1a1",
+    "astropy>=5",
+    "pillow>=10",
+    "matplotlib>=3.6",
+    "typer>=0.12",
+    "rich>=13",
+]
 
 [tool.scikit-build]
 minimum-version = "0.10"

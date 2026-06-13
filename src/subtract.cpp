@@ -20,14 +20,6 @@ Eigen::MatrixXd coeff_matrix(const Eigen::Ref<const Eigen::VectorXd>& theta,
   return Eigen::Map<const Eigen::MatrixXd>(theta.data(), k, n_fields);
 }
 
-// Per-pixel inverse-variance not needed here; this wraps a variance layer into
-// an ImageF so the separable convolution engine can act on it.
-ImageF variance_image(const ImageF& src) {
-  ImageF v(src.width(), src.height());
-  std::copy(src.variance().begin(), src.variance().end(), v.pixels().begin());
-  return v;
-}
-
 // A copy of the reference data with masked and non-finite pixels set to zero.
 // Convolving the raw reference smears NaNs and the spurious values sitting under
 // bad pixels across the kernel footprint, polluting B_n and corrupting the model
@@ -125,28 +117,71 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   if (reference.width() != w || reference.height() != h)
     throw std::runtime_error("subtract: science/reference shape mismatch");
 
-  // B_n = phi_n (x) R, one per basis component (SPEC §3.2). Convolve a sanitised
-  // reference so masked/non-finite pixels do not bleed into the model.
-  const std::vector<ImageF> bn = basis_convolve(sanitised_reference(reference), basis);
-  const int nc = static_cast<int>(bn.size());
+  // D = S - b - sum_n a_n (phi_n (x) R)   (SPEC §3.2). The reference is sanitised
+  // first so masked/non-finite pixels do not bleed into the model.
+  const int nc = basis.component_count();
   const SpatialFields fields = evaluate_fields(spatial, theta, nc, w, h);
-
-  ImageF diff(w, h);
+  const ImageF clean = sanitised_reference(reference);
   const int hh = static_cast<int>(h);
   const int ww = static_cast<int>(w);
+  const std::size_t npix = w * h;
 
+  // Share the separable x-pass across components with the same nx (n_max+1 of
+  // them), then stream each component's y-pass straight into the running
+  // difference. Materialising the full nc-component B_n stack (and re-reading it
+  // in a combine pass) was memory-bound; streaming touches one temporary at a
+  // time and keeps it hot for the accumulate.
+  const int n_max = basis.n_max();
+  std::vector<ImageF> tx;
+  tx.reserve(n_max + 1);
+  for (int nx = 0; nx <= n_max; ++nx)
+    tx.push_back(convolve_x(clean, basis.kernel1d(nx)));
+
+  const auto& orders = basis.orders();
+  std::vector<std::vector<float>> ky(nc);
+  for (int n = 0; n < nc; ++n) ky[n] = basis.kernel1d(orders[n].second);
+  const int kh = (basis.ksize() - 1) / 2;
+
+  ImageF diff(w, h);
+  {
+    const float* s = science.data();
+    const float* bg = fields.background.data();
+    float* d = diff.data();
 #pragma omp parallel for schedule(static)
-  for (int y = 0; y < hh; ++y) {
-    const std::size_t off = static_cast<std::size_t>(y) * w;
-    float* d = diff.data() + off;
-    const float* s = science.data() + off;
-    const float* bg = fields.background.data() + off;
-    for (int x = 0; x < ww; ++x) {
-      double model = bg[x];
-      for (int n = 0; n < nc; ++n)
-        model += static_cast<double>(fields.coeff[n].data()[off + x]) *
-                 bn[n].data()[off + x];
-      d[x] = s[x] - static_cast<float>(model);
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(npix); ++i)
+      d[i] = s[i] - bg[i];
+  }
+
+  // Stream each component's y-pass over the full frame (so the shared x-pass tx
+  // stays cache-resident across output rows) and fuse the a_n accumulation into
+  // the same row loop -- B_n is never materialised full-frame, and the separate
+  // combine pass is gone.
+  for (int n = 0; n < nc; ++n) {
+    const float* src = tx[orders[n].first].data();
+    const std::vector<float>& kyn = ky[n];
+    const int ks = static_cast<int>(kyn.size());
+    const float* a = fields.coeff[n].data();
+    float* dd = diff.data();
+#pragma omp parallel
+    {
+      std::vector<float> bn(w);
+#pragma omp for schedule(static)
+      for (int y = 0; y < hh; ++y) {
+        std::fill(bn.begin(), bn.end(), 0.0f);
+        for (int j = 0; j < ks; ++j) {
+          const int sy = y + kh - j;
+          if (sy < 0 || sy >= hh) continue;
+          const float c = kyn[j];
+          const float* srow = src + static_cast<std::size_t>(sy) * w;
+#pragma omp simd
+          for (int x = 0; x < ww; ++x) bn[x] += c * srow[x];
+        }
+        const std::size_t off = static_cast<std::size_t>(y) * w;
+        const float* arow = a + off;
+        float* drow = dd + off;
+#pragma omp simd
+        for (int x = 0; x < ww; ++x) drow[x] -= arow[x] * bn[x];
+      }
     }
   }
 
@@ -156,31 +191,108 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     std::vector<float>& var = diff.variance();
 
     if (reference.has_variance()) {
-      const ImageF var_ref = variance_image(reference);
-      const auto& orders = basis.orders();
-      // Pairwise separable accumulation. phi_n phi_m is separable with x-kernel
-      // g_{nx} g_{mx} and y-kernel g_{ny} g_{my}; symmetric in (n,m).
-      for (int n = 0; n < nc; ++n) {
-        for (int m = n; m < nc; ++m) {
-          const auto [nxn, nyn] = orders[n];
-          const auto [nxm, nym] = orders[m];
-          const auto& gxn = basis.basis1d(nxn);
-          const auto& gxm = basis.basis1d(nxm);
-          const auto& gyn = basis.basis1d(nyn);
-          const auto& gym = basis.basis1d(nym);
-          const std::size_t ks = gxn.size();
-          std::vector<float> kx(ks), ky(ks);
-          for (std::size_t i = 0; i < ks; ++i) {
-            kx[i] = static_cast<float>(gxn[i] * gxm[i]);
-            ky[i] = static_cast<float>(gyn[i] * gym[i]);
+      // Block-effective squared-kernel convolution (SPEC §3.4).
+      //
+      //   Var(D) gets  (K^2 (x) Var(R)),  K(x,y) = sum_n a_n(x,y) phi_n .
+      //
+      // The exact expansion sum_{n,m} a_n a_m [(phi_n phi_m) (x) Var(R)] needs
+      // nc(nc+1)/2 separable convolutions of the whole frame (406 at n_max=6) --
+      // it dominated the subtraction. Since K varies smoothly, we instead tile
+      // the frame, freeze K at each tile's centre, square it into a dense ks x ks
+      // footprint K^2, and convolve Var(R) with it in a single O(ks^2)/pixel pass.
+      // That is ~30x fewer FLOPs at n_max=6 and allocates no full-frame temporaries.
+      // For a spatially constant field every tile yields the same K, so the result
+      // is identical to the exact expansion; for a varying field it is a per-tile
+      // piecewise-constant approximation of the (slowly varying) coefficient maps.
+      const std::vector<float>& vr = reference.variance();
+      const int ks = basis.ksize();
+      const int rk = basis.radius();
+
+      std::vector<std::vector<float>> phi(nc);
+      for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
+
+      // Tiles are kept small (so the gathered input window + output tile sit in
+      // L1/L2 and stay hot across the ks^2 taps) and the input window is gathered
+      // once into a contiguous, zero-padded buffer -- a 256-wide tile straight off
+      // the strided frame thrashed the cache and was the dominant cost.
+      constexpr int bsz = 64;
+      const int ibw = bsz + 2 * rk;  // gathered window side (>= tile + halo)
+      std::vector<std::pair<int, int>> blocks;
+      for (int by = 0; by < hh; by += bsz)
+        for (int bx = 0; bx < ww; bx += bsz) blocks.emplace_back(bx, by);
+
+#pragma omp parallel
+      {
+        std::vector<float> k2(static_cast<std::size_t>(ks) * ks);
+        std::vector<float> kf(static_cast<std::size_t>(ks) * ks);
+        std::vector<float> win(static_cast<std::size_t>(ibw) * ibw);
+        std::vector<float> out(static_cast<std::size_t>(bsz) * bsz);
+#pragma omp for schedule(dynamic)
+        for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+          const int bx = blocks[bi].first, by = blocks[bi].second;
+          const int bw = std::min(bsz, ww - bx);
+          const int bh = std::min(bsz, hh - by);
+          const std::size_t cidx =
+              static_cast<std::size_t>(std::min(by + bh / 2, hh - 1)) * w +
+              std::min(bx + bw / 2, ww - 1);
+
+          // Effective kernel at the tile centre, squared elementwise, then
+          // mirrored in both axes (kf) so out(x) = sum K^2(u) Var(x-u) becomes a
+          // unit-stride correlation against the gathered window.
+          std::fill(k2.begin(), k2.end(), 0.0f);
+          for (int n = 0; n < nc; ++n) {
+            const float an = fields.coeff[n].data()[cidx];
+            const float* p = phi[n].data();
+            for (std::size_t i = 0; i < k2.size(); ++i) k2[i] += an * p[i];
           }
-          const ImageF v = convolve_separable(var_ref, kx, ky);
-          const float factor = (n == m) ? 1.0f : 2.0f;
-          const float* an = fields.coeff[n].data();
-          const float* am = fields.coeff[m].data();
-          const float* vv = v.data();
-          for (std::size_t i = 0; i < var.size(); ++i)
-            var[i] += factor * an[i] * am[i] * vv[i];
+          for (std::size_t i = 0; i < k2.size(); ++i) {
+            const float v = k2[i];
+            kf[k2.size() - 1 - i] = v * v;
+          }
+
+          // Gather the (bh+2rk) x (bw+2rk) input window, zero-padded at the frame
+          // edge, into a contiguous buffer of row stride ibw.
+          const int iwh = bh + 2 * rk;
+          const int iww = bw + 2 * rk;
+          for (int iy = 0; iy < iwh; ++iy) {
+            const int gy = by - rk + iy;
+            float* wrow = win.data() + static_cast<std::size_t>(iy) * ibw;
+            if (gy < 0 || gy >= hh) {
+              std::fill(wrow, wrow + iww, 0.0f);
+              continue;
+            }
+            const float* vrow = vr.data() + static_cast<std::size_t>(gy) * w;
+            for (int ix = 0; ix < iww; ++ix) {
+              const int gx = bx - rk + ix;
+              wrow[ix] = (gx < 0 || gx >= ww) ? 0.0f : vrow[gx];
+            }
+          }
+
+          // Tap-outer dense convolution on the cache-resident window/tile: each
+          // tap is a contiguous multiply-add over the tile row (auto-vectorised).
+          std::fill(out.begin(), out.begin() + static_cast<std::size_t>(bh) * bw,
+                    0.0f);
+          for (int ly = 0; ly < ks; ++ly) {
+            const float* krow = kf.data() + static_cast<std::size_t>(ly) * ks;
+            for (int lx = 0; lx < ks; ++lx) {
+              const float c = krow[lx];
+              if (c == 0.0f) continue;
+              for (int oy = 0; oy < bh; ++oy) {
+                const float* src =
+                    win.data() + static_cast<std::size_t>(oy + ly) * ibw + lx;
+                float* dst = out.data() + static_cast<std::size_t>(oy) * bw;
+#pragma omp simd
+                for (int ox = 0; ox < bw; ++ox) dst[ox] += c * src[ox];
+              }
+            }
+          }
+
+          // Scatter the tile's reference-variance contribution into Var(D).
+          for (int oy = 0; oy < bh; ++oy) {
+            float* vout = var.data() + static_cast<std::size_t>(by + oy) * w + bx;
+            const float* orow = out.data() + static_cast<std::size_t>(oy) * bw;
+            for (int ox = 0; ox < bw; ++ox) vout[ox] += orow[ox];
+          }
         }
       }
     }

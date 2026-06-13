@@ -1,8 +1,14 @@
 #include "delta/solve.hpp"
 
 #include <Eigen/Cholesky>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace delta {
 
@@ -44,24 +50,51 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
   const int k = static_cast<int>(d.cols());
   const int p = (nc + 1) * k;
 
-  // Build the full design matrix X (N x P): each component block is D scaled
-  // row-wise by the corresponding B_n column; the trailing block is D itself.
-  Eigen::MatrixXd x(n, p);
+  // Build the pre-whitened design Xs = W^{1/2} X (N x P): each component block is
+  // D scaled row-wise by sqrt(weight) * B_n; the trailing block is sqrt(weight) D.
+  // With Xs the normal equations are M = Xs^T Xs and rhs = Xs^T ds (ds = W^{1/2} d),
+  // so M is a symmetric rank update -- half the FLOPs of the general X^T W X.
+  const Eigen::ArrayXd sw = weights.array().sqrt();
+  Eigen::MatrixXd xs(n, p);
   for (int c = 0; c < nc; ++c)
-    x.block(0, c * k, n, k) = (d.array().colwise() * bn.col(c).array()).matrix();
-  x.block(0, nc * k, n, k) = d;
-
-  // Weighted normal equations.
-  const Eigen::VectorXd wd = weights.array() * target.array();
-  const Eigen::MatrixXd wx = (x.array().colwise() * weights.array()).matrix();
+    xs.block(0, c * k, n, k) =
+        (d.array().colwise() * (bn.col(c).array() * sw)).matrix();
+  xs.block(0, nc * k, n, k) = (d.array().colwise() * sw).matrix();
+  const Eigen::VectorXd ds = (sw * target.array()).matrix();
 
   System s;
   s.n = n;
   s.nc = nc;
   s.k = k;
   s.p = p;
-  s.m = x.transpose() * wx;
-  s.rhs = x.transpose() * wd;
+
+  // M = Xs^T Xs (P x P) and rhs = Xs^T ds. This O(N P^2) work dominates the fit
+  // (P = (nc+1)k can be ~700) and Eigen does not reliably thread it here, so we
+  // accumulate over row chunks and reduce; each chunk uses a symmetric rankUpdate
+  // (lower triangle only). Each thread holds a private P x P partial.
+  Eigen::MatrixXd m_acc = Eigen::MatrixXd::Zero(p, p);
+  Eigen::VectorXd rhs_acc = Eigen::VectorXd::Zero(p);
+  constexpr int kChunk = 2048;
+#pragma omp parallel
+  {
+    Eigen::MatrixXd m_loc = Eigen::MatrixXd::Zero(p, p);
+    Eigen::VectorXd rhs_loc = Eigen::VectorXd::Zero(p);
+#pragma omp for schedule(dynamic) nowait
+    for (int r0 = 0; r0 < n; r0 += kChunk) {
+      const int nr = std::min(kChunk, n - r0);
+      const auto xb = xs.middleRows(r0, nr);
+      m_loc.selfadjointView<Eigen::Lower>().rankUpdate(xb.transpose());
+      rhs_loc.noalias() += xb.transpose() * ds.segment(r0, nr);
+    }
+#pragma omp critical
+    {
+      m_acc.triangularView<Eigen::Lower>() += m_loc;
+      rhs_acc += rhs_loc;
+    }
+  }
+  // Mirror the accumulated lower triangle into a full symmetric matrix.
+  s.m = m_acc.selfadjointView<Eigen::Lower>();
+  s.rhs = std::move(rhs_acc);
   s.ywy = (weights.array() * target.array().square()).sum();
 
   // Penalty unit: the same k x k bending-energy block for every field
@@ -118,20 +151,25 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
 
   const System s = assemble(points, target, weights, bn, basis);
 
-  GlsResult best;
-  double best_gcv = std::numeric_limits<double>::infinity();
-  std::vector<double> curve;
-  curve.reserve(lambda_grid.size());
+  // Each lambda is an independent LDLT solve + trace on the shared (read-only)
+  // system; evaluate the grid in parallel, then reduce to the GCV-minimising fit.
+  const int ng = static_cast<int>(lambda_grid.size());
+  std::vector<GlsResult> results(ng);
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < ng; ++i) results[i] = solve_at(s, lambda_grid[i]);
 
-  for (double lambda : lambda_grid) {
-    GlsResult r = solve_at(s, lambda);
-    curve.push_back(r.gcv);
-    if (r.gcv < best_gcv) {
-      best_gcv = r.gcv;
-      best = r;
+  std::vector<double> curve(ng);
+  int best_i = 0;
+  double best_gcv = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < ng; ++i) {
+    curve[i] = results[i].gcv;
+    if (results[i].gcv < best_gcv) {
+      best_gcv = results[i].gcv;
+      best_i = i;
     }
   }
 
+  GlsResult best = results[best_i];
   best.lambda_grid = lambda_grid;
   best.gcv_curve = std::move(curve);
   return best;

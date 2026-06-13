@@ -34,9 +34,14 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   if (stamp_x.size() != stamp_y.size())
     throw std::runtime_error("fit_kernel: stamp_x/stamp_y length mismatch");
 
-  // B_n = phi_n (x) reference; sampled at the gathered stamp pixels.
-  const std::vector<ImageF> bn = basis_convolve(reference, basis);
-  const int nc = static_cast<int>(bn.size());
+  // B_n = phi_n (x) reference, but only the gathered stamp pixels are used by
+  // the solve, so convolving the whole frame is wasteful. For each stamp we
+  // convolve just its window plus a one-kernel-radius halo: with the halo in
+  // place the zero-padded patch convolution reproduces the full-frame B_n
+  // exactly inside the stamp (and the halo clamps to the frame edge, where the
+  // zero padding is the same as the full-frame engine's).
+  const int nc = basis.component_count();
+  const int r = basis.radius();
   const int iw = static_cast<int>(w);
   const int ih = static_cast<int>(h);
 
@@ -51,9 +56,23 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     const int y1 = std::min(ih - 1, cy + stamp_radius);
     bool used = false;
 
+    // Reference patch covering the stamp plus a kernel-radius halo, and its
+    // per-component basis convolution (patch-local, zero-padded at patch edges).
+    const int ex0 = std::max(0, x0 - r), ex1 = std::min(iw - 1, x1 + r);
+    const int ey0 = std::max(0, y0 - r), ey1 = std::min(ih - 1, y1 + r);
+    const int pw = ex1 - ex0 + 1, ph = ey1 - ey0 + 1;
+    ImageF patch(pw, ph);
+    for (int yy = 0; yy < ph; ++yy) {
+      const float* rrow = reference.data() + static_cast<std::size_t>(ey0 + yy) * w + ex0;
+      std::copy(rrow, rrow + pw, patch.data() + static_cast<std::size_t>(yy) * pw);
+    }
+    const std::vector<ImageF> bn = basis_convolve(patch, basis);
+
     for (int y = y0; y <= y1; ++y) {
       for (int x = x0; x <= x1; ++x) {
         const std::size_t i = static_cast<std::size_t>(y) * w + x;
+        const std::size_t li =
+            static_cast<std::size_t>(y - ey0) * pw + (x - ex0);
         if (science.has_mask() && science.mask()[i] != kMaskGood) continue;
         if (reference.has_mask() && reference.mask()[i] != kMaskGood) continue;
         const float sv = science.data()[i];
@@ -72,7 +91,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
 
         bool finite_bn = true;
         for (int n = 0; n < nc; ++n)
-          if (!std::isfinite(bn[n].data()[i])) { finite_bn = false; break; }
+          if (!std::isfinite(bn[n].data()[li])) { finite_bn = false; break; }
         if (!finite_bn) continue;
 
         px.push_back(static_cast<double>(x));
@@ -80,7 +99,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         target.push_back(static_cast<double>(sv));
         weights.push_back(weight);
         for (int n = 0; n < nc; ++n)
-          bn_flat.push_back(static_cast<double>(bn[n].data()[i]));
+          bn_flat.push_back(static_cast<double>(bn[n].data()[li]));
         used = true;
       }
     }

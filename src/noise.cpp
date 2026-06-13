@@ -213,10 +213,33 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   const std::vector<int> oxs = origins(w, block, stride);
   const std::vector<int> oys = origins(h, block, stride);
 
-  ImageF buf(block, block);
-  for (int by : oys) {
-    for (int bx : oxs) {
-      // Reflect-pad the block region into an n x n buffer.
+  // Flatten the block grid so the (independent, FFT-heavy) blocks distribute
+  // over threads. Each thread builds its own FFTW plans/buffers once -- planning
+  // is not thread-safe (guarded) and was previously redone for every block via
+  // the per-call decorrelation_filter / apply_filter_fft helpers.
+  std::vector<std::pair<int, int>> origins_xy;
+  origins_xy.reserve(oxs.size() * oys.size());
+  for (int by : oys)
+    for (int bx : oxs) origins_xy.emplace_back(bx, by);
+
+  const std::size_t nn = static_cast<std::size_t>(block) * block;
+  const float inv_n2 = 1.0f / static_cast<float>(nn);
+
+#pragma omp parallel
+  {
+    Fft2d* fftp = nullptr;
+#pragma omp critical(delta_fftw_plan)
+    { fftp = new Fft2d(block); }
+    Fft2d& fft = *fftp;
+    const std::size_t nspec = static_cast<std::size_t>(block) * fft.nc;
+    std::vector<float> buf(nn);
+    std::vector<float> filter(nspec);
+
+#pragma omp for schedule(dynamic)
+    for (std::size_t bi = 0; bi < origins_xy.size(); ++bi) {
+      const int bx = origins_xy[bi].first, by = origins_xy[bi].second;
+
+      // Reflect-pad the block region into a local buffer.
       for (int iy = 0; iy < block; ++iy) {
         int sy = by + iy;
         if (sy < 0) sy = -sy - 1;
@@ -227,7 +250,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
           if (sx < 0) sx = -sx - 1;
           if (sx >= w) sx = 2 * w - sx - 1;
           sx = std::clamp(sx, 0, w - 1);
-          buf.data()[static_cast<std::size_t>(iy) * block + ix] =
+          buf[static_cast<std::size_t>(iy) * block + ix] =
               difference.data()[static_cast<std::size_t>(sy) * w + sx];
         }
       }
@@ -237,10 +260,29 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       const std::vector<float> kern = local_kernel(spatial, theta, basis, cx, cy);
       const double vs = block_mean(var_science, bx, by, block, w, h);
       const double vr = block_mean(var_reference, bx, by, block, w, h);
-      const std::vector<float> filter =
-          decorrelation_filter(kern, ks, vs, vr, block);
-      const ImageF filtered = apply_filter_fft(buf, filter, block);
 
+      // Decorrelation filter from |Khat|^2 (kernel_power reuses the thread's FFT
+      // buffers, so it must run before the block data is loaded into fft.real).
+      const std::vector<double> power = kernel_power(kern, ks, block, fft);
+      double sumk2 = 0.0;
+      for (float v : kern) sumk2 += static_cast<double>(v) * v;
+      const double cnum = std::sqrt(std::max(vs + vr * sumk2, 0.0));
+      for (std::size_t i = 0; i < nspec; ++i) {
+        const double denom = vs + vr * power[i];
+        filter[i] = denom > 0.0 ? static_cast<float>(cnum / std::sqrt(denom)) : 0.0f;
+      }
+
+      // Apply the filter to this block.
+      std::copy(buf.begin(), buf.end(), fft.real);
+      fftwf_execute(fft.fwd);
+      for (std::size_t i = 0; i < nspec; ++i) {
+        fft.freq[i][0] *= filter[i];
+        fft.freq[i][1] *= filter[i];
+      }
+      fftwf_execute(fft.inv);
+
+      // Hann-weighted blend into the shared accumulators (cheap; serialised).
+#pragma omp critical(delta_decorr_blend)
       for (int iy = 0; iy < block; ++iy) {
         const int y = by + iy;
         if (y < 0 || y >= h) continue;
@@ -249,11 +291,14 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
           if (x < 0 || x >= w) continue;
           const double wgt = hann2d(iy, ix, block);
           const std::size_t i = static_cast<std::size_t>(y) * w + x;
-          acc[i] += wgt * filtered.data()[static_cast<std::size_t>(iy) * block + ix];
+          acc[i] += wgt * fft.real[static_cast<std::size_t>(iy) * block + ix] * inv_n2;
           wsum[i] += wgt;
         }
       }
     }
+
+#pragma omp critical(delta_fftw_plan)
+    { delete fftp; }
   }
 
   ImageF out(w, h);

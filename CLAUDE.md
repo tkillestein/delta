@@ -25,8 +25,16 @@ uv run ruff format            # format
 uv run ty check               # type-check
 ```
 
-After editing any C++ source/header, re-run `uv sync` (or `uv run pytest`, which
-rebuilds) to recompile the `_core` extension — Python-only changes do not need a rebuild.
+After editing any C++ source/header, recompile the `_core` extension with
+`uv sync --reinstall-package delta`. **Plain `uv sync` / `uv run pytest` do NOT
+rebuild on source changes** — uv keys reinstall on the package version (unchanged),
+so it reports "Checked N packages" and silently runs the stale binary. Python-only
+changes do not need a rebuild.
+
+The core is built `-O3 -march=native` (see `CMakeLists.txt`); the `-O3` is re-asserted
+after nanobind's default `-Os` (last `-O` wins) because `-Os` disables the
+vectorisation the convolution/variance/score hot loops depend on. Set
+`-DDELTA_NATIVE=OFF` for a portable (non-host-tuned) wheel.
 
 System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen, CFITSIO, FFTW
 (`fftw3f`). OpenMP is used if found.
@@ -45,10 +53,18 @@ orchestrated by the Python package in `python/delta/`.
 - `basis` — separable Cartesian Gauss-Hermite kernel basis (scale `beta`, order `n_max`).
 - `convolve` — separable/SIMD convolution; precomputes `B_n = φ_n ⊗ R`.
 - `spatial` — low-rank thin-plate regression spline: knots, design, bending-energy penalty.
-- `solve` — penalized GLS normal equations (Eigen) + GCV λ selection.
+- `solve` — penalized GLS normal equations (Eigen) + GCV λ selection. The `M = XᵀWX`
+  build is threaded over row chunks via symmetric `rankUpdate` on the whitened design,
+  and the λ grid is evaluated in parallel.
 - `detect` — stamp detection/selection, FWHM and convolution-direction estimation.
-- `subtract` — full-frame model evaluation, difference, variance/mask propagation.
-- `noise` — ZOGY-style decorrelation (apodized FFT blocks, FFTW) + match-filter score.
+- `subtract` — full-frame model evaluation, difference, variance/mask propagation. The
+  model streams each component's y-pass fused into the `aₙ` accumulate (no full `B_n`
+  stack). Variance uses a **block-effective squared-kernel** convolution: per tile, freeze
+  `K=Σaₙφₙ` at the tile centre, square it, and convolve `Var(R)` directly — exact for a
+  spatially-constant kernel, a per-tile piecewise-constant approximation otherwise, and far
+  cheaper than the `nc(nc+1)/2` separable products the exact expansion needs.
+- `noise` — ZOGY-style decorrelation (apodized FFT blocks, FFTW; threaded over blocks with
+  per-thread reused plans) + match-filter score.
 - `fit` — ties stamps + basis + spatial together into the kernel solve.
 
 **Python layer** (`python/delta/`):

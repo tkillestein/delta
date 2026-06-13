@@ -107,10 +107,12 @@ class Subtractor:
         n_max: int = 6,
         beta: float | None = None,
         n_knots: int = 5,
+        radius: int = 0,
         stamp_radius: int = 15,
         threshold_sigma: float = 5.0,
         max_stamps: int = 200,
         saturation: float = 0.0,
+        bright_mask: float = 0.0,
         lambda_grid: NDArray[np.float64] | None = None,
         clip_sigma: float = 4.0,
         clip_iterations: int = 5,
@@ -124,10 +126,20 @@ class Subtractor:
         self.n_max = n_max
         self.beta = beta
         self.n_knots = n_knots
+        # Kernel footprint half-width; 0 auto-sizes from beta/n_max. Larger values
+        # capture more of the matching-kernel wings (HOTPANTS uses -r ~13).
+        self.radius = radius
         self.stamp_radius = stamp_radius
         self.threshold_sigma = threshold_sigma
         self.max_stamps = max_stamps
+        # `saturation` is the instrument detector level: genuinely saturated
+        # (non-linear) pixels, rejected from stamp selection AND masked in the
+        # output. `bright_mask` is a data-driven, output-only level: it masks the
+        # cores of bright (but linear) stars whose few-percent PSF-match residual
+        # would otherwise dominate the difference, without removing those high-SNR
+        # stars from the kernel fit. Both grow by the kernel radius in the output.
         self.saturation = saturation
+        self.bright_mask = bright_mask
         self.lambda_grid = (
             np.logspace(-6.0, 6.0, 25) if lambda_grid is None else np.asarray(lambda_grid)
         )
@@ -252,6 +264,7 @@ class Subtractor:
                 beta,
                 self.n_max,
                 self.lambda_grid,
+                radius=self.radius,
                 clip_sigma=self.clip_sigma,
                 clip_iterations=self.clip_iterations,
                 min_stamps=self.min_stamps,
@@ -283,7 +296,7 @@ class Subtractor:
         solution = KernelSolution(
             beta=beta,
             n_max=self.n_max,
-            radius=0,
+            radius=self.radius,
             knots=knots,
             theta=fit["theta"],
             n_components=fit["n_components"],
@@ -366,6 +379,11 @@ class Subtractor:
         )
         target, conv, tvar, cvar, tmask, cmask, sign, stamp_x, stamp_y = layers
 
+        # Output bright-core mask threshold: the lowest positive of the
+        # instrument saturation and the data-level bright mask (stamp selection
+        # already used `saturation` alone, so bright_mask never culls the fit).
+        out_levels = [v for v in (self.saturation, self.bright_mask) if v and v > 0]
+        out_saturation = min(out_levels) if out_levels else 0.0
         with log_timing("full-frame subtraction"):
             diff = _core.subtract(
                 target,
@@ -374,7 +392,8 @@ class Subtractor:
                 solution.theta,
                 solution.beta,
                 solution.n_max,
-                saturation=self.saturation,
+                radius=solution.radius,
+                saturation=out_saturation,
                 science_var=tvar,
                 reference_var=cvar,
                 science_mask=tmask,
@@ -437,8 +456,8 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     """Convenience wrapper: configure a :class:`Subtractor` and run it once.
 
     Configuration keywords (``n_max``, ``beta``, ``n_knots``, ``stamp_radius``,
-    ``threshold_sigma``, ``max_stamps``, ``saturation``, ``lambda_grid``,
-    ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
+    ``threshold_sigma``, ``max_stamps``, ``saturation``, ``bright_mask``,
+    ``lambda_grid``, ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
     ``spatial_scale``, ``decorrelate``, ``score``, ``block``) are split from
     the per-call inputs
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
@@ -448,10 +467,12 @@ def subtract(science, reference, **kwargs) -> DiffResult:
         "n_max",
         "beta",
         "n_knots",
+        "radius",
         "stamp_radius",
         "threshold_sigma",
         "max_stamps",
         "saturation",
+        "bright_mask",
         "lambda_grid",
         "clip_sigma",
         "clip_iterations",

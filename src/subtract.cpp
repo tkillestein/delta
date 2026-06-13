@@ -339,18 +339,24 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       dilate_mask(grown, ww, hh, r);
       for (std::size_t i = 0; i < out.size(); ++i) out[i] |= grown[i];
     }
-    // Bright/saturated cores in either input are non-linear and never match the
-    // model; flag and grow them by the kernel radius so their large residual is
-    // kept out of the difference (SPEC §3.6). Uses the raw reference (pre-sanitise).
+    // Bright/saturated cores are non-linear and never match the model; flag them
+    // so their large residual stays out of the difference (SPEC §3.6). A saturated
+    // *reference* (convolved) pixel contaminates a whole kernel footprint, so it
+    // is grown by the kernel radius; a saturated *science* (target) pixel is not
+    // convolved, so it propagates one-to-one -- growing it too is what produced
+    // the oversized boxes around every bright star.
     if (saturation > 0.0) {
       const float sat = static_cast<float>(saturation);
-      const float* sd = science.data();
       const float* rd = reference.data();
       std::vector<MaskType> hot(out.size(), kMaskGood);
       for (std::size_t i = 0; i < out.size(); ++i)
-        if (sd[i] >= sat || rd[i] >= sat) hot[i] = kMaskSaturated;
+        if (rd[i] >= sat) hot[i] = kMaskSaturated;
       dilate_mask(hot, ww, hh, r);
-      for (std::size_t i = 0; i < out.size(); ++i) out[i] |= hot[i];
+      const float* sd = science.data();
+      for (std::size_t i = 0; i < out.size(); ++i) {
+        if (sd[i] >= sat) hot[i] |= kMaskSaturated;  // target pixel: 1:1
+        out[i] |= hot[i];
+      }
     }
     // Edge border of one kernel half-width, and any non-finite difference pixel.
     for (int y = 0; y < hh; ++y) {

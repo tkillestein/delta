@@ -386,24 +386,24 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
         fill = good[good.size() / 2];
       }
     }
-    // Resolve masked-pixel values. The exact saturated cores are non-linear
-    // garbage -> set to the background median (cosmetic). Pixels masked *only*
-    // because they fall in a saturated core's grown footprint keep their real
-    // difference value, so the subtraction there can still be assessed (the mask
-    // still flags them). All other masked pixels (edge, non-finite, input masks)
-    // are zeroed, as their values are not meaningful.
+    // Resolve masked-pixel values. Only genuinely meaningless pixels are
+    // overwritten: non-finite ones are zeroed, and the exact (un-dilated)
+    // saturated cores -- which are non-linear and never match the model -- are
+    // set to the background median. Every other masked pixel keeps its real
+    // difference (and variance): the mask grows to flag the affected footprint,
+    // but the subtraction itself is preserved so PSF wings and transients close
+    // to bright stars / mask edges stay assessable. (Setting the whole grown
+    // footprint to a constant boxed out exactly those wings.)
     for (std::size_t i = 0; i < out.size(); ++i) {
       if (out[i] == kMaskGood) continue;
-      const bool nonfin = !std::isfinite(dd[i]);
-      if (!nonfin && !exact_sat.empty() && exact_sat[i]) {
-        dd[i] = fill;
-        if (has_var) vv[i] = 0.0f;
-      } else if (!nonfin && out[i] == kMaskSaturated) {
-        // saturation-grown halo only: preserve the real difference (and variance).
-      } else {
+      if (!std::isfinite(dd[i])) {
         dd[i] = 0.0f;
         if (has_var) vv[i] = 0.0f;
+      } else if (!exact_sat.empty() && exact_sat[i]) {
+        dd[i] = fill;
+        if (has_var) vv[i] = 0.0f;
       }
+      // otherwise: masked by mask growth / edge / input layers -> preserve.
     }
   }
 

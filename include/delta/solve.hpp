@@ -44,4 +44,20 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                         const ThinPlateBasis& basis,
                         const std::vector<double>& lambda_grid);
 
+// Select lambda by k-fold *group* cross-validation rather than GCV. `group[i]`
+// assigns pixel i to a fold (0..n_groups-1); folds should be whole stamps so the
+// held-out prediction error respects the strong within-stamp pixel correlation
+// that makes GCV under-smooth (and over-fit the spatial field). For each lambda
+// every fold is predicted from a fit on the others; the lambda minimising total
+// held-out weighted SSE is chosen, then the final fit uses all pixels. The
+// per-fold normal equations are formed once and reused (M_train = M_all - M_fold),
+// so the cost is k*|grid| small dense solves, not k*|grid| re-assemblies.
+GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
+                       const Eigen::Ref<const Eigen::VectorXd>& target,
+                       const Eigen::Ref<const Eigen::VectorXd>& weights,
+                       const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                       const ThinPlateBasis& basis,
+                       const std::vector<double>& lambda_grid,
+                       const std::vector<int>& group, int n_groups);
+
 }  // namespace delta

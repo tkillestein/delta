@@ -367,6 +367,21 @@ nb::dict solve_gls_gcv(const Eigen::MatrixXd& knots,
       delta::solve_gls_gcv(points, target, weights, bn, basis, grid));
 }
 
+// As solve_gls_gcv but selecting lambda by k-fold group cross-validation; `group`
+// is the fold id per pixel (gcv_curve in the result holds the CV-error curve).
+nb::dict solve_gls_cv(const Eigen::MatrixXd& knots, const Eigen::MatrixXd& points,
+                      const Eigen::VectorXd& target,
+                      const Eigen::VectorXd& weights, const Eigen::MatrixXd& bn,
+                      const Eigen::VectorXd& lambda_grid,
+                      InArray1D<std::int32_t> group, int n_groups) {
+  const delta::ThinPlateBasis basis(knots);
+  const std::vector<double> grid(lambda_grid.data(),
+                                 lambda_grid.data() + lambda_grid.size());
+  const std::vector<int> grp(group.data(), group.data() + group.size());
+  return gls_result_to_dict(
+      delta::solve_gls_cv(points, target, weights, bn, basis, grid, grp, n_groups));
+}
+
 // ---- subtract (full-frame spatially-varying subtraction) -------------------
 
 // Build an ImageF from data with optional variance and mask layers.
@@ -397,7 +412,7 @@ delta::ImageF make_image_vm(InArray<float> data,
 // present only when the inputs carry the corresponding layers).
 nb::dict subtract(InArray<float> science, InArray<float> reference,
                   const Eigen::MatrixXd& knots, const Eigen::VectorXd& theta,
-                  double beta, int n_max, int radius,
+                  double beta, int n_max, int radius, double saturation,
                   std::optional<InArray<float>> science_var,
                   std::optional<InArray<float>> reference_var,
                   std::optional<InArray<std::uint8_t>> science_mask,
@@ -409,7 +424,7 @@ nb::dict subtract(InArray<float> science, InArray<float> reference,
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
 
-  delta::ImageF diff = delta::subtract(sci, ref, spatial, theta, basis);
+  delta::ImageF diff = delta::subtract(sci, ref, spatial, theta, basis, saturation);
   const std::size_t h = diff.height();
   const std::size_t w = diff.width();
 
@@ -435,6 +450,8 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
                     InArray1D<std::int32_t> stamp_y, int stamp_radius,
                     double beta, int n_max,
                     const Eigen::VectorXd& lambda_grid, int radius,
+                    double clip_sigma, int clip_iterations, int min_stamps,
+                    int cv_folds,
                     std::optional<InArray<float>> science_var,
                     std::optional<InArray<float>> reference_var,
                     std::optional<InArray<std::uint8_t>> science_mask,
@@ -451,13 +468,25 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
                                  lambda_grid.data() + lambda_grid.size());
 
   const delta::KernelFit fit =
-      delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid);
+      delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
+                        clip_sigma, clip_iterations, min_stamps, cv_folds);
 
   nb::dict out = gls_result_to_dict(fit.gls);
   out["component_sums"] = to_numpy<double>(
       std::vector<double>(fit.component_sums), {fit.component_sums.size()});
   out["n_pixels"] = fit.n_pixels;
   out["n_stamps_used"] = fit.n_stamps_used;
+  out["n_stamps_total"] = fit.n_stamps_total;
+  out["n_stamps_rejected"] = fit.n_stamps_rejected;
+  out["reduced_chi2"] = fit.reduced_chi2;
+  out["stamp_x"] = to_numpy<int>(std::vector<int>(fit.stamp_x),
+                                 {fit.stamp_x.size()});
+  out["stamp_y"] = to_numpy<int>(std::vector<int>(fit.stamp_y),
+                                 {fit.stamp_y.size()});
+  out["stamp_chi2"] = to_numpy<double>(std::vector<double>(fit.stamp_chi2),
+                                       {fit.stamp_chi2.size()});
+  out["stamp_accepted"] = to_numpy<std::uint8_t>(
+      std::vector<std::uint8_t>(fit.stamp_accepted), {fit.stamp_accepted.size()});
   return out;
 }
 
@@ -627,21 +656,29 @@ NB_MODULE(_core, m) {
   m.def("solve_gls_gcv", &solve_gls_gcv, "knots"_a, "points"_a, "target"_a,
         "weights"_a, "bn"_a, "lambda_grid"_a,
         "Penalised GLS selecting lambda by GCV over lambda_grid.");
+  m.def("solve_gls_cv", &solve_gls_cv, "knots"_a, "points"_a, "target"_a,
+        "weights"_a, "bn"_a, "lambda_grid"_a, "group"_a, "n_groups"_a,
+        "Penalised GLS selecting lambda by k-fold group cross-validation "
+        "(group = fold id per pixel); gcv_curve holds the CV-error curve.");
 
   m.def("subtract", &subtract, "science"_a, "reference"_a, "knots"_a, "theta"_a,
-        "beta"_a, "n_max"_a, "radius"_a = 0, "science_var"_a = nb::none(),
-        "reference_var"_a = nb::none(), "science_mask"_a = nb::none(),
-        "reference_mask"_a = nb::none(),
+        "beta"_a, "n_max"_a, "radius"_a = 0, "saturation"_a = 0.0,
+        "science_var"_a = nb::none(), "reference_var"_a = nb::none(),
+        "science_mask"_a = nb::none(), "reference_mask"_a = nb::none(),
         "Full-frame spatially-varying subtraction with variance/mask "
-        "propagation; returns {'difference','variance','mask'}.");
+        "propagation; saturation>0 masks+grows bright cores. Returns "
+        "{'difference','variance','mask'}.");
 
   m.def("fit_kernel", &fit_kernel, "science"_a, "reference"_a, "knots"_a,
         "stamp_x"_a, "stamp_y"_a, "stamp_radius"_a, "beta"_a, "n_max"_a,
-        "lambda_grid"_a, "radius"_a = 0, "science_var"_a = nb::none(),
-        "reference_var"_a = nb::none(), "science_mask"_a = nb::none(),
-        "reference_mask"_a = nb::none(),
+        "lambda_grid"_a, "radius"_a = 0, "clip_sigma"_a = 4.0,
+        "clip_iterations"_a = 5, "min_stamps"_a = 5, "cv_folds"_a = 0,
+        "science_var"_a = nb::none(), "reference_var"_a = nb::none(),
+        "science_mask"_a = nb::none(), "reference_mask"_a = nb::none(),
         "Fit the matching kernel + background from stamp pixels via penalised "
-        "GLS; returns the solver result plus component_sums/n_pixels.");
+        "GLS, with iterative per-stamp sigma clipping. Returns the solver result "
+        "plus component_sums, n_pixels, per-stamp chi^2 and goodness-of-fit "
+        "diagnostics (reduced_chi2, n_stamps_used/total/rejected).");
   m.def("photometric_scale", &photometric_scale, "knots"_a, "theta"_a,
         "component_sums"_a, "height"_a, "width"_a,
         "Per-pixel photometric scale field sum_n a_n(x,y) S_n, shape (H,W).");

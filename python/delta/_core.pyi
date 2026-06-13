@@ -53,6 +53,13 @@ KernelFit = TypedDict(
         "component_sums": NDArray[np.float64],
         "n_pixels": int,
         "n_stamps_used": int,
+        "n_stamps_total": int,
+        "n_stamps_rejected": int,
+        "reduced_chi2": float,
+        "stamp_x": NDArray[np.int32],
+        "stamp_y": NDArray[np.int32],
+        "stamp_chi2": NDArray[np.float64],
+        "stamp_accepted": NDArray[np.uint8],
     },
 )
 
@@ -178,6 +185,18 @@ def solve_gls_gcv(
 ) -> GlsResult:
     """Penalised GLS selecting lambda by GCV over lambda_grid."""
 
+def solve_gls_cv(
+    knots: NDArray[np.float64],
+    points: NDArray[np.float64],
+    target: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    bn: NDArray[np.float64],
+    lambda_grid: NDArray[np.float64],
+    group: NDArray[np.int32],
+    n_groups: int,
+) -> GlsResult:
+    """Penalised GLS selecting lambda by k-fold group cross-validation."""
+
 def subtract(
     science: NDArray[np.float32],
     reference: NDArray[np.float32],
@@ -186,12 +205,14 @@ def subtract(
     beta: float,
     n_max: int,
     radius: int = ...,
+    saturation: float = ...,
     science_var: NDArray[np.float32] | None = ...,
     reference_var: NDArray[np.float32] | None = ...,
     science_mask: NDArray[np.uint8] | None = ...,
     reference_mask: NDArray[np.uint8] | None = ...,
 ) -> DiffProducts:
-    """Full-frame spatially-varying subtraction with variance/mask propagation."""
+    """Full-frame spatially-varying subtraction with variance/mask propagation;
+    saturation>0 masks and grows bright/saturated cores."""
 
 def fit_kernel(
     science: NDArray[np.float32],
@@ -204,12 +225,18 @@ def fit_kernel(
     n_max: int,
     lambda_grid: NDArray[np.float64],
     radius: int = ...,
+    clip_sigma: float = ...,
+    clip_iterations: int = ...,
+    min_stamps: int = ...,
+    cv_folds: int = ...,
     science_var: NDArray[np.float32] | None = ...,
     reference_var: NDArray[np.float32] | None = ...,
     science_mask: NDArray[np.uint8] | None = ...,
     reference_mask: NDArray[np.uint8] | None = ...,
 ) -> KernelFit:
-    """Fit the matching kernel + background from stamp pixels via penalised GLS."""
+    """Fit the matching kernel + background via penalised GLS with per-stamp
+    sigma clipping. The returned dict adds reduced_chi2, n_stamps_total/used/
+    rejected and per-stamp stamp_x/stamp_y/stamp_chi2/stamp_accepted."""
 
 def photometric_scale(
     knots: NDArray[np.float64],

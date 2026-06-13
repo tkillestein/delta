@@ -41,9 +41,14 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
 // If either input carries a mask the difference carries the science mask unioned
 // with the reference mask dilated by the kernel radius, plus a one-kernel-radius
 // edge border (kMaskEdge); non-finite difference pixels are flagged.
+// `saturation` (> 0) flags pixels at or above that level in either input as
+// kMaskSaturated and grows them by the kernel radius: a bright/saturated stellar
+// core is non-linear and never matches the model, so propagating it leaves a
+// large spurious residual; masking the affected footprint keeps it out of the
+// difference (and downstream detection). 0 disables it.
 ImageF subtract(const ImageF& science, const ImageF& reference,
                 const ThinPlateBasis& spatial,
                 const Eigen::Ref<const Eigen::VectorXd>& theta,
-                const GaussHermiteBasis& basis);
+                const GaussHermiteBasis& basis, double saturation = 0.0);
 
 }  // namespace delta

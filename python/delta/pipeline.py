@@ -104,14 +104,21 @@ class Subtractor:
     def __init__(
         self,
         *,
-        n_max: int = 6,
-        beta: float | None = None,
+        n_max: int = 6,  # 6 is a robust default; 8 sharpens bright-star cores on
+        beta: float | None = None,  # well-sampled frames (overfits sparse ones).
         n_knots: int = 5,
+        radius: int = 0,
         stamp_radius: int = 15,
         threshold_sigma: float = 5.0,
         max_stamps: int = 200,
         saturation: float = 0.0,
+        bright_mask: float = 0.0,
         lambda_grid: NDArray[np.float64] | None = None,
+        clip_sigma: float = 4.0,
+        clip_iterations: int = 5,
+        min_stamps: int = 5,
+        cv_folds: int = 5,
+        spatial_scale: float | None = None,
         decorrelate: bool = False,
         score: bool = False,
         block: int = 256,
@@ -119,13 +126,33 @@ class Subtractor:
         self.n_max = n_max
         self.beta = beta
         self.n_knots = n_knots
+        # Kernel footprint half-width; 0 auto-sizes from beta/n_max. Larger values
+        # capture more of the matching-kernel wings (HOTPANTS uses -r ~13).
+        self.radius = radius
         self.stamp_radius = stamp_radius
         self.threshold_sigma = threshold_sigma
         self.max_stamps = max_stamps
+        # `saturation` is the instrument detector level: genuinely saturated
+        # (non-linear) pixels, rejected from stamp selection AND masked in the
+        # output. `bright_mask` is a data-driven, output-only level: it masks the
+        # cores of bright (but linear) stars whose few-percent PSF-match residual
+        # would otherwise dominate the difference, without removing those high-SNR
+        # stars from the kernel fit. Both grow by the kernel radius in the output.
         self.saturation = saturation
+        self.bright_mask = bright_mask
         self.lambda_grid = (
             np.logspace(-6.0, 6.0, 25) if lambda_grid is None else np.asarray(lambda_grid)
         )
+        self.clip_sigma = clip_sigma
+        self.clip_iterations = clip_iterations
+        self.min_stamps = min_stamps
+        # cv_folds >= 2 selects the spatial smoothing by leave-stamp-out k-fold CV
+        # (more robust than GCV, which under-smooths correlated stamp pixels).
+        self.cv_folds = cv_folds
+        # Physical prior: the kernel varies on scales >> a stamp, so knots are
+        # placed no finer than `spatial_scale` pixels apart (a coarse spatial
+        # basis can't over-fit small-scale structure). None keeps `n_knots`.
+        self.spatial_scale = spatial_scale
         self.decorrelate = decorrelate
         self.score = score
         self.block = block
@@ -215,7 +242,14 @@ class Subtractor:
         )
 
         h, w = sci.shape
-        knots = _core.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, self.n_knots, self.n_knots)
+        # Knot grid: honour `spatial_scale` (don't place knots finer than the
+        # expected variation scale) so the spatial basis stays coarse.
+        nkx, nky = self.n_knots, self.n_knots
+        if self.spatial_scale is not None and self.spatial_scale > 0:
+            nkx = int(np.clip(round((w - 1) / self.spatial_scale) + 1, 3, self.n_knots))
+            nky = int(np.clip(round((h - 1) / self.spatial_scale) + 1, 3, self.n_knots))
+            logger.debug("spatial_scale={:.0f}px -> {}x{} knots", self.spatial_scale, nkx, nky)
+        knots = _core.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, nkx, nky)
         stamp_x = np.ascontiguousarray(sel["x"], dtype=np.int32)
         stamp_y = np.ascontiguousarray(sel["y"], dtype=np.int32)
 
@@ -230,26 +264,39 @@ class Subtractor:
                 beta,
                 self.n_max,
                 self.lambda_grid,
+                radius=self.radius,
+                clip_sigma=self.clip_sigma,
+                clip_iterations=self.clip_iterations,
+                min_stamps=self.min_stamps,
+                cv_folds=self.cv_folds,
                 science_var=tvar,
                 reference_var=cvar,
                 science_mask=tmask,
                 reference_mask=cmask,
             )
+        selector = f"{self.cv_folds}-fold CV" if self.cv_folds > 1 else "GCV"
         logger.info(
-            "kernel fit: lambda={:.3g}, GCV={:.4g}, eff.dof={:.1f}, "
-            "RSS={:.4g} ({}/{} stamps, {} px)",
+            "kernel fit: lambda={:.3g} ({}), eff.dof={:.1f}, "
+            "reduced chi2={:.3f} ({} stamps used, {} rejected of {}, {} px)",
             fit["lambda"],
-            fit["gcv"],
+            selector,
             fit["effective_dof"],
-            fit["rss"],
+            fit["reduced_chi2"],
             fit["n_stamps_used"],
-            n_stamps,
+            fit["n_stamps_rejected"],
+            fit["n_stamps_total"],
             fit["n_pixels"],
         )
+        if fit["reduced_chi2"] > 3.0:
+            logger.warning(
+                "kernel fit reduced chi2={:.2f} >> 1: stellar residuals likely. "
+                "Check registration (dipoles), basis (n_max/beta), or knots.",
+                fit["reduced_chi2"],
+            )
         solution = KernelSolution(
             beta=beta,
             n_max=self.n_max,
-            radius=0,
+            radius=self.radius,
             knots=knots,
             theta=fit["theta"],
             n_components=fit["n_components"],
@@ -261,6 +308,13 @@ class Subtractor:
             component_sums=fit["component_sums"],
             direction=direction,
             shape=(h, w),
+            reduced_chi2=fit["reduced_chi2"],
+            n_stamps_used=fit["n_stamps_used"],
+            n_stamps_rejected=fit["n_stamps_rejected"],
+            stamp_x=fit["stamp_x"],
+            stamp_y=fit["stamp_y"],
+            stamp_chi2=fit["stamp_chi2"],
+            stamp_accepted=fit["stamp_accepted"],
         )
         layers = (target, conv, tvar, cvar, tmask, cmask, sign, stamp_x, stamp_y)
         return solution, layers
@@ -325,6 +379,11 @@ class Subtractor:
         )
         target, conv, tvar, cvar, tmask, cmask, sign, stamp_x, stamp_y = layers
 
+        # Output bright-core mask threshold: the lowest positive of the
+        # instrument saturation and the data-level bright mask (stamp selection
+        # already used `saturation` alone, so bright_mask never culls the fit).
+        out_levels = [v for v in (self.saturation, self.bright_mask) if v and v > 0]
+        out_saturation = min(out_levels) if out_levels else 0.0
         with log_timing("full-frame subtraction"):
             diff = _core.subtract(
                 target,
@@ -333,6 +392,8 @@ class Subtractor:
                 solution.theta,
                 solution.beta,
                 solution.n_max,
+                radius=solution.radius,
+                saturation=out_saturation,
                 science_var=tvar,
                 reference_var=cvar,
                 science_mask=tmask,
@@ -395,8 +456,10 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     """Convenience wrapper: configure a :class:`Subtractor` and run it once.
 
     Configuration keywords (``n_max``, ``beta``, ``n_knots``, ``stamp_radius``,
-    ``threshold_sigma``, ``max_stamps``, ``saturation``, ``lambda_grid``,
-    ``decorrelate``, ``score``, ``block``) are split from the per-call inputs
+    ``threshold_sigma``, ``max_stamps``, ``saturation``, ``bright_mask``,
+    ``lambda_grid``, ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
+    ``spatial_scale``, ``decorrelate``, ``score``, ``block``) are split from
+    the per-call inputs
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
     ``gain``, ``read_noise``, ``catalog``, ``direction``).
     """
@@ -404,11 +467,18 @@ def subtract(science, reference, **kwargs) -> DiffResult:
         "n_max",
         "beta",
         "n_knots",
+        "radius",
         "stamp_radius",
         "threshold_sigma",
         "max_stamps",
         "saturation",
+        "bright_mask",
         "lambda_grid",
+        "clip_sigma",
+        "clip_iterations",
+        "min_stamps",
+        "cv_folds",
+        "spatial_scale",
         "decorrelate",
         "score",
         "block",

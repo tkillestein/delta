@@ -3,7 +3,6 @@
 #include <cstddef>
 
 namespace delta {
-namespace {
 
 // 1-D convolution along x (fast axis), zero-padded, 'same' size.
 // out[y,x] = sum_j k[j] * in[y, x + h - j]   (j = m + h, h = ksize/2).
@@ -66,8 +65,6 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
   }
   return out;
 }
-
-}  // namespace
 
 ImageF convolve_separable(const ImageF& image, const std::vector<float>& kx,
                           const std::vector<float>& ky) {

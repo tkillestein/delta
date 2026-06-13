@@ -70,24 +70,28 @@ Eigen::MatrixXd ThinPlateBasis::design(
   const int k = n_knots();
   const int nr = k - 3;
 
-  Eigen::MatrixXd un(m, 2);
-  un.col(0) = (points.col(0).array() - cx_) / scale_;
-  un.col(1) = (points.col(1).array() - cy_) / scale_;
+  const Eigen::ArrayXd ux = (points.col(0).array() - cx_) / scale_;
+  const Eigen::ArrayXd uy = (points.col(1).array() - cy_) / scale_;
 
+  // sigma(i, j) = U(|point_i - knot_j|), U(r) = r^2 log r = 0.5 r^2 log r^2.
+  // Built one knot-column at a time so the r^2 / log / select run as SIMD-
+  // vectorised array expressions (Eigen's packet log under -march=native),
+  // instead of m*k scalar std::log calls -- this loop is evaluated once per
+  // pixel row over the whole frame and dominated the field evaluation.
   Eigen::MatrixXd sigma(m, k);
-  for (int i = 0; i < m; ++i) {
-    for (int j = 0; j < k; ++j) {
-      const double dx = un(i, 0) - knots_(j, 0);
-      const double dy = un(i, 1) - knots_(j, 1);
-      sigma(i, j) = tps_green(dx * dx + dy * dy);
-    }
+  for (int j = 0; j < k; ++j) {
+    const Eigen::ArrayXd dx = ux - knots_(j, 0);
+    const Eigen::ArrayXd dy = uy - knots_(j, 1);
+    const Eigen::ArrayXd r2 = dx * dx + dy * dy;
+    sigma.col(j) =
+        (r2 > 0.0).select(0.5 * r2 * r2.log(), Eigen::ArrayXd::Zero(m)).matrix();
   }
 
   Eigen::MatrixXd d(m, k);
   if (nr > 0) d.leftCols(nr) = sigma * nullspace_;
   d.col(nr).setOnes();
-  d.col(nr + 1) = un.col(0);
-  d.col(nr + 2) = un.col(1);
+  d.col(nr + 1) = ux.matrix();
+  d.col(nr + 2) = uy.matrix();
   return d;
 }
 

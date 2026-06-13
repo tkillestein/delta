@@ -85,6 +85,7 @@ def test_decorrelate_and_score_paths_run(preview):
         ref,
         gain=1.5,
         read_noise=4.0,
+        n_max=2,  # this path test fixes the basis order, independent of the default
         n_knots=4,
         stamp_radius=12,
         decorrelate=True,
@@ -137,9 +138,23 @@ def test_write_fits_products(tmp_path):
     ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
     res = delta.subtract(sci, ref, gain=1.5, n_knots=3, stamp_radius=12)
 
+    # Default (compressed) layout: provenance in the dataless primary, the
+    # difference in a DIFFERENCE extension. Compression is quantised, so the
+    # round-trip is approximate.
     path = str(tmp_path / "diff.fits")
     res.write(path)
     with fits.open(path) as hdul:
+        assert hdul[0].header["DLTCONV"] == "reference"
+        assert hdul[0].data is None
+        assert "DIFFERENCE" in hdul
+        assert "VARIANCE" in hdul
+        scale = np.median(np.abs(res.difference)) + 1e-6
+        np.testing.assert_allclose(hdul["DIFFERENCE"].data, res.difference, atol=0.1 * scale)
+
+    # Legacy (uncompressed) layout: difference in the primary, exact round-trip.
+    plain = str(tmp_path / "diff_plain.fits")
+    res.write(plain, compress=False)
+    with fits.open(plain) as hdul:
         assert hdul[0].header["DLTCONV"] == "reference"
         assert "VARIANCE" in hdul
         np.testing.assert_allclose(hdul[0].data, res.difference, rtol=1e-6)

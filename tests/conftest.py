@@ -30,6 +30,23 @@ def _panel(label, arr):
     return _gray(arr, lo, hi if hi > lo else lo + 1.0)
 
 
+@pytest.fixture(autouse=True)
+def _silence_delta_logging():
+    """Restore delta's silent-by-default logging after every test.
+
+    The CLI tests call ``configure_logging``, which binds a loguru sink to the
+    (captured) ``sys.stderr`` and enables the ``delta`` namespace globally. Left
+    in place, that stale sink leaks into later library-only tests and raises
+    "I/O operation on closed file" once pytest tears the captured stream down.
+    Re-asserting the library default (no sinks, namespace disabled) isolates it.
+    """
+    from loguru import logger
+
+    yield
+    logger.remove()
+    logger.disable("delta")
+
+
 @pytest.fixture
 def preview():
     """Return save(name, **panels) writing tests/artifacts/<name>.jpg (or no-op)."""

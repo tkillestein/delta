@@ -104,8 +104,8 @@ class Subtractor:
     def __init__(
         self,
         *,
-        n_max: int = 6,
-        beta: float | None = None,
+        n_max: int = 6,  # 6 is a robust default; 8 sharpens bright-star cores on
+        beta: float | None = None,  # well-sampled frames (overfits sparse ones).
         n_knots: int = 5,
         radius: int = 0,
         stamp_radius: int = 15,

@@ -122,7 +122,6 @@ class Subtractor:
         decorrelate: bool = False,
         score: bool = False,
         block: int = 256,
-        fill_holes: bool = True,
     ) -> None:
         self.n_max = n_max
         self.beta = beta
@@ -157,9 +156,6 @@ class Subtractor:
         self.decorrelate = decorrelate
         self.score = score
         self.block = block
-        # Cosmetically fill masked difference pixels with the background median
-        # (the mask itself is preserved). Set False to keep masked holes at zero.
-        self.fill_holes = fill_holes
 
     # -- internals -----------------------------------------------------------
 
@@ -447,14 +443,6 @@ class Subtractor:
                 score = _core.matched_filter(whitened, psf, noise_var)
 
         out_diff = whitened if self.decorrelate else difference
-        # Cosmetic: fill masked holes with the unmasked median so they sit at the
-        # background level instead of a hard zero, which stands out under a tight
-        # difference stretch. The mask is the source of truth and is left intact.
-        if self.fill_holes and mask is not None:
-            good = out_diff[mask == 0]
-            if good.size:
-                out_diff = out_diff.copy()
-                out_diff[mask != 0] = np.median(good)
         return DiffResult(
             difference=out_diff,
             variance=variance,
@@ -470,8 +458,7 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     Configuration keywords (``n_max``, ``beta``, ``n_knots``, ``stamp_radius``,
     ``threshold_sigma``, ``max_stamps``, ``saturation``, ``bright_mask``,
     ``lambda_grid``, ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
-    ``spatial_scale``, ``decorrelate``, ``score``, ``block``, ``fill_holes``)
-    are split from
+    ``spatial_scale``, ``decorrelate``, ``score``, ``block``) are split from
     the per-call inputs
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
     ``gain``, ``read_noise``, ``catalog``, ``direction``).
@@ -495,7 +482,6 @@ def subtract(science, reference, **kwargs) -> DiffResult:
         "decorrelate",
         "score",
         "block",
-        "fill_holes",
     }
     config = {k: v for k, v in kwargs.items() if k in config_keys}
     call = {k: v for k, v in kwargs.items() if k not in config_keys}

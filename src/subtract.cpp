@@ -344,17 +344,21 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     // *reference* (convolved) pixel contaminates a whole kernel footprint, so it
     // is grown by the kernel radius; a saturated *science* (target) pixel is not
     // convolved, so it propagates one-to-one -- growing it too is what produced
-    // the oversized boxes around every bright star.
+    // the oversized boxes around every bright star. `exact_sat` records the
+    // un-dilated saturated pixels (the only ones whose value is truly garbage).
+    std::vector<char> exact_sat;
     if (saturation > 0.0) {
       const float sat = static_cast<float>(saturation);
       const float* rd = reference.data();
+      const float* sd = science.data();
+      exact_sat.assign(out.size(), 0);
       std::vector<MaskType> hot(out.size(), kMaskGood);
       for (std::size_t i = 0; i < out.size(); ++i)
         if (rd[i] >= sat) hot[i] = kMaskSaturated;
       dilate_mask(hot, ww, hh, r);
-      const float* sd = science.data();
       for (std::size_t i = 0; i < out.size(); ++i) {
         if (sd[i] >= sat) hot[i] |= kMaskSaturated;  // target pixel: 1:1
+        if (rd[i] >= sat || sd[i] >= sat) exact_sat[i] = 1;
         out[i] |= hot[i];
       }
     }
@@ -367,14 +371,36 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
         if (!std::isfinite(diff.data()[i])) out[i] |= kMaskNonFinite;
       }
     }
-    // Zero the difference (and its variance) wherever the output is flagged: a
-    // masked pixel carries no meaningful subtraction, and leaving garbage there
-    // dominates the display stretch and any downstream detection.
+    // Background median of the good difference, for filling the saturated cores.
+    float fill = 0.0f;
     const bool has_var = diff.has_variance();
     float* dd = diff.data();
     float* vv = has_var ? diff.variance().data() : nullptr;
+    if (!exact_sat.empty()) {
+      std::vector<float> good;
+      good.reserve(out.size() / 7 + 1);
+      for (std::size_t i = 0; i < out.size(); i += 7)
+        if (out[i] == kMaskGood && std::isfinite(dd[i])) good.push_back(dd[i]);
+      if (!good.empty()) {
+        std::nth_element(good.begin(), good.begin() + good.size() / 2, good.end());
+        fill = good[good.size() / 2];
+      }
+    }
+    // Resolve masked-pixel values. The exact saturated cores are non-linear
+    // garbage -> set to the background median (cosmetic). Pixels masked *only*
+    // because they fall in a saturated core's grown footprint keep their real
+    // difference value, so the subtraction there can still be assessed (the mask
+    // still flags them). All other masked pixels (edge, non-finite, input masks)
+    // are zeroed, as their values are not meaningful.
     for (std::size_t i = 0; i < out.size(); ++i) {
-      if (out[i] != kMaskGood) {
+      if (out[i] == kMaskGood) continue;
+      const bool nonfin = !std::isfinite(dd[i]);
+      if (!nonfin && !exact_sat.empty() && exact_sat[i]) {
+        dd[i] = fill;
+        if (has_var) vv[i] = 0.0f;
+      } else if (!nonfin && out[i] == kMaskSaturated) {
+        // saturation-grown halo only: preserve the real difference (and variance).
+      } else {
         dd[i] = 0.0f;
         if (has_var) vv[i] = 0.0f;
       }

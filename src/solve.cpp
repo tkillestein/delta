@@ -175,4 +175,113 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   return best;
 }
 
+GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
+                       const Eigen::Ref<const Eigen::VectorXd>& target,
+                       const Eigen::Ref<const Eigen::VectorXd>& weights,
+                       const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                       const ThinPlateBasis& basis,
+                       const std::vector<double>& lambda_grid,
+                       const std::vector<int>& group, int n_groups) {
+  if (lambda_grid.empty())
+    throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
+  const int n = static_cast<int>(points.rows());
+  if (n_groups < 2 || static_cast<int>(group.size()) != n)
+    return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+
+  const int nc = static_cast<int>(bn.cols());
+  const Eigen::MatrixXd d = basis.design(points);  // N x k
+  const int k = static_cast<int>(d.cols());
+  const int p = (nc + 1) * k;
+
+  // Whitened design Xs = W^{1/2} X and target ds = W^{1/2} y (see assemble()).
+  const Eigen::ArrayXd sw = weights.array().sqrt();
+  Eigen::MatrixXd xs(n, p);
+  for (int c = 0; c < nc; ++c)
+    xs.block(0, c * k, n, k) =
+        (d.array().colwise() * (bn.col(c).array() * sw)).matrix();
+  xs.block(0, nc * k, n, k) = (d.array().colwise() * sw).matrix();
+  const Eigen::VectorXd ds = (sw * target.array()).matrix();
+
+  // Row indices per fold, then each fold's normal-equation contribution
+  // M_g = Xs_g^T Xs_g, rhs_g = Xs_g^T ds_g, and held-out sum of squares ds_g^T ds_g.
+  std::vector<std::vector<int>> rows(n_groups);
+  for (int i = 0; i < n; ++i) {
+    const int g = group[i];
+    if (g < 0 || g >= n_groups)
+      throw std::runtime_error("solve_gls_cv: group id out of range");
+    rows[g].push_back(i);
+  }
+  std::vector<Eigen::MatrixXd> mf(n_groups);
+  std::vector<Eigen::VectorXd> rf(n_groups);
+  std::vector<double> ysq(n_groups, 0.0);
+#pragma omp parallel for schedule(dynamic)
+  for (int g = 0; g < n_groups; ++g) {
+    const std::vector<int>& idx = rows[g];
+    const int nf = static_cast<int>(idx.size());
+    Eigen::MatrixXd xf(nf, p);
+    Eigen::VectorXd yf(nf);
+    for (int j = 0; j < nf; ++j) {
+      xf.row(j) = xs.row(idx[j]);
+      yf(j) = ds(idx[j]);
+    }
+    Eigen::MatrixXd m = Eigen::MatrixXd::Zero(p, p);
+    if (nf > 0) m.selfadjointView<Eigen::Lower>().rankUpdate(xf.transpose());
+    mf[g] = m.selfadjointView<Eigen::Lower>();
+    rf[g] = nf > 0 ? Eigen::VectorXd(xf.transpose() * yf)
+                   : Eigen::VectorXd::Zero(p);
+    ysq[g] = yf.squaredNorm();
+  }
+
+  // Full-data system (sum of folds) + the block-diagonal bending penalty.
+  System s;
+  s.n = n;
+  s.nc = nc;
+  s.k = k;
+  s.p = p;
+  s.m = Eigen::MatrixXd::Zero(p, p);
+  s.rhs = Eigen::VectorXd::Zero(p);
+  s.ywy = 0.0;
+  for (int g = 0; g < n_groups; ++g) {
+    s.m += mf[g];
+    s.rhs += rf[g];
+    s.ywy += ysq[g];
+  }
+  s.p0 = Eigen::MatrixXd::Zero(p, p);
+  const Eigen::MatrixXd& pen = basis.penalty();
+  for (int b = 0; b <= nc; ++b) s.p0.block(b * k, b * k, k, k) = pen;
+
+  // Held-out weighted SSE for every (lambda, fold): fit on M_all - M_g, predict
+  // fold g via ds_g^T ds_g - 2 theta^T rhs_g + theta^T M_g theta. Independent
+  // tasks, run in parallel.
+  const int nl = static_cast<int>(lambda_grid.size());
+  Eigen::MatrixXd err(nl, n_groups);
+#pragma omp parallel for collapse(2) schedule(dynamic)
+  for (int li = 0; li < nl; ++li) {
+    for (int g = 0; g < n_groups; ++g) {
+      const Eigen::MatrixXd a = (s.m - mf[g]) + lambda_grid[li] * s.p0;
+      const Eigen::LDLT<Eigen::MatrixXd> ldlt(a);
+      const Eigen::VectorXd th = ldlt.solve(s.rhs - rf[g]);
+      double e = ysq[g] - 2.0 * th.dot(rf[g]) + th.dot(mf[g] * th);
+      err(li, g) = e > 0.0 ? e : 0.0;
+    }
+  }
+
+  std::vector<double> curve(nl);
+  int best_i = 0;
+  double best_cv = std::numeric_limits<double>::infinity();
+  for (int li = 0; li < nl; ++li) {
+    curve[li] = err.row(li).sum();
+    if (curve[li] < best_cv) {
+      best_cv = curve[li];
+      best_i = li;
+    }
+  }
+
+  // Final fit on all pixels at the CV-selected lambda.
+  GlsResult best = solve_at(s, lambda_grid[best_i]);
+  best.lambda_grid = lambda_grid;
+  best.gcv_curve = std::move(curve);  // holds the CV-error curve here
+  return best;
+}
+
 }  // namespace delta

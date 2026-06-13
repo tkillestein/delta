@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "delta/basis.hpp"
@@ -15,8 +16,17 @@ namespace delta {
 struct KernelFit {
   GlsResult gls;                       // theta + GCV diagnostics
   std::vector<double> component_sums;  // S_n = sum phi_n footprint
-  int n_pixels = 0;                    // stamp pixels entering the solve
-  int n_stamps_used = 0;               // stamps contributing >= 1 pixel
+  int n_pixels = 0;                    // stamp pixels in the final solve
+  int n_stamps_used = 0;               // stamps kept in the final solve
+  int n_stamps_total = 0;              // stamps that contributed any pixels
+  int n_stamps_rejected = 0;           // stamps dropped by sigma clipping
+  double reduced_chi2 = 0.0;           // rss / (n_pixels - effective_dof)
+  // Per-stamp goodness-of-fit, one entry per stamp that contributed pixels
+  // (parallel arrays). `stamp_chi2` is the per-stamp reduced chi^2 under the
+  // final solution; `stamp_accepted` is 1 if the stamp survived clipping.
+  std::vector<int> stamp_x, stamp_y;
+  std::vector<double> stamp_chi2;
+  std::vector<std::uint8_t> stamp_accepted;
 };
 
 // Fit the spatially-varying matching kernel + differential background by
@@ -28,12 +38,26 @@ struct KernelFit {
 // design row is [B_0(x,y) ... B_{nc-1}(x,y)] with B_n = phi_n (x) reference; the
 // weight is the inverse of the summed input variances (1 if none supplied). The
 // smoothing lambda is selected by GCV over `lambda_grid`.
+//
+// Bad stamps (variable sources, dipoles from misregistration, cosmics, saturated
+// cores) bias the global kernel, so the solve is iterated with per-stamp sigma
+// clipping: after each fit the per-stamp reduced chi^2 is computed and stamps
+// beyond `clip_sigma` robust deviations above the median are dropped, up to
+// `clip_iterations` times. `clip_sigma <= 0` or `clip_iterations <= 0` disables
+// clipping (single solve). At least `min_stamps` stamps are always retained.
+//
+// `cv_folds` chooses the spatial smoothing lambda: 0/1 keeps GCV, while >= 2
+// selects lambda by k-fold *group* cross-validation that holds out whole stamps
+// (folds = stamp index mod cv_folds). Group CV respects the within-stamp pixel
+// correlation that makes GCV under-smooth and over-fit the spatial field.
 KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
                      const ThinPlateBasis& spatial,
                      const GaussHermiteBasis& basis,
                      const std::vector<int>& stamp_x,
                      const std::vector<int>& stamp_y, int stamp_radius,
-                     const std::vector<double>& lambda_grid);
+                     const std::vector<double>& lambda_grid,
+                     double clip_sigma = 4.0, int clip_iterations = 5,
+                     int min_stamps = 5, int cv_folds = 0);
 
 // Per-pixel photometric scale field m(x,y) = sum_n a_n(x,y) S_n over a
 // (width x height) grid (SPEC §3.3). `component_sums` are the S_n; theta is the

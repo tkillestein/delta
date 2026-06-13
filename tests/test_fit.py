@@ -55,6 +55,9 @@ def test_fit_kernel_matches_python_assembly():
     sy = sy.ravel().astype(np.int32)
     grid = np.logspace(-6, 4, 12)
 
+    # clip_iterations=0 -> raw single solve under 1/(Var_s+Var_r) weights, which
+    # is what the NumPy reference replicates (the default fit additionally does
+    # IRLS reweighting + per-stamp clipping, validated separately).
     fit = delta.fit_kernel(
         sci,
         ref,
@@ -65,6 +68,7 @@ def test_fit_kernel_matches_python_assembly():
         beta,
         n_max,
         grid,
+        clip_iterations=0,
         science_var=var_s,
         reference_var=var_r,
     )
@@ -161,3 +165,71 @@ def test_photometric_scale_image_consistent_with_at():
     pts = np.column_stack([xs.ravel().astype(float), ys.ravel().astype(float)])
     at = delta.photometric_scale_at(knots, theta, sums, pts).reshape(h, w)
     np.testing.assert_allclose(img, at, rtol=1e-5, atol=1e-5)
+
+
+def _matched_pair(seed, corrupt_n=0, gain=2.0, rn=5.0, size=512, n=50):
+    """A matched reference/science pair (science PSF broader) with Poisson + read
+    noise and per-pixel variance maps. Optionally drop cosmic-ray spikes into the
+    science (not recorded in its variance) on the `corrupt_n` brightest stars,
+    making unambiguously bad stamps the kernel cannot fit."""
+    rng = np.random.default_rng(seed)
+    pos, flux = delta.validation.sample_starfield(
+        (size, size), n, rng, flux_range=(2000.0, 30000.0), min_separation=30.0
+    )
+    ref0 = 120.0 + delta.validation.render_stars((size, size), pos, flux, 1.6)
+    sci0 = 120.0 + delta.validation.render_stars((size, size), pos, flux, 2.4)
+
+    def noisify(clean):
+        var = clean / gain + rn**2
+        obs = clean + rng.normal(0.0, np.sqrt(var))
+        return obs.astype(np.float32), var.astype(np.float32)
+
+    sci, svar = noisify(sci0)
+    ref, rvar = noisify(ref0)
+
+    bad = np.argsort(flux)[::-1][:corrupt_n]
+    for bx, by in pos[bad].astype(int):
+        sci[by, bx] += 4000.0
+        sci[by, bx + 1] += 3000.0
+    return sci, ref, svar, rvar, pos[bad]
+
+
+def test_reduced_chi2_near_unity_on_clean_data():
+    # With a correct per-pixel noise model the fit's reduced chi^2 must be ~1:
+    # the residual variance is Var_target + (sum K^2) Var_conv, so the convolved
+    # reference noise is suppressed by the kernel (it was previously overcounted).
+    sci, ref, svar, rvar, _ = _matched_pair(7)
+    sol = delta.subtract(
+        sci,
+        ref,
+        science_var=svar,
+        reference_var=rvar,
+        n_knots=4,
+        stamp_radius=12,
+        threshold_sigma=8,
+    ).solution
+    assert abs(sol.reduced_chi2 - 1.0) < 0.1
+    assert sol.n_stamps_rejected == 0
+
+
+def test_sigma_clipping_rejects_bad_stamps():
+    # Cosmic-ray-hit stamps badly inflate the unclipped reduced chi^2; clipping
+    # should flag them and pull chi^2 back toward 1.
+    sci, ref, svar, rvar, badpos = _matched_pair(3, corrupt_n=6)
+    kw = dict(science_var=svar, reference_var=rvar, n_knots=4, stamp_radius=12, threshold_sigma=8)
+
+    noclip = delta.subtract(sci, ref, clip_sigma=0.0, **kw).solution
+    clipped = delta.subtract(sci, ref, clip_sigma=4.0, **kw).solution
+
+    assert noclip.reduced_chi2 > 2.0  # cosmics wreck the unclipped fit
+    assert clipped.n_stamps_rejected > 0
+    assert abs(clipped.reduced_chi2 - 1.0) < abs(noclip.reduced_chi2 - 1.0)
+    assert abs(clipped.reduced_chi2 - 1.0) < 0.3
+
+    # The rejected stamps coincide with the corrupted stars.
+    assert clipped.stamp_accepted is not None
+    assert clipped.stamp_x is not None and clipped.stamp_y is not None
+    rej = np.where(clipped.stamp_accepted == 0)[0]
+    rx, ry = clipped.stamp_x[rej], clipped.stamp_y[rej]
+    hits = sum(np.min((rx - bx) ** 2 + (ry - by) ** 2) < 9 for bx, by in badpos)
+    assert hits >= 5  # of the 6 corrupted stars

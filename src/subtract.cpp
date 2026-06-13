@@ -20,12 +20,15 @@ Eigen::MatrixXd coeff_matrix(const Eigen::Ref<const Eigen::VectorXd>& theta,
   return Eigen::Map<const Eigen::MatrixXd>(theta.data(), k, n_fields);
 }
 
-// A copy of the reference data with masked and non-finite pixels set to zero.
-// Convolving the raw reference smears NaNs and the spurious values sitting under
-// bad pixels across the kernel footprint, polluting B_n and corrupting the model
-// everywhere within a kernel radius of any defect (SPEC §3.6). Zeroing first
-// confines the damage: the affected output pixels are flagged by the dilated
-// reference mask anyway, so their model value is irrelevant.
+// A copy of the reference with masked / non-finite pixels replaced by the image
+// median (the background level). Convolving the raw reference smears NaNs and the
+// spurious values under bad pixels across the kernel footprint, polluting B_n
+// within a kernel radius of any defect (SPEC §3.6). Filling with the *median*
+// rather than zero matters at mask boundaries: a zero fill convolves a hard step
+// (0 vs background) and rings the model just outside every masked region, which
+// shows up as cruft around the masked template and the frame edge. Median fill
+// removes that step, so the model stays smooth right up to the (dilated-masked)
+// boundary. The median is estimated from a strided sample of the good pixels.
 ImageF sanitised_reference(const ImageF& reference) {
   ImageF clean(reference.width(), reference.height());
   const std::size_t n = reference.size();
@@ -33,10 +36,25 @@ ImageF sanitised_reference(const ImageF& reference) {
   float* dst = clean.data();
   const bool has_mask = reference.has_mask();
   const MaskType* m = has_mask ? reference.mask().data() : nullptr;
+
+  // Background estimate: median of a strided sample of finite, unmasked pixels.
+  std::vector<float> sample;
+  sample.reserve(n / 16 + 1);
+  for (std::size_t i = 0; i < n; i += 7) {
+    const float v = src[i];
+    if (std::isfinite(v) && !(has_mask && m[i] != kMaskGood)) sample.push_back(v);
+  }
+  float fill = 0.0f;
+  if (!sample.empty()) {
+    std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
+                     sample.end());
+    fill = sample[sample.size() / 2];
+  }
+
   for (std::size_t i = 0; i < n; ++i) {
     const float v = src[i];
     const bool bad = (has_mask && m[i] != kMaskGood) || !std::isfinite(v);
-    dst[i] = bad ? 0.0f : v;
+    dst[i] = bad ? fill : v;
   }
   return clean;
 }
@@ -111,7 +129,7 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
 ImageF subtract(const ImageF& science, const ImageF& reference,
                 const ThinPlateBasis& spatial,
                 const Eigen::Ref<const Eigen::VectorXd>& theta,
-                const GaussHermiteBasis& basis) {
+                const GaussHermiteBasis& basis, double saturation) {
   const std::size_t w = science.width();
   const std::size_t h = science.height();
   if (reference.width() != w || reference.height() != h)
@@ -303,7 +321,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   }
 
   // ---- mask growth (SPEC §3.6) --------------------------------------------
-  if (reference.has_mask() || science.has_mask()) {
+  if (reference.has_mask() || science.has_mask() || saturation > 0.0) {
     diff.allocate_mask();
     std::vector<MaskType>& out = diff.mask();
     const int r = basis.radius();
@@ -320,6 +338,19 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       std::vector<MaskType> grown = reference.mask();
       dilate_mask(grown, ww, hh, r);
       for (std::size_t i = 0; i < out.size(); ++i) out[i] |= grown[i];
+    }
+    // Bright/saturated cores in either input are non-linear and never match the
+    // model; flag and grow them by the kernel radius so their large residual is
+    // kept out of the difference (SPEC §3.6). Uses the raw reference (pre-sanitise).
+    if (saturation > 0.0) {
+      const float sat = static_cast<float>(saturation);
+      const float* sd = science.data();
+      const float* rd = reference.data();
+      std::vector<MaskType> hot(out.size(), kMaskGood);
+      for (std::size_t i = 0; i < out.size(); ++i)
+        if (sd[i] >= sat || rd[i] >= sat) hot[i] = kMaskSaturated;
+      dilate_mask(hot, ww, hh, r);
+      for (std::size_t i = 0; i < out.size(); ++i) out[i] |= hot[i];
     }
     // Edge border of one kernel half-width, and any non-finite difference pixel.
     for (int y = 0; y < hh; ++y) {

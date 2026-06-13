@@ -34,6 +34,14 @@ class KernelSolution:
     component_sums: NDArray[np.float64]
     direction: str
     shape: tuple[int, int]
+    # Goodness-of-fit / stamp-clipping diagnostics (SPEC §3.3, §13).
+    reduced_chi2: float = float("nan")
+    n_stamps_used: int = 0
+    n_stamps_rejected: int = 0
+    stamp_x: NDArray[np.int32] | None = None
+    stamp_y: NDArray[np.int32] | None = None
+    stamp_chi2: NDArray[np.float64] | None = None
+    stamp_accepted: NDArray[np.uint8] | None = None
 
     def photometric_scale(self) -> NDArray[np.float32]:
         """Per-pixel photometric scale field sum_n a_n(x,y) S_n, shape (H, W)."""
@@ -47,7 +55,13 @@ class KernelSolution:
         )
 
     def save(self, path: str) -> None:
-        """Serialize to a .npz file."""
+        """Serialize to a .npz file. Optional per-stamp diagnostics are stored as
+        empty arrays when absent."""
+        empty_i = np.empty(0, np.int32)
+
+        def _arr(a: NDArray | None, like: NDArray) -> NDArray:
+            return like if a is None else a
+
         np.savez(
             path,
             beta=self.beta,
@@ -64,6 +78,13 @@ class KernelSolution:
             component_sums=self.component_sums,
             direction=self.direction,
             shape=np.asarray(self.shape),
+            reduced_chi2=self.reduced_chi2,
+            n_stamps_used=self.n_stamps_used,
+            n_stamps_rejected=self.n_stamps_rejected,
+            stamp_x=_arr(self.stamp_x, empty_i),
+            stamp_y=_arr(self.stamp_y, empty_i),
+            stamp_chi2=_arr(self.stamp_chi2, np.empty(0, np.float64)),
+            stamp_accepted=_arr(self.stamp_accepted, np.empty(0, np.uint8)),
         )
 
     @classmethod
@@ -85,6 +106,13 @@ class KernelSolution:
             component_sums=d["component_sums"],
             direction=str(d["direction"]),
             shape=(int(d["shape"][0]), int(d["shape"][1])),
+            reduced_chi2=float(d["reduced_chi2"]) if "reduced_chi2" in d else float("nan"),
+            n_stamps_used=int(d["n_stamps_used"]) if "n_stamps_used" in d else 0,
+            n_stamps_rejected=int(d["n_stamps_rejected"]) if "n_stamps_rejected" in d else 0,
+            stamp_x=d.get("stamp_x"),
+            stamp_y=d.get("stamp_y"),
+            stamp_chi2=d.get("stamp_chi2"),
+            stamp_accepted=d.get("stamp_accepted"),
         )
 
     def header_cards(self) -> dict[str, object]:
@@ -96,5 +124,8 @@ class KernelSolution:
             "DLTLAM": self.lam,
             "DLTGCV": self.gcv,
             "DLTEDOF": self.effective_dof,
+            "DLTCHI2": self.reduced_chi2,
+            "DLTNSTU": self.n_stamps_used,
+            "DLTNSTR": self.n_stamps_rejected,
             "DLTCONV": self.direction,
         }

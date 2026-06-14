@@ -32,6 +32,7 @@ ImageF convolve_x(const ImageF& in, const std::vector<float>& k) {
       const int sh = h - j;  // src index = x + sh
       const int xlo = sh < 0 ? -sh : 0;
       const int xhi = (width - 1 - sh) < (width - 1) ? (width - 1 - sh) : (width - 1);
+#pragma omp simd
       for (int x = xlo; x <= xhi; ++x) drow[x] += kc * srow[x + sh];
     }
   }
@@ -60,6 +61,7 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
       if (sy < 0 || sy >= height) continue;
       const float kc = k[j];
       const float* srow = src + static_cast<std::size_t>(sy) * width;
+#pragma omp simd
       for (int x = 0; x < width; ++x) drow[x] += kc * srow[x];
     }
   }

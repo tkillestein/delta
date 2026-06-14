@@ -33,26 +33,33 @@ indented C++ sub-stage splits:
 
 | stage                              | time (s) | share |
 |------------------------------------|---------:|------:|
-| stamp selection                    |     1.54 |  4.5% |
-| kernel solve                       |     5.53 | 16.2% |
-| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.20 |  0.6% |
-| &nbsp;&nbsp;↳ GLS solve            |     4.94 | 14.5% |
-| full-frame subtraction             |    16.98 | 49.9% |
-| &nbsp;&nbsp;↳ spatial fields       |     6.75 | 19.8% |
-| &nbsp;&nbsp;↳ model convolve       |     4.16 | 12.2% |
-| &nbsp;&nbsp;↳ variance propagation |     4.76 | 14.0% |
-| noise decorrelation                |     5.76 | 16.9% |
-| matched-filter score               |     3.88 | 11.4% |
-| orchestration                      |     0.35 |  1.0% |
-| **total**                          |**34.03** |  100% |
+| stamp selection                    |     1.99 |  8.6% |
+| kernel solve                       |     5.22 | 22.4% |
+| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.20 |  0.8% |
+| &nbsp;&nbsp;↳ GLS solve            |     4.61 | 19.8% |
+| full-frame subtraction             |    13.67 | 58.8% |
+| &nbsp;&nbsp;↳ spatial fields       |     6.21 | 26.7% |
+| &nbsp;&nbsp;↳ model convolve       |     2.20 |  9.5% |
+| &nbsp;&nbsp;↳ variance propagation |     4.13 | 17.8% |
+| noise decorrelation                |     1.26 |  5.4% |
+| matched-filter score               |     0.80 |  3.4% |
+| orchestration                      |     0.32 |  1.4% |
+| **total**                          |**23.25** |  100% |
+
+These numbers are *post* the convolution-path optimisation (issue #19): cache-blocked
+model convolve and matched filter, plus a de-`cos`'d decorrelation blend (history
+below). The previous breakdown totalled **34.03 s**; the three convolution paths it
+called out are now markedly cheaper — model convolve 4.16→2.20 s, matched filter
+3.88→0.80 s, decorrelation 5.76→1.26 s.
 
 Two findings fall straight out of the splits:
 
-- **The biggest single sub-stage is `spatial fields` (~20%)** — evaluating the
+- **The biggest single sub-stage is now `spatial fields` (~27%)** — evaluating the
   thin-plate-spline coefficient maps `aₙ(x,y)` and background per pixel, *not* the
   convolution. The RBF design matrix is rebuilt for every frame row inside
-  `evaluate_fields` (`src/subtract.cpp`). This was invisible before the sub-timers.
-- **`B_n` precompute is negligible (~0.6%)** because the fit convolves only the stamp
+  `evaluate_fields` (`src/subtract.cpp`). With the convolutions sped up it is, by some
+  margin, the tall pole.
+- **`B_n` precompute is negligible (~0.8%)** because the fit convolves only the stamp
   windows, not the whole frame — so the kernel solve is essentially all *solve*
   (the λ-grid × CV-fold factorisations), not convolution.
 
@@ -67,19 +74,22 @@ Same 14-core host, 4096×4096 (16.8 Mpix), 419 stars, no warm-up:
 
 | threads | wall (s) | speedup | efficiency |
 |--------:|---------:|--------:|-----------:|
-|       1 |    23.25 |   1.00x |       100% |
-|       2 |    16.73 |   1.39x |        70% |
-|       4 |    14.62 |   1.59x |        40% |
-|       8 |    13.93 |   1.67x |        21% |
-|      14 |    13.69 |   1.70x |        12% |
+|       1 |    20.83 |   1.00x |       100% |
+|       2 |    14.54 |   1.43x |        72% |
+|       4 |    12.97 |   1.61x |        40% |
+|       8 |    12.31 |   1.69x |        21% |
+|      14 |    12.29 |   1.69x |        12% |
 
 Scaling is far from ideal: it saturates at ~1.7× by 4 threads and barely moves after.
 The convolution/subtract paths (SPEC §5: *threaded over rows/tiles purely for
 parallelism*) do parallelise, but a large serial/memory-bound fraction (Amdahl) caps
 the win — at this frame size the full-frame passes are memory-bandwidth bound, so
-extra cores contend for the same bus rather than adding throughput. This is itself a
-finding: the headline lever is per-core efficiency (SIMD/cache/GPU), not more threads.
-See the per-stage gaps below.
+extra cores contend for the same bus rather than adding throughput. This confirmed the
+headline lever is **per-core efficiency (SIMD/cache), not more threads** — acted on in
+issue #19 (cache-blocking the convolutions): the single-thread baseline dropped from
+23.25→20.83 s here while the scaling *shape* is unchanged, because the remaining tall
+poles (GLS solve, spatial-field evaluation) are not convolutions. See the per-stage
+gaps below.
 
 ## Sub-stage instrumentation (`DELTA_TIMING`)
 
@@ -125,22 +135,32 @@ convolve `Var(R)`). A near-full-frame second convolution.
   between adjacent tiles) trades negligible accuracy for time; a cheaper variance
   approximation is possible when `Var(R)` is near-flat.
 
-### `subtract: model convolve` — ~12% (`src/subtract.cpp`, `src/convolve.cpp`)
-The actual separable model convolution (`#pragma omp simd` today). Shares the
-convolution-throughput story with score and decorrelation (below): the natural
-first **GPU / wider-SIMD / FFT-for-large-kernels** offload candidate, and a place
-**fusing with the variance pass** would cut repeated reads of the same neighbourhoods.
+### `subtract: model convolve` — ~10% (`src/subtract.cpp`, `src/convolve.cpp`)
+The separable model convolution, now **2D-tiled and fully fused** (issue #19): the
+per-component loop runs *inside* a 128×128 tile loop, so a tile-local difference
+accumulator plus the shared x-passes for the tile's rows stay in L2 while every
+component is swept. The earlier version looped components on the outside with a
+full-frame y-pass each, read-modify-writing the whole `diff` `nc`(=28)× and re-reading
+each `tx[nx]` from DRAM per component — memory-bandwidth bound. Per-pixel accumulation
+order is unchanged, so the result is bit-identical. Remaining levers: **fusing with the
+variance pass** (same neighbourhoods, read once) and wider SIMD.
 
-### `noise decorrelation` — ~17% (`src/noise.cpp`)
-Apodised FFT blocks (FFTW, per-thread reused plans, threaded over blocks).
-- Sensitive to `block` size (default 256) — sweep it; larger blocks amortise plan
-  overhead and apodisation but raise per-block FFT cost.
-- It is optional (`decorrelate=False`); for latency-bound runs the cost/benefit of
-  skipping or coarsening it is worth documenting.
+### `noise decorrelation` — ~5% (`src/noise.cpp`)
+Apodised FFT blocks (FFTW, per-thread reused plans, threaded over blocks). The FFT is
+genuine (the ZOGY decorrelation filter is non-compact in Fourier space), so it stays.
+The recent win (issue #19) was in the *blend*, not the FFT: the overlap-add Hann window
+is precomputed once (it was evaluating two `std::cos` per pixel of every overlapping
+block, ~370M calls) and the weight normalisation is computed as a **separable outer
+product** rather than accumulating a `w·h` weight image in the serialised critical
+section. Remaining levers: sweep `block` size (default 256); it is optional
+(`decorrelate=False`).
 
-### `matched-filter score` — ~11% (`src/noise.cpp`)
-A PSF convolution of the (decorrelated) difference. Shares the convolution story with
-`full-frame subtraction` — any SIMD/GPU/FFT convolution win lands here too. Also
+### `matched-filter score` — ~3% (`src/noise.cpp`)
+A PSF correlation of the (decorrelated) difference, now **cache-blocked** (issue #19):
+each tile gathers its haloed input window once into a contiguous buffer (kept hot in
+L1/L2 across the `ks²` taps) and applies the PSF taps as unit-stride `#pragma omp simd`
+multiply-adds — mirroring the variance pass. The earlier output-outer/kernel-inner loop
+re-read a full `ks²` window per output pixel straight off the strided frame. Also
 optional (`score=False`).
 
 ### `stamp selection` — ~5% (`src/detect.cpp`)

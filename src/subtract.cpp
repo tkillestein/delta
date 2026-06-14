@@ -149,13 +149,11 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   }();
   const int hh = static_cast<int>(h);
   const int ww = static_cast<int>(w);
-  const std::size_t npix = w * h;
 
   // Share the separable x-pass across components with the same nx (n_max+1 of
-  // them), then stream each component's y-pass straight into the running
+  // them), then fuse every component's y-pass + a_n accumulation into the running
   // difference. Materialising the full nc-component B_n stack (and re-reading it
-  // in a combine pass) was memory-bound; streaming touches one temporary at a
-  // time and keeps it hot for the accumulate.
+  // in a combine pass) was memory-bound; this never materialises B_n at all.
   ImageF diff(w, h);
   {
     DELTA_TIME("subtract: model convolve");
@@ -172,40 +170,70 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
 
     const float* s = science.data();
     const float* bg = fields.background.data();
-    float* d = diff.data();
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(npix); ++i)
-      d[i] = s[i] - bg[i];
 
-    // Stream each component's y-pass over the full frame (so the shared x-pass
-    // tx stays cache-resident across output rows) and fuse the a_n accumulation
-    // into the same row loop -- B_n is never materialised full-frame, and the
-    // separate combine pass is gone.
-    for (int n = 0; n < nc; ++n) {
-      const float* src = tx[orders[n].first].data();
-      const std::vector<float>& kyn = ky[n];
-      const int ks = static_cast<int>(kyn.size());
-      const float* a = fields.coeff[n].data();
-      float* dd = diff.data();
+    // Cache-blocked, fully fused model convolve. The earlier version looped
+    // components on the outside and ran a full-frame y-pass each, so the running
+    // diff was read-modify-written nc(=28) times and every tx[nx] was re-read
+    // from DRAM per component -- memory-bandwidth bound (the pipeline's headline
+    // bottleneck). Here we tile the frame: a tile-local diff accumulator and the
+    // shared x-passes for the tile's rows (+halo) all fit in L2, so we sweep all
+    // components over the tile while diff stays hot and write it out once. The
+    // per-pixel accumulation order (component order) is unchanged, so the result
+    // is bit-identical to the streamed version.
+    constexpr int tw = 128;
+    constexpr int th = 128;
+    std::vector<std::pair<int, int>> tiles;
+    for (int by = 0; by < hh; by += th)
+      for (int bx = 0; bx < ww; bx += tw) tiles.emplace_back(bx, by);
+
 #pragma omp parallel
-      {
-        std::vector<float> bn(w);
-#pragma omp for schedule(static)
-        for (int y = 0; y < hh; ++y) {
-          std::fill(bn.begin(), bn.end(), 0.0f);
-          for (int j = 0; j < ks; ++j) {
-            const int sy = y + kh - j;
-            if (sy < 0 || sy >= hh) continue;
-            const float c = kyn[j];
-            const float* srow = src + static_cast<std::size_t>(sy) * w;
+    {
+      std::vector<float> dtile(static_cast<std::size_t>(tw) * th);
+      std::vector<float> bn(tw);
+#pragma omp for schedule(dynamic)
+      for (std::size_t ti = 0; ti < tiles.size(); ++ti) {
+        const int bx = tiles[ti].first, by = tiles[ti].second;
+        const int bw = std::min(tw, ww - bx);
+        const int bh = std::min(th, hh - by);
+
+        // Initialise the tile accumulator to S - b.
+        for (int ly = 0; ly < bh; ++ly) {
+          const std::size_t off = static_cast<std::size_t>(by + ly) * w + bx;
+          float* drow = dtile.data() + static_cast<std::size_t>(ly) * bw;
+          for (int lx = 0; lx < bw; ++lx) drow[lx] = s[off + lx] - bg[off + lx];
+        }
+
+        // Fuse every component's y-pass + a_n accumulate over the tile. tx[nx]
+        // for the tile rows (+kh halo) is read once and reused across the (up to
+        // n_max+1) components that share nx.
+        for (int n = 0; n < nc; ++n) {
+          const float* src = tx[orders[n].first].data();
+          const std::vector<float>& kyn = ky[n];
+          const int ks = static_cast<int>(kyn.size());
+          const float* a = fields.coeff[n].data();
+          for (int ly = 0; ly < bh; ++ly) {
+            const int y = by + ly;
+            std::fill(bn.begin(), bn.begin() + bw, 0.0f);
+            for (int j = 0; j < ks; ++j) {
+              const int sy = y + kh - j;
+              if (sy < 0 || sy >= hh) continue;
+              const float c = kyn[j];
+              const float* srow = src + static_cast<std::size_t>(sy) * w + bx;
 #pragma omp simd
-            for (int x = 0; x < ww; ++x) bn[x] += c * srow[x];
+              for (int lx = 0; lx < bw; ++lx) bn[lx] += c * srow[lx];
+            }
+            const float* arow = a + static_cast<std::size_t>(y) * w + bx;
+            float* drow = dtile.data() + static_cast<std::size_t>(ly) * bw;
+#pragma omp simd
+            for (int lx = 0; lx < bw; ++lx) drow[lx] -= arow[lx] * bn[lx];
           }
-          const std::size_t off = static_cast<std::size_t>(y) * w;
-          const float* arow = a + off;
-          float* drow = dd + off;
-#pragma omp simd
-          for (int x = 0; x < ww; ++x) drow[x] -= arow[x] * bn[x];
+        }
+
+        // Write the tile's difference out once.
+        for (int ly = 0; ly < bh; ++ly) {
+          float* drow = diff.data() + static_cast<std::size_t>(by + ly) * w + bx;
+          const float* trow = dtile.data() + static_cast<std::size_t>(ly) * bw;
+          for (int lx = 0; lx < bw; ++lx) drow[lx] = trow[lx];
         }
       }
     }

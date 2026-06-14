@@ -62,11 +62,14 @@ std::vector<double> kernel_power(const std::vector<float>& kernel, int ksize,
   return power;
 }
 
-// Separable Hann window weight at (iy, ix) within an n x n block.
-inline double hann2d(int iy, int ix, int n) {
-  const double wy = 0.5 * (1.0 - std::cos(2.0 * kPi * (iy + 0.5) / n));
-  const double wx = 0.5 * (1.0 - std::cos(2.0 * kPi * (ix + 0.5) / n));
-  return wy * wx;
+// Periodic Hann window samples over an n-point block (the separable factor used
+// for overlap-add blending). Precomputed once: the blend touches every pixel of
+// every overlapping block, so evaluating cos per pixel dominated the pass.
+inline std::vector<double> hann1d(int n) {
+  std::vector<double> w(n);
+  for (int i = 0; i < n; ++i)
+    w[i] = 0.5 * (1.0 - std::cos(2.0 * kPi * (i + 0.5) / n));
+  return w;
 }
 
 }  // namespace
@@ -208,7 +211,6 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   const int ks = basis.ksize();
 
   std::vector<double> acc(static_cast<std::size_t>(w) * h, 0.0);
-  std::vector<double> wsum(static_cast<std::size_t>(w) * h, 0.0);
 
   const int stride = block / 2;
   // Block origins covering the frame, last block flush with the far edge.
@@ -236,6 +238,23 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
 
   const std::size_t nn = static_cast<std::size_t>(block) * block;
   const float inv_n2 = 1.0f / static_cast<float>(nn);
+
+  // The overlap-add weight sum is separable: the blocks form a full oxs x oys
+  // grid, so wsum(x,y) = (sum_bx hann(x-bx)) * (sum_by hann(y-by)). Build the two
+  // 1-D total-weight profiles once instead of accumulating a w*h weight image in
+  // the (serialised) blend.
+  const std::vector<double> hwin = hann1d(block);
+  std::vector<double> wx_total(w, 0.0), wy_total(h, 0.0);
+  for (int bx : oxs)
+    for (int ix = 0; ix < block; ++ix) {
+      const int x = bx + ix;
+      if (x >= 0 && x < w) wx_total[x] += hwin[ix];
+    }
+  for (int by : oys)
+    for (int iy = 0; iy < block; ++iy) {
+      const int y = by + iy;
+      if (y >= 0 && y < h) wy_total[y] += hwin[iy];
+    }
 
 #pragma omp parallel
   {
@@ -293,18 +312,21 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       }
       fftwf_execute(fft.inv);
 
-      // Hann-weighted blend into the shared accumulators (cheap; serialised).
+      // Hann-weighted overlap-add into the shared accumulator. The weight is the
+      // precomputed separable window; wsum is handled analytically (see above),
+      // so the blend only touches acc. Still serialised against other blocks'
+      // blends (overlapping writes race), but now just a weighted add per pixel.
 #pragma omp critical(delta_decorr_blend)
       for (int iy = 0; iy < block; ++iy) {
         const int y = by + iy;
         if (y < 0 || y >= h) continue;
+        const double wy = hwin[iy] * inv_n2;
+        const float* frow = fft.real + static_cast<std::size_t>(iy) * block;
+        double* arow = acc.data() + static_cast<std::size_t>(y) * w;
         for (int ix = 0; ix < block; ++ix) {
           const int x = bx + ix;
           if (x < 0 || x >= w) continue;
-          const double wgt = hann2d(iy, ix, block);
-          const std::size_t i = static_cast<std::size_t>(y) * w + x;
-          acc[i] += wgt * fft.real[static_cast<std::size_t>(iy) * block + ix] * inv_n2;
-          wsum[i] += wgt;
+          arow[x] += wy * hwin[ix] * frow[ix];
         }
       }
     }
@@ -314,8 +336,16 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   }
 
   ImageF out(w, h);
-  for (std::size_t i = 0; i < acc.size(); ++i)
-    out.data()[i] = wsum[i] > 0.0 ? static_cast<float>(acc[i] / wsum[i]) : 0.0f;
+#pragma omp parallel for schedule(static)
+  for (int y = 0; y < h; ++y) {
+    const double wy = wy_total[y];
+    const double* arow = acc.data() + static_cast<std::size_t>(y) * w;
+    float* orow = out.data() + static_cast<std::size_t>(y) * w;
+    for (int x = 0; x < w; ++x) {
+      const double wsum = wy * wx_total[x];
+      orow[x] = wsum > 0.0 ? static_cast<float>(arow[x] / wsum) : 0.0f;
+    }
+  }
   return out;
 }
 
@@ -325,29 +355,84 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
     throw std::runtime_error("matched_filter: psf size mismatch");
   const int w = static_cast<int>(image.width());
   const int h = static_cast<int>(image.height());
+  const int ks = psf_size;
   const int r = psf_size / 2;
 
   double sumpsf2 = 0.0;
   for (float v : psf) sumpsf2 += static_cast<double>(v) * v;
   const double norm = std::sqrt(std::max(noise_var, 0.0) * sumpsf2);
+  const float inv_norm = norm > 0.0 ? static_cast<float>(1.0 / norm) : 0.0f;
 
   ImageF out(w, h);
-#pragma omp parallel for schedule(static)
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      double sum = 0.0;
-      for (int dy = -r; dy <= r; ++dy) {
-        const int sy = y + dy;
-        if (sy < 0 || sy >= h) continue;
-        for (int dx = -r; dx <= r; ++dx) {
-          const int sx = x + dx;
-          if (sx < 0 || sx >= w) continue;
-          const float p = psf[static_cast<std::size_t>(dy + r) * psf_size + (dx + r)];
-          sum += p * image.data()[static_cast<std::size_t>(sy) * w + sx];
+
+  // Cache-blocked correlation: out(x) = (1/norm) sum_u psf(u) image(x+u). Done
+  // naively (output-outer, kernel-inner) every output pixel re-reads the whole
+  // ks x ks window straight off the strided frame, thrashing the cache. Instead
+  // tile the frame, gather each tile's haloed input window once into a small
+  // contiguous buffer (so it stays hot in L1/L2 across the ks^2 taps), and apply
+  // the PSF taps as unit-stride multiply-adds. Unlike the variance pass this is a
+  // correlation, so the PSF is applied directly (no axis mirror).
+  const float* img = image.data();
+  constexpr int bsz = 64;
+  const int ibw = bsz + 2 * r;  // gathered window side (tile + halo)
+  std::vector<std::pair<int, int>> blocks;
+  for (int by = 0; by < h; by += bsz)
+    for (int bx = 0; bx < w; bx += bsz) blocks.emplace_back(bx, by);
+
+#pragma omp parallel
+  {
+    std::vector<float> win(static_cast<std::size_t>(ibw) * ibw);
+    std::vector<float> acc(static_cast<std::size_t>(bsz) * bsz);
+#pragma omp for schedule(dynamic)
+    for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+      const int bx = blocks[bi].first, by = blocks[bi].second;
+      const int bw = std::min(bsz, w - bx);
+      const int bh = std::min(bsz, h - by);
+
+      // Gather the (bh+2r) x (bw+2r) input window, zero-padded at the frame edge
+      // (matching the original zero-padding contract), into a contiguous buffer.
+      const int iwh = bh + 2 * r;
+      const int iww = bw + 2 * r;
+      for (int iy = 0; iy < iwh; ++iy) {
+        const int gy = by - r + iy;
+        float* wrow = win.data() + static_cast<std::size_t>(iy) * ibw;
+        if (gy < 0 || gy >= h) {
+          std::fill(wrow, wrow + iww, 0.0f);
+          continue;
+        }
+        const float* irow = img + static_cast<std::size_t>(gy) * w;
+        for (int ix = 0; ix < iww; ++ix) {
+          const int gx = bx - r + ix;
+          wrow[ix] = (gx < 0 || gx >= w) ? 0.0f : irow[gx];
         }
       }
-      out.data()[static_cast<std::size_t>(y) * w + x] =
-          norm > 0.0 ? static_cast<float>(sum / norm) : 0.0f;
+
+      // Tap-outer correlation on the cache-resident window: win[(oy+ly)*ibw +
+      // ox+lx] is image[by+oy+(ly-r), bx+ox+(lx-r)], i.e. the (ly-r, lx-r) tap.
+      std::fill(acc.begin(), acc.begin() + static_cast<std::size_t>(bh) * bw,
+                0.0f);
+      for (int ly = 0; ly < ks; ++ly) {
+        const float* prow = psf.data() + static_cast<std::size_t>(ly) * ks;
+        for (int lx = 0; lx < ks; ++lx) {
+          const float p = prow[lx];
+          if (p == 0.0f) continue;
+          for (int oy = 0; oy < bh; ++oy) {
+            const float* src =
+                win.data() + static_cast<std::size_t>(oy + ly) * ibw + lx;
+            float* dst = acc.data() + static_cast<std::size_t>(oy) * bw;
+#pragma omp simd
+            for (int ox = 0; ox < bw; ++ox) dst[ox] += p * src[ox];
+          }
+        }
+      }
+
+      // Normalise and scatter into the output frame.
+      for (int oy = 0; oy < bh; ++oy) {
+        float* orow = out.data() + static_cast<std::size_t>(by + oy) * w + bx;
+        const float* arow = acc.data() + static_cast<std::size_t>(oy) * bw;
+#pragma omp simd
+        for (int ox = 0; ox < bw; ++ox) orow[ox] = arow[ox] * inv_norm;
+      }
     }
   }
   return out;

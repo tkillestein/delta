@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "delta/convolve.hpp"
@@ -373,6 +374,11 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       const std::vector<float>& vr = reference.variance();
       const int ks = basis.ksize();
       const int rk = basis.radius();
+      // A tile takes the flat-Var(R) shortcut when its window's relative spread is
+      // below this; it bounds the shortcut's relative error (see below). 1e-3 keeps
+      // it well inside the propagated-variance tolerance while still catching the
+      // smooth sky that dominates a survey frame.
+      constexpr float kVarFlatTol = 1e-3f;
 
       std::vector<std::vector<float>> phi(nc);
       for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
@@ -411,27 +417,58 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
             const float* p = phi[n].data();
             for (std::size_t i = 0; i < k2.size(); ++i) k2[i] += an * p[i];
           }
+          // K^2 mirrored for the correlation, and its sum Q = sum_u K^2(u) -- the
+          // total weight the convolution applies to Var(R), reused by the flat-var
+          // shortcut below.
+          double qsum = 0.0;
           for (std::size_t i = 0; i < k2.size(); ++i) {
             const float v = k2[i];
             kf[k2.size() - 1 - i] = v * v;
+            qsum += static_cast<double>(v) * v;
           }
 
           // Gather the (bh+2rk) x (bw+2rk) input window, zero-padded at the frame
-          // edge, into a contiguous buffer of row stride ibw.
+          // edge, into a contiguous buffer of row stride ibw. Track the min/max of
+          // the gathered Var(R) to decide whether it is flat over the footprint.
           const int iwh = bh + 2 * rk;
           const int iww = bw + 2 * rk;
+          float wmin = std::numeric_limits<float>::infinity();
+          float wmax = -std::numeric_limits<float>::infinity();
           for (int iy = 0; iy < iwh; ++iy) {
             const int gy = by - rk + iy;
             float* wrow = win.data() + static_cast<std::size_t>(iy) * ibw;
             if (gy < 0 || gy >= hh) {
               std::fill(wrow, wrow + iww, 0.0f);
+              wmin = std::min(wmin, 0.0f);
+              wmax = std::max(wmax, 0.0f);
               continue;
             }
             const float* vrow = vr.data() + static_cast<std::size_t>(gy) * w;
             for (int ix = 0; ix < iww; ++ix) {
               const int gx = bx - rk + ix;
-              wrow[ix] = (gx < 0 || gx >= ww) ? 0.0f : vrow[gx];
+              const float v = (gx < 0 || gx >= ww) ? 0.0f : vrow[gx];
+              wrow[ix] = v;
+              wmin = std::min(wmin, v);
+              wmax = std::max(wmax, v);
             }
+          }
+
+          // Flat-Var(R) shortcut (SPEC §3.4): where the reference variance is
+          // near-constant over the kernel footprint -- the sky-dominated common
+          // case -- K^2 (x) Var(R) ~= Var(R) * sum_u K^2(u) = Q * Var(R), so the
+          // ks^2 convolution collapses to a per-pixel scale by Q. The relative
+          // error is bounded by the window's (max-min)/max, so we take it only when
+          // that is below kVarFlatTol (zero-padded edge tiles read non-flat and fall
+          // through to the exact convolution, which tapers correctly there).
+          if (wmax > 0.0f && (wmax - wmin) <= kVarFlatTol * wmax) {
+            const float q = static_cast<float>(qsum);
+            for (int oy = 0; oy < bh; ++oy) {
+              const float* vrow =
+                  win.data() + static_cast<std::size_t>(oy + rk) * ibw + rk;
+              float* vout = var.data() + static_cast<std::size_t>(by + oy) * w + bx;
+              for (int ox = 0; ox < bw; ++ox) vout[ox] += q * vrow[ox];
+            }
+            continue;
           }
 
           // Tap-outer dense convolution on the cache-resident window/tile: each

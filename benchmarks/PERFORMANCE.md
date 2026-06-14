@@ -33,33 +33,36 @@ indented C++ sub-stage splits:
 
 | stage                              | time (s) | share |
 |------------------------------------|---------:|------:|
-| stamp selection                    |     1.99 |  8.6% |
-| kernel solve                       |     5.22 | 22.4% |
-| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.20 |  0.8% |
-| &nbsp;&nbsp;↳ GLS solve            |     4.61 | 19.8% |
-| full-frame subtraction             |    13.67 | 58.8% |
-| &nbsp;&nbsp;↳ spatial fields       |     6.21 | 26.7% |
-| &nbsp;&nbsp;↳ model convolve       |     2.20 |  9.5% |
-| &nbsp;&nbsp;↳ variance propagation |     4.13 | 17.8% |
-| noise decorrelation                |     1.26 |  5.4% |
-| matched-filter score               |     0.80 |  3.4% |
-| orchestration                      |     0.32 |  1.4% |
-| **total**                          |**23.25** |  100% |
+| stamp selection                    |     1.97 | 10.0% |
+| kernel solve                       |     5.28 | 26.8% |
+| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.17 |  0.9% |
+| &nbsp;&nbsp;↳ GLS solve            |     4.71 | 23.9% |
+| full-frame subtraction             |    10.05 | 51.0% |
+| &nbsp;&nbsp;↳ spatial fields       |     2.51 | 12.8% |
+| &nbsp;&nbsp;↳ model convolve       |     2.16 | 11.0% |
+| &nbsp;&nbsp;↳ variance propagation |     4.23 | 21.4% |
+| noise decorrelation                |     1.28 |  6.5% |
+| matched-filter score               |     0.81 |  4.1% |
+| orchestration                      |     0.31 |  1.6% |
+| **total**                          |**19.70** |  100% |
 
-These numbers are *post* the convolution-path optimisation (issue #19): cache-blocked
-model convolve and matched filter, plus a de-`cos`'d decorrelation blend (history
-below). The previous breakdown totalled **34.03 s**; the three convolution paths it
-called out are now markedly cheaper — model convolve 4.16→2.20 s, matched filter
-3.88→0.80 s, decorrelation 5.76→1.26 s.
+These numbers are *post* the convolution-path optimisation (issue #19) and the
+spatial-field coarse-grid evaluation (issue #16). The breakdown before #19 totalled
+**34.03 s**; the three convolution paths it called out are now markedly cheaper — model
+convolve 4.16→2.16 s, matched filter 3.88→0.81 s, decorrelation 5.76→1.28 s. Issue #16
+then halved-and-more the spatial-field evaluation (**6.21→2.51 s**), dropping it from
+the tall pole, for a total of 23.25→19.70 s.
 
 Two findings fall straight out of the splits:
 
-- **The biggest single sub-stage is now `spatial fields` (~27%)** — evaluating the
-  thin-plate-spline coefficient maps `aₙ(x,y)` and background per pixel, *not* the
-  convolution. The RBF design matrix is rebuilt for every frame row inside
-  `evaluate_fields` (`src/subtract.cpp`). With the convolutions sped up it is, by some
-  margin, the tall pole.
-- **`B_n` precompute is negligible (~0.8%)** because the fit convolves only the stamp
+- **The tall poles are now both ~`O(stamp)·O(area)`-bounded sub-stages**: the `GLS
+  solve` (~24%, fixed cost set by stamp/λ-grid/CV-fold count) and `variance
+  propagation` (~21%, the block-effective squared-kernel convolution). `spatial fields`
+  was the previous #1 (~27%) until #16 evaluated the thin-plate-spline coefficient maps
+  on a knot-scale coarse lattice and bilinearly interpolated to full resolution — what
+  remains there (~13%) is the memory-bound interpolation + full-frame field
+  materialisation, not the RBF/`log` cost.
+- **`B_n` precompute is negligible (~0.9%)** because the fit convolves only the stamp
   windows, not the whole frame — so the kernel solve is essentially all *solve*
   (the λ-grid × CV-fold factorisations), not convolution.
 
@@ -87,8 +90,9 @@ the win — at this frame size the full-frame passes are memory-bandwidth bound,
 extra cores contend for the same bus rather than adding throughput. This confirmed the
 headline lever is **per-core efficiency (SIMD/cache), not more threads** — acted on in
 issue #19 (cache-blocking the convolutions): the single-thread baseline dropped from
-23.25→20.83 s here while the scaling *shape* is unchanged, because the remaining tall
-poles (GLS solve, spatial-field evaluation) are not convolutions. See the per-stage
+23.25→20.83 s here while the scaling *shape* is unchanged, because the dominant tall
+pole (the GLS solve) is not a convolution. (Spatial-field evaluation, the other large
+non-convolution cost at the time, has since been cut by issue #16.) See the per-stage
 gaps below.
 
 ## Sub-stage instrumentation (`DELTA_TIMING`)
@@ -105,20 +109,25 @@ check, so production runs are unaffected. To split a stage further, add a
 
 ## Where plausible improvements could lie
 
-Ordered by measured share of reference-frame wall time. Each big lever has a tracking
-GitHub issue (search the repo issues for "perf:").
+Ordered by the share each lever had *when first identified* (completed ones are kept,
+marked **DONE**, for the history). Each big lever has a tracking GitHub issue (search
+the repo issues for "perf:").
 
-### `subtract: spatial fields` — ~20% (`src/subtract.cpp`, `evaluate_fields`)
-**The single biggest lever, and a surprise** — it is coefficient-field evaluation, not
-convolution. `evaluate_fields` rebuilds the thin-plate-spline design matrix
-`spatial.design(points)` for *every frame row* and multiplies by the coefficient
-matrix. The RBF design depends only on (x,y) and the fixed knots, so it is recomputed
-~6000× over identical structure.
-- **Evaluate on a coarse grid + interpolate**: the fields `aₙ(x,y)` vary on knot
-  scales (≫ a pixel), so evaluating them on a coarse lattice and bilinearly
-  interpolating to full resolution would be near-exact and orders of magnitude cheaper.
-- **Cache / factor the design** across rows (the knot-distance RBF terms are shared),
-  or evaluate the spline incrementally.
+### `subtract: spatial fields` — ~13%, was ~27% (`src/subtract.cpp`, `evaluate_fields`) — **DONE (issue #16)**
+Was the single biggest lever, and a surprise — coefficient-field evaluation, not
+convolution: `evaluate_fields` rebuilt the thin-plate-spline design matrix
+`spatial.design(points)` for *every frame row* (~6000× over identical structure), an
+`h·w·k` count of `log()` evaluations. Fixed by **coarse-grid evaluation +
+bilinear interpolation**: the fields `aₙ(x,y)` vary on the knot length-scale (≫ a
+pixel), so they are now evaluated exactly on a coarse lattice and bilinearly
+interpolated to full resolution. The stride is chosen adaptively from the smallest knot
+spacing (`ThinPlateBasis::min_knot_spacing()`, ~16 samples per knot interval, capped at
+64 px), so the relative error stays well below 1e-3; small frames fall back to the exact
+per-pixel path (bit-for-bit). This cut the stage 6.21→2.51 s (~2.5×). What remains is
+the memory-bound interpolation + full-frame field materialisation (the downstream model
+convolve reads `aₙ` per pixel), not the RBF/`log` cost — a further win would need to
+fuse field evaluation into the convolve so the full-resolution fields are never
+materialised.
 
 ### `kernel solve` (GLS) — ~15% (and dominant on small frames) (`src/solve.cpp`, `src/fit.cpp`)
 Now confirmed to be ~all *solve* (`B_n` precompute is ~0.6%). Builds `M = XᵀWX`

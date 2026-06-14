@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace delta {
@@ -93,6 +94,20 @@ Eigen::MatrixXd ThinPlateBasis::design(
   d.col(nr + 1) = ux.matrix();
   d.col(nr + 2) = uy.matrix();
   return d;
+}
+
+double ThinPlateBasis::min_knot_spacing() const {
+  const int k = n_knots();
+  // Knots are stored normalised by `scale_`; rescale to original units.
+  double best = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < k; ++i) {
+    for (int j = i + 1; j < k; ++j) {
+      const double dx = knots_(i, 0) - knots_(j, 0);
+      const double dy = knots_(i, 1) - knots_(j, 1);
+      best = std::min(best, dx * dx + dy * dy);
+    }
+  }
+  return std::isfinite(best) ? std::sqrt(best) * scale_ : 0.0;
 }
 
 Eigen::MatrixXd grid_knots(double x0, double y0, double x1, double y1, int nx,

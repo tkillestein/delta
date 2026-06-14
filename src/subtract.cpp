@@ -92,6 +92,61 @@ void dilate_mask(std::vector<MaskType>& mask, int w, int h, int r) {
 
 }  // namespace
 
+namespace {
+
+// Coarse evaluation lattice for spatial-field evaluation. The thin-plate fields vary
+// on the knot length-scale (>> a pixel; SPEC §3.2/§3.5), so evaluating them exactly
+// on a coarse lattice and bilinearly interpolating to full resolution is near-exact
+// at a fraction of the cost. Bilinear error scales as ~(stride / knot-spacing)^2, so
+// the stride is taken as a fraction of the smallest knot spacing (>= ~16 samples per
+// knot interval keeps the relative error well below 1e-3), capped so it stays cheap.
+constexpr int kSamplesPerKnotInterval = 16;
+constexpr int kMaxFieldStride = 64;
+// Below this stride the coarse grid is barely coarser than full resolution, so the
+// exact per-pixel path is used instead (it is also bit-for-bit for tests).
+constexpr int kMinFieldStride = 4;
+
+int choose_field_stride(const ThinPlateBasis& spatial) {
+  const double spacing = spatial.min_knot_spacing();
+  if (!(spacing > 0.0)) return 1;
+  const int s = static_cast<int>(spacing / kSamplesPerKnotInterval);
+  return std::clamp(s, 1, kMaxFieldStride);
+}
+
+// Exact per-pixel field evaluation: for each row, design(points) * C scattered into
+// the full-resolution coefficient/background images. The reference implementation,
+// used directly for small frames where interpolation buys nothing.
+void evaluate_fields_exact(const ThinPlateBasis& spatial, const Eigen::MatrixXd& c,
+                           int n_components, int w, int h, SpatialFields& out) {
+#pragma omp parallel for schedule(static)
+  for (int y = 0; y < h; ++y) {
+    Eigen::MatrixXd points(w, 2);
+    for (int x = 0; x < w; ++x) {
+      points(x, 0) = static_cast<double>(x);
+      points(x, 1) = static_cast<double>(y);
+    }
+    const Eigen::MatrixXd fields = spatial.design(points) * c;  // w x n_fields
+    for (int n = 0; n < n_components; ++n) {
+      float* row = out.coeff[n].data() + static_cast<std::size_t>(y) * w;
+      for (int x = 0; x < w; ++x) row[x] = static_cast<float>(fields(x, n));
+    }
+    float* bg = out.background.data() + static_cast<std::size_t>(y) * w;
+    for (int x = 0; x < w; ++x)
+      bg[x] = static_cast<float>(fields(x, n_components));
+  }
+}
+
+// Coarse sample coordinates for one axis: 0, S, 2S, ... with the last entry pinned
+// to len-1 so interpolation brackets every full-resolution pixel.
+std::vector<int> coarse_coords(int len, int stride) {
+  std::vector<int> g;
+  for (int p = 0; p < len - 1; p += stride) g.push_back(p);
+  g.push_back(len - 1);
+  return g;
+}
+
+}  // namespace
+
 SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
                               const Eigen::Ref<const Eigen::VectorXd>& theta,
                               int n_components, std::size_t width,
@@ -107,22 +162,78 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
   const int w = static_cast<int>(width);
   const int h = static_cast<int>(height);
 
+  // Stride chosen from the knot spacing; a frame coarser than the lattice or a
+  // sub-threshold stride falls back to exact per-pixel evaluation (also bit-for-bit
+  // for tests). 2*stride guarantees >= 3 coarse samples per axis so the bilinear
+  // brackets are always non-degenerate.
+  const int stride = choose_field_stride(spatial);
+  if (stride < kMinFieldStride || w <= 2 * stride || h <= 2 * stride) {
+    evaluate_fields_exact(spatial, c, n_components, w, h, out);
+    return out;
+  }
+
+  // --- evaluate fields exactly on a coarse lattice -------------------------------
+  const std::vector<int> gx = coarse_coords(w, stride);
+  const std::vector<int> gy = coarse_coords(h, stride);
+  const int ncx = static_cast<int>(gx.size());
+  const int ncy = static_cast<int>(gy.size());
+
+  // coarse[(field*ncy + iy)*ncx + ix] -- one contiguous (ncy x ncx) block per field.
+  std::vector<double> coarse(static_cast<std::size_t>(n_fields) * ncy * ncx);
+#pragma omp parallel for schedule(static)
+  for (int iy = 0; iy < ncy; ++iy) {
+    Eigen::MatrixXd points(ncx, 2);
+    for (int ix = 0; ix < ncx; ++ix) {
+      points(ix, 0) = static_cast<double>(gx[ix]);
+      points(ix, 1) = static_cast<double>(gy[iy]);
+    }
+    const Eigen::MatrixXd fields = spatial.design(points) * c;  // ncx x n_fields
+    for (int f = 0; f < n_fields; ++f) {
+      double* dst = coarse.data() +
+                    (static_cast<std::size_t>(f) * ncy + iy) * ncx;
+      for (int ix = 0; ix < ncx; ++ix) dst[ix] = fields(ix, f);
+    }
+  }
+
+  // --- bilinearly interpolate to full resolution ---------------------------------
+  // Per-axis lookup: containing coarse cell + fractional weight, computed once.
+  std::vector<int> ix0(w);
+  std::vector<float> wx(w);
+  for (int x = 0; x < w; ++x) {
+    int c0 = std::min(x / stride, ncx - 2);
+    const int x0 = gx[c0], x1 = gx[c0 + 1];
+    ix0[x] = c0;
+    wx[x] = x1 > x0 ? static_cast<float>(x - x0) / (x1 - x0) : 0.0f;
+  }
+  std::vector<int> iy0(h);
+  std::vector<float> wy(h);
+  for (int y = 0; y < h; ++y) {
+    int c0 = std::min(y / stride, ncy - 2);
+    const int y0 = gy[c0], y1 = gy[c0 + 1];
+    iy0[y] = c0;
+    wy[y] = y1 > y0 ? static_cast<float>(y - y0) / (y1 - y0) : 0.0f;
+  }
+
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
-    // Design block for this row (w x k), then fields = design * C (w x n_fields).
-    Eigen::MatrixXd points(w, 2);
-    for (int x = 0; x < w; ++x) {
-      points(x, 0) = static_cast<double>(x);
-      points(x, 1) = static_cast<double>(y);
+    const int jy0 = iy0[y], jy1 = jy0 + 1;
+    const float fy = wy[y];
+    for (int f = 0; f < n_fields; ++f) {
+      const double* c00 = coarse.data() +
+                          (static_cast<std::size_t>(f) * ncy + jy0) * ncx;
+      const double* c10 = coarse.data() +
+                          (static_cast<std::size_t>(f) * ncy + jy1) * ncx;
+      float* dst = (f < n_components ? out.coeff[f].data()
+                                     : out.background.data()) +
+                   static_cast<std::size_t>(y) * w;
+      for (int x = 0; x < w; ++x) {
+        const int jx0 = ix0[x], jx1 = jx0 + 1;
+        const float fx = wx[x];
+        const double top = c00[jx0] + (c00[jx1] - c00[jx0]) * fx;
+        const double bot = c10[jx0] + (c10[jx1] - c10[jx0]) * fx;
+        dst[x] = static_cast<float>(top + (bot - top) * fy);
+      }
     }
-    const Eigen::MatrixXd fields = spatial.design(points) * c;  // w x n_fields
-    for (int n = 0; n < n_components; ++n) {
-      float* row = out.coeff[n].data() + static_cast<std::size_t>(y) * w;
-      for (int x = 0; x < w; ++x) row[x] = static_cast<float>(fields(x, n));
-    }
-    float* bg = out.background.data() + static_cast<std::size_t>(y) * w;
-    for (int x = 0; x < w; ++x)
-      bg[x] = static_cast<float>(fields(x, n_components));
   }
   return out;
 }

@@ -31,6 +31,11 @@ class ThinPlateBasis {
   // Bending-energy penalty (n_basis, n_basis): block-diag(Z^T E Z, 0_3).
   const Eigen::MatrixXd& penalty() const { return penalty_; }
 
+  // Smallest centre-to-centre knot spacing in the original (input) coordinate
+  // units. The fields vary on this length-scale; callers use it to choose a
+  // coarse evaluation lattice (see evaluate_fields).
+  double min_knot_spacing() const;
+
  private:
   Eigen::MatrixXd knots_;    // (k, 2) normalised knot coordinates
   Eigen::MatrixXd nullspace_;  // (k, k-3) affine null space (Z)

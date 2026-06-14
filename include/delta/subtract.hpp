@@ -23,8 +23,13 @@ struct SpatialFields {
 //
 // `theta` is the solver output, ordered [ c_0 | c_1 | ... | c_{nc-1} | b ] with
 // k = spatial.n_basis() coefficients per field; n_components = nc. The fields
-// are continuous across the whole frame (no tiling seams): each pixel row is a
-// design block times the reshaped coefficient matrix.
+// are continuous across the whole frame (no tiling seams).
+//
+// The thin-plate fields vary on the knot length-scale (>> a pixel; SPEC §3.2/§3.5),
+// so for large frames they are evaluated exactly on a coarse lattice and bilinearly
+// interpolated to full resolution -- near-exact (error ~ (stride/knot-spacing)^2) and
+// far cheaper than the per-pixel design-matrix rebuild. Small frames fall back to the
+// exact per-pixel evaluation.
 SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
                               const Eigen::Ref<const Eigen::VectorXd>& theta,
                               int n_components, std::size_t width,

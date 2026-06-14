@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "delta/convolve.hpp"
+#include "delta/timing.hpp"
 
 namespace delta {
 
@@ -138,8 +139,14 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   // D = S - b - sum_n a_n (phi_n (x) R)   (SPEC §3.2). The reference is sanitised
   // first so masked/non-finite pixels do not bleed into the model.
   const int nc = basis.component_count();
-  const SpatialFields fields = evaluate_fields(spatial, theta, nc, w, h);
-  const ImageF clean = sanitised_reference(reference);
+  const SpatialFields fields = [&] {
+    DELTA_TIME("subtract: spatial fields");
+    return evaluate_fields(spatial, theta, nc, w, h);
+  }();
+  const ImageF clean = [&] {
+    DELTA_TIME("subtract: sanitise reference");
+    return sanitised_reference(reference);
+  }();
   const int hh = static_cast<int>(h);
   const int ww = static_cast<int>(w);
   const std::size_t npix = w * h;
@@ -149,62 +156,64 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   // difference. Materialising the full nc-component B_n stack (and re-reading it
   // in a combine pass) was memory-bound; streaming touches one temporary at a
   // time and keeps it hot for the accumulate.
-  const int n_max = basis.n_max();
-  std::vector<ImageF> tx;
-  tx.reserve(n_max + 1);
-  for (int nx = 0; nx <= n_max; ++nx)
-    tx.push_back(convolve_x(clean, basis.kernel1d(nx)));
-
-  const auto& orders = basis.orders();
-  std::vector<std::vector<float>> ky(nc);
-  for (int n = 0; n < nc; ++n) ky[n] = basis.kernel1d(orders[n].second);
-  const int kh = (basis.ksize() - 1) / 2;
-
   ImageF diff(w, h);
   {
+    DELTA_TIME("subtract: model convolve");
+    const int n_max = basis.n_max();
+    std::vector<ImageF> tx;
+    tx.reserve(n_max + 1);
+    for (int nx = 0; nx <= n_max; ++nx)
+      tx.push_back(convolve_x(clean, basis.kernel1d(nx)));
+
+    const auto& orders = basis.orders();
+    std::vector<std::vector<float>> ky(nc);
+    for (int n = 0; n < nc; ++n) ky[n] = basis.kernel1d(orders[n].second);
+    const int kh = (basis.ksize() - 1) / 2;
+
     const float* s = science.data();
     const float* bg = fields.background.data();
     float* d = diff.data();
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(npix); ++i)
       d[i] = s[i] - bg[i];
-  }
 
-  // Stream each component's y-pass over the full frame (so the shared x-pass tx
-  // stays cache-resident across output rows) and fuse the a_n accumulation into
-  // the same row loop -- B_n is never materialised full-frame, and the separate
-  // combine pass is gone.
-  for (int n = 0; n < nc; ++n) {
-    const float* src = tx[orders[n].first].data();
-    const std::vector<float>& kyn = ky[n];
-    const int ks = static_cast<int>(kyn.size());
-    const float* a = fields.coeff[n].data();
-    float* dd = diff.data();
+    // Stream each component's y-pass over the full frame (so the shared x-pass
+    // tx stays cache-resident across output rows) and fuse the a_n accumulation
+    // into the same row loop -- B_n is never materialised full-frame, and the
+    // separate combine pass is gone.
+    for (int n = 0; n < nc; ++n) {
+      const float* src = tx[orders[n].first].data();
+      const std::vector<float>& kyn = ky[n];
+      const int ks = static_cast<int>(kyn.size());
+      const float* a = fields.coeff[n].data();
+      float* dd = diff.data();
 #pragma omp parallel
-    {
-      std::vector<float> bn(w);
+      {
+        std::vector<float> bn(w);
 #pragma omp for schedule(static)
-      for (int y = 0; y < hh; ++y) {
-        std::fill(bn.begin(), bn.end(), 0.0f);
-        for (int j = 0; j < ks; ++j) {
-          const int sy = y + kh - j;
-          if (sy < 0 || sy >= hh) continue;
-          const float c = kyn[j];
-          const float* srow = src + static_cast<std::size_t>(sy) * w;
+        for (int y = 0; y < hh; ++y) {
+          std::fill(bn.begin(), bn.end(), 0.0f);
+          for (int j = 0; j < ks; ++j) {
+            const int sy = y + kh - j;
+            if (sy < 0 || sy >= hh) continue;
+            const float c = kyn[j];
+            const float* srow = src + static_cast<std::size_t>(sy) * w;
 #pragma omp simd
-          for (int x = 0; x < ww; ++x) bn[x] += c * srow[x];
+            for (int x = 0; x < ww; ++x) bn[x] += c * srow[x];
+          }
+          const std::size_t off = static_cast<std::size_t>(y) * w;
+          const float* arow = a + off;
+          float* drow = dd + off;
+#pragma omp simd
+          for (int x = 0; x < ww; ++x) drow[x] -= arow[x] * bn[x];
         }
-        const std::size_t off = static_cast<std::size_t>(y) * w;
-        const float* arow = a + off;
-        float* drow = dd + off;
-#pragma omp simd
-        for (int x = 0; x < ww; ++x) drow[x] -= arow[x] * bn[x];
       }
     }
   }
 
   // ---- variance propagation: Var(D) = Var(S) + (K^2 (x) Var(R)) ------------
   if (reference.has_variance() || science.has_variance()) {
+    DELTA_TIME("subtract: variance propagation");
     diff.allocate_variance();
     std::vector<float>& var = diff.variance();
 
@@ -322,6 +331,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
 
   // ---- mask growth (SPEC §3.6) --------------------------------------------
   if (reference.has_mask() || science.has_mask() || saturation > 0.0) {
+    DELTA_TIME("subtract: mask growth");
     diff.allocate_mask();
     std::vector<MaskType>& out = diff.mask();
     const int r = basis.radius();

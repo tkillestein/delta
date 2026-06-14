@@ -21,6 +21,7 @@
 #include "delta/solve.hpp"
 #include "delta/spatial.hpp"
 #include "delta/subtract.hpp"
+#include "delta/timing.hpp"
 #include "delta/version.hpp"
 
 namespace nb = nanobind;
@@ -408,6 +409,16 @@ delta::ImageF make_image_vm(InArray<float> data,
   return img;
 }
 
+// Drain the opt-in C++ sub-stage timers (DELTA_TIMING) into a {label: seconds}
+// dict, or None when timing is disabled (so callers can branch cheaply).
+nb::object timing_dict() {
+  if (!delta::timing::enabled()) return nb::none();
+  nb::dict out;
+  for (const auto& [label, seconds] : delta::timing::drain())
+    out[label.c_str()] = seconds;
+  return out;
+}
+
 // Full-frame subtraction -> {'difference', 'variance', 'mask'} (the latter two
 // present only when the inputs carry the corresponding layers).
 nb::dict subtract(InArray<float> science, InArray<float> reference,
@@ -424,11 +435,13 @@ nb::dict subtract(InArray<float> science, InArray<float> reference,
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
 
+  delta::timing::clear();
   delta::ImageF diff = delta::subtract(sci, ref, spatial, theta, basis, saturation);
   const std::size_t h = diff.height();
   const std::size_t w = diff.width();
 
   nb::dict out;
+  out["timing"] = timing_dict();
   out["difference"] = to_numpy<float>(std::move(diff.pixels()), {h, w});
   if (diff.has_variance())
     out["variance"] = to_numpy<float>(std::move(diff.variance()), {h, w});
@@ -467,11 +480,13 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
   const std::vector<double> grid(lambda_grid.data(),
                                  lambda_grid.data() + lambda_grid.size());
 
+  delta::timing::clear();
   const delta::KernelFit fit =
       delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
                         clip_sigma, clip_iterations, min_stamps, cv_folds);
 
   nb::dict out = gls_result_to_dict(fit.gls);
+  out["timing"] = timing_dict();
   out["component_sums"] = to_numpy<double>(
       std::vector<double>(fit.component_sums), {fit.component_sums.size()});
   out["n_pixels"] = fit.n_pixels;

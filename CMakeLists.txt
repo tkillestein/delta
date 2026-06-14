@@ -61,6 +61,7 @@ nanobind_add_module(_core
   src/subtract.cpp
   src/fit.cpp
   src/noise.cpp
+  src/timing.cpp
 )
 target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO PkgConfig::FFTWF)

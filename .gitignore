@@ -21,6 +21,8 @@ __pycache__/
 
 # Benchmark / validation figures
 /artifacts/
+# Host-specific benchmark history (see benchmarks/PERFORMANCE.md)
+/benchmarks/results/
 
 # Editors / OS
 .vscode/

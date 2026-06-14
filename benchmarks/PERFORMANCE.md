@@ -33,42 +33,43 @@ indented C++ sub-stage splits:
 
 | stage                              | time (s) | share |
 |------------------------------------|---------:|------:|
-| stamp selection                    |     2.16 | 11.0% |
-| kernel solve                       |     4.24 | 21.5% |
-| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.19 |  1.0% |
-| &nbsp;&nbsp;↳ GLS solve            |     3.62 | 18.4% |
-| full-frame subtraction             |    10.67 | 54.2% |
-| &nbsp;&nbsp;↳ spatial fields       |     2.72 | 13.8% |
-| &nbsp;&nbsp;↳ model convolve       |     2.26 | 11.5% |
-| &nbsp;&nbsp;↳ variance propagation |     4.46 | 22.6% |
-| noise decorrelation                |     1.41 |  7.2% |
-| matched-filter score               |     0.87 |  4.4% |
-| orchestration                      |     0.34 |  1.7% |
-| **total**                          |**19.70** |  100% |
+| stamp selection                    |     2.16 | 13.8% |
+| kernel solve                       |     4.24 | 27.0% |
+| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.19 |  1.2% |
+| &nbsp;&nbsp;↳ GLS solve            |     3.62 | 23.1% |
+| full-frame subtraction             |     6.68 | 42.5% |
+| &nbsp;&nbsp;↳ spatial fields       |     2.72 | 17.3% |
+| &nbsp;&nbsp;↳ model convolve       |     2.26 | 14.4% |
+| &nbsp;&nbsp;↳ variance propagation |     0.47 |  3.0% |
+| noise decorrelation                |     1.41 |  9.0% |
+| matched-filter score               |     0.87 |  5.5% |
+| orchestration                      |     0.34 |  2.2% |
+| **total**                          |**15.70** |  100% |
 
-These numbers are *post* the GLS-solve optimisation (issue #17); the convolution-path
-(#19) and spatial-field coarse-grid (#16) wins are folded in. Re-captured on this host,
-the pre-#17 baseline was **21.33 s** (the absolute seconds are host-specific — an earlier
-capture on a different 14-core machine read 19.70 s for the same pre-#17 code; treat the
-*ratios* as durable). Issue #17 cut the **GLS solve 5.26→3.62 s** (−31%, see below),
-dropping the total 21.33→19.70 s and leaving `variance propagation` as the new tall pole
-(issue #18 tracks it).
+These numbers are *post* the GLS-solve and variance-propagation optimisations (issues
+#17 and #18); the convolution-path (#19) and spatial-field coarse-grid (#16) wins are
+folded in. Re-captured on this host, the pre-#17/#18 baseline was **21.33 s** (the
+absolute seconds are host-specific — an earlier capture on a different 14-core machine
+read 19.70 s for the same pre-#17/#18 code; treat the *ratios* as durable). The two tall
+poles it called out are now markedly cheaper: **GLS solve 5.26→3.62 s** (#17) and
+**variance propagation 4.46→0.47 s** (#18), dropping the total 21.33→15.70 s (−26%) and
+flipping `full-frame subtraction` from 50% to ~42% of wall time.
 
 Two findings fall straight out of the splits:
 
-- **The tall poles are now `variance propagation` (~23%, the block-effective
-  squared-kernel convolution — a near-full-frame second convolution) and the `GLS solve`
-  (~18%, a fixed cost set by stamp/λ-grid/CV-fold count, now cut by #17).** `spatial
-  fields` (~14%) is third, down from the previous #1 (~27%) after #16 moved it to a
-  knot-scale coarse lattice + bilinear interpolation.
-- **`B_n` precompute is negligible (~1.0%)** because the fit convolves only the stamp
+- **No single tall pole remains**: the largest sub-stages — `GLS solve` (~23%),
+  `spatial fields` (~17%), and `model convolve` (~14%) — are now within ~1.6× of each
+  other, so further wins must spread across them rather than chase one. `variance
+  propagation`, the previous #2 at ~23%, has collapsed to ~3% (#18); `spatial fields`
+  (#16) and the convolution paths (#19) were cut earlier.
+- **`B_n` precompute is negligible (~1.2%)** because the fit convolves only the stamp
   windows, not the whole frame — so the kernel solve is essentially all *solve*
   (the λ-grid × CV-fold factorisations), not convolution.
 
 The balance shifts with frame size: **the GLS solve is a fixed cost** (set by stamp
 count and the λ-grid × CV-fold solve count, independent of frame area), so on small
-frames it dominates (~76% at 1024²), while on the reference frame the
-**area-proportional `full-frame subtraction` dominates at ~50%**.
+frames it dominates (~62% at 2048²), while on the reference frame the
+**area-proportional `full-frame subtraction` dominates at ~42%**.
 
 ## Thread scaling (4096², no warm-up)
 
@@ -152,12 +153,22 @@ and measured but *does not pay off* at the relevant size: one symmetric eigensol
 P = (nc+1)k ≈ 812 costs ≈ 25–50 Cholesky factorisations, so it is a net loss for both
 the 25-point GCV grid and the 5-fold CV path. Left out.
 
-### `subtract: variance propagation` — ~14% (`src/subtract.cpp`)
+### `subtract: variance propagation` — ~3%, was ~21% (`src/subtract.cpp`) — **DONE (issue #18)**
 The *block-effective squared-kernel* convolution (freeze `K=Σaₙφₙ` per tile, square it,
-convolve `Var(R)`). A near-full-frame second convolution.
-- Where the kernel is near-constant a **coarser tile grid** (or skipping re-freeze
-  between adjacent tiles) trades negligible accuracy for time; a cheaper variance
-  approximation is possible when `Var(R)` is near-flat.
+convolve `Var(R)`) was a near-full-frame second convolution. Cut **4.46→0.47 s** (~9.6×)
+by the **flat-`Var(R)` shortcut**: where the reference variance is near-constant over the
+kernel footprint — the sky-dominated common case — `K² ⊗ Var(R) ≈ Var(R)·Σᵤ K²(u)`, i.e.
+a per-pixel scale by the kernel sum-of-squares `Q`, with no `ks²` convolution at all. Each
+tile gathers its `Var(R)` window (tile + kernel-radius halo) and takes the shortcut only
+when the window's relative spread `(max−min)/max` is below `1e-3`, which bounds the
+shortcut's relative error by the same; otherwise it falls through to the exact
+convolution. Because the *haloed* window is the exact footprint the convolution reads, a
+tile near a bright source (a Poisson variance spike) reads non-flat and stays exact —
+verified to ~1e-6 relative against a direct `K²` convolution on a flat-sky-plus-bump map.
+The ~9.6× here is the constant-`Var` best case (every tile flat); a frame with structure
+near sources sees less, but the sky tiles that dominate a survey frame still get it.
+- Remaining lever: **adaptive tile size** where the kernel itself is near-constant, and
+  **fusing with the model-convolve pass** (same neighbourhoods, read once).
 
 ### `subtract: model convolve` — ~10% (`src/subtract.cpp`, `src/convolve.cpp`)
 The separable model convolution, now **2D-tiled and fully fused** (issue #19): the

@@ -178,7 +178,6 @@ def main() -> int:
             max_stamps=300,
             saturation=552.0,
             decorrelate=dec,
-            fill_holes=False,
         )
         assert res.mask is not None and res.variance is not None
         var = np.asarray(res.variance)

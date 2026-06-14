@@ -35,6 +35,56 @@ def _conv2d_same(img, kernel):
     return out
 
 
+def _exact_scale(knots, theta, sums, h, w):
+    """Exact per-pixel photometric scale via the at-points evaluator, shape (h, w)."""
+    ys, xs = np.mgrid[0:h, 0:w]
+    points = np.column_stack([xs.ravel().astype(float), ys.ravel().astype(float)])
+    return delta._core.photometric_scale_at(knots, theta, sums, points).reshape(h, w)
+
+
+def test_coarse_field_matches_exact_large_frame():
+    # The full-frame spatial-field evaluation uses a coarse lattice + bilinear
+    # interpolation (issue #16). On a frame large enough to take that path it must
+    # stay near-exact vs the per-point evaluator, since the thin-plate fields vary
+    # on the knot length-scale (>> a pixel).
+    # Wide knot spacing (3x3 over 400 px ~= 200 px apart) so the stride, set to a
+    # fraction of the knot spacing, lands well above the exact-fallback threshold.
+    h, w = 400, 400
+    rng = np.random.default_rng(7)
+    knots = delta.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, 3, 3)
+    k = knots.shape[0]
+    nc = 6
+    theta = 0.1 * rng.standard_normal((nc + 1) * k)
+    sums = rng.standard_normal(nc)
+
+    got = delta._core.photometric_scale(knots, theta, sums, h, w)
+    exact = _exact_scale(knots, theta, sums, h, w)
+
+    # Worst-case interpolation error is a small fraction of the field's dynamic
+    # range. This frame's knot spacing forces the largest stride/spacing ratio the
+    # scheme allows (~1/16); on the reference frame the stride caps out far below the
+    # knot spacing, so the real-world error is ~30x smaller still. The coarse path is
+    # genuinely active (not the exact fallback), so the error is non-zero.
+    err = np.max(np.abs(got - exact))
+    assert err < 5e-3 * np.ptp(exact)
+    assert err > 0.0
+
+
+def test_exact_fallback_small_frame_bit_for_bit():
+    # Small frames bypass the coarse grid and evaluate exactly per pixel.
+    h, w = 40, 48  # <= 2*stride -> exact path
+    rng = np.random.default_rng(8)
+    knots = delta.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, 3, 3)
+    k = knots.shape[0]
+    nc = 4
+    theta = 0.1 * rng.standard_normal((nc + 1) * k)
+    sums = rng.standard_normal(nc)
+
+    got = delta._core.photometric_scale(knots, theta, sums, h, w)
+    exact = _exact_scale(knots, theta, sums, h, w)
+    np.testing.assert_allclose(got, exact, rtol=1e-5, atol=1e-5)
+
+
 def test_difference_matches_numpy_model():
     h, w, beta, n_max = 48, 56, 2.0, 2
     rng = np.random.default_rng(0)

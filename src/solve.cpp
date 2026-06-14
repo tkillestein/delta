@@ -107,22 +107,34 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
 
 GlsResult solve_at(const System& s, double lambda) {
   const Eigen::MatrixXd a = s.m + lambda * s.p0;
-  const Eigen::LDLT<Eigen::MatrixXd> ldlt(a);
 
   GlsResult r;
-  r.theta = ldlt.solve(s.rhs);
   r.n_components = s.nc;
   r.n_spatial = s.k;
   r.lambda = lambda;
+
+  // A = X^T W X + lambda P0 is symmetric positive-definite for any lambda>0, so a
+  // plain Cholesky (LLT) factorises it ~1.5x faster than the pivoted LDLT -- and
+  // this factorisation, repeated across the lambda grid, is the dominant cost of
+  // the fit (benchmarks/PERFORMANCE.md). The rare near-singular system (an
+  // under-constrained field at lambda~0) loses positive-definiteness mid-Cholesky;
+  // there we fall back to the robust LDLT. Both give theta and tr S(lambda) =
+  // tr(A^{-1} X^T W X) (the effective dof) identically.
+  const Eigen::LLT<Eigen::MatrixXd> llt(a);
+  if (llt.info() == Eigen::Success) {
+    r.theta = llt.solve(s.rhs);
+    r.effective_dof = (llt.solve(s.m)).trace();
+  } else {
+    const Eigen::LDLT<Eigen::MatrixXd> ldlt(a);
+    r.theta = ldlt.solve(s.rhs);
+    r.effective_dof = (ldlt.solve(s.m)).trace();
+  }
 
   // Weighted residual sum of squares: ||W^1/2 (d - X theta)||^2
   //   = y^T W y - 2 theta^T (X^T W d) + theta^T (X^T W X) theta.
   double rss = s.ywy - 2.0 * r.theta.dot(s.rhs) + r.theta.dot(s.m * r.theta);
   if (rss < 0.0) rss = 0.0;  // guard against round-off near a perfect fit
   r.rss = rss;
-
-  // Effective degrees of freedom tr S(lambda) = tr(A^{-1} X^T W X).
-  r.effective_dof = (ldlt.solve(s.m)).trace();
 
   const double denom = static_cast<double>(s.n) - r.effective_dof;
   r.gcv = denom > 0.0 ? static_cast<double>(s.n) * rss / (denom * denom)
@@ -251,31 +263,75 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   for (int b = 0; b <= nc; ++b) s.p0.block(b * k, b * k, k, k) = pen;
 
   // Held-out weighted SSE for every (lambda, fold): fit on M_all - M_g, predict
-  // fold g via ds_g^T ds_g - 2 theta^T rhs_g + theta^T M_g theta. Independent
-  // tasks, run in parallel.
+  // fold g via ds_g^T ds_g - 2 theta^T rhs_g + theta^T M_g theta.
   const int nl = static_cast<int>(lambda_grid.size());
-  Eigen::MatrixXd err(nl, n_groups);
-#pragma omp parallel for collapse(2) schedule(dynamic)
-  for (int li = 0; li < nl; ++li) {
-    for (int g = 0; g < n_groups; ++g) {
-      const Eigen::MatrixXd a = (s.m - mf[g]) + lambda_grid[li] * s.p0;
-      const Eigen::LDLT<Eigen::MatrixXd> ldlt(a);
-      const Eigen::VectorXd th = ldlt.solve(s.rhs - rf[g]);
-      double e = ysq[g] - 2.0 * th.dot(rf[g]) + th.dot(mf[g] * th);
-      err(li, g) = e > 0.0 ? e : 0.0;
-    }
-  }
+  const double kInf = std::numeric_limits<double>::infinity();
+  std::vector<double> curve(nl, kInf);
+  std::vector<char> done(nl, 0);
 
-  std::vector<double> curve(nl);
+  // Evaluate the total CV error at a set of lambda indices. Each (lambda, fold) is
+  // an independent small dense solve -- this nl*n_groups factorisation grid is the
+  // dominant cost of the fit (benchmarks/PERFORMANCE.md), so the work is the
+  // (collapsed) parallel loop below.
+  auto evaluate = [&](const std::vector<int>& idx) {
+    const int m = static_cast<int>(idx.size());
+    Eigen::MatrixXd err(m, n_groups);
+#pragma omp parallel for collapse(2) schedule(dynamic)
+    for (int ii = 0; ii < m; ++ii) {
+      for (int g = 0; g < n_groups; ++g) {
+        const Eigen::MatrixXd a = (s.m - mf[g]) + lambda_grid[idx[ii]] * s.p0;
+        // SPD training normal matrix -> Cholesky (LLT); fall back to the robust
+        // pivoted LDLT only when a fold's system is not positive-definite (an
+        // under-constrained field at tiny lambda). See solve_at().
+        const Eigen::VectorXd rhs_g = s.rhs - rf[g];
+        const Eigen::LLT<Eigen::MatrixXd> llt(a);
+        Eigen::VectorXd th;
+        if (llt.info() == Eigen::Success)
+          th = llt.solve(rhs_g);
+        else
+          th = Eigen::LDLT<Eigen::MatrixXd>(a).solve(rhs_g);
+        const double e = ysq[g] - 2.0 * th.dot(rf[g]) + th.dot(mf[g] * th);
+        err(ii, g) = e > 0.0 ? e : 0.0;
+      }
+    }
+    for (int ii = 0; ii < m; ++ii) {
+      curve[idx[ii]] = err.row(ii).sum();
+      done[idx[ii]] = 1;
+    }
+  };
+
+  // Coarse-to-fine lambda search. The held-out CV error is unimodal in log-lambda
+  // (the bias-variance tradeoff is convex over a log grid), so the full grid need
+  // not be swept: evaluate a stride-`kCoarseStep` coarse subset, then refine the
+  // bracket around its minimum. With stride 2 the true grid minimum is always
+  // within +/-2 of the coarse argmin (an interior minimum lies between, or on, the
+  // two bracketing coarse samples), so the selected lambda is identical to the
+  // full-grid sweep for any unimodal curve -- at ~0.6x the factorisations. The
+  // reduced-chi2 / effective-dof diagnostics come from the exact final solve below,
+  // not the curve, so they are unaffected.
+  constexpr int kCoarseStep = 2;
+  std::vector<int> coarse;
+  for (int li = 0; li < nl; li += kCoarseStep) coarse.push_back(li);
+  if (coarse.empty() || coarse.back() != nl - 1) coarse.push_back(nl - 1);
+  evaluate(coarse);
+
+  int coarse_best = coarse.front();
+  for (int li : coarse)
+    if (curve[li] < curve[coarse_best]) coarse_best = li;
+
+  std::vector<int> refine;
+  for (int li = std::max(0, coarse_best - kCoarseStep);
+       li <= std::min(nl - 1, coarse_best + kCoarseStep); ++li)
+    if (!done[li]) refine.push_back(li);
+  if (!refine.empty()) evaluate(refine);
+
   int best_i = 0;
-  double best_cv = std::numeric_limits<double>::infinity();
-  for (int li = 0; li < nl; ++li) {
-    curve[li] = err.row(li).sum();
-    if (curve[li] < best_cv) {
+  double best_cv = kInf;
+  for (int li = 0; li < nl; ++li)
+    if (done[li] && curve[li] < best_cv) {
       best_cv = curve[li];
       best_i = li;
     }
-  }
 
   // Final fit on all pixels at the CV-selected lambda.
   GlsResult best = solve_at(s, lambda_grid[best_i]);

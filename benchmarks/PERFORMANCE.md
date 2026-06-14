@@ -33,36 +33,35 @@ indented C++ sub-stage splits:
 
 | stage                              | time (s) | share |
 |------------------------------------|---------:|------:|
-| stamp selection                    |     1.97 | 10.0% |
-| kernel solve                       |     5.28 | 26.8% |
-| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.17 |  0.9% |
-| &nbsp;&nbsp;↳ GLS solve            |     4.71 | 23.9% |
-| full-frame subtraction             |    10.05 | 51.0% |
-| &nbsp;&nbsp;↳ spatial fields       |     2.51 | 12.8% |
-| &nbsp;&nbsp;↳ model convolve       |     2.16 | 11.0% |
-| &nbsp;&nbsp;↳ variance propagation |     4.23 | 21.4% |
-| noise decorrelation                |     1.28 |  6.5% |
-| matched-filter score               |     0.81 |  4.1% |
-| orchestration                      |     0.31 |  1.6% |
+| stamp selection                    |     2.16 | 11.0% |
+| kernel solve                       |     4.24 | 21.5% |
+| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.19 |  1.0% |
+| &nbsp;&nbsp;↳ GLS solve            |     3.62 | 18.4% |
+| full-frame subtraction             |    10.67 | 54.2% |
+| &nbsp;&nbsp;↳ spatial fields       |     2.72 | 13.8% |
+| &nbsp;&nbsp;↳ model convolve       |     2.26 | 11.5% |
+| &nbsp;&nbsp;↳ variance propagation |     4.46 | 22.6% |
+| noise decorrelation                |     1.41 |  7.2% |
+| matched-filter score               |     0.87 |  4.4% |
+| orchestration                      |     0.34 |  1.7% |
 | **total**                          |**19.70** |  100% |
 
-These numbers are *post* the convolution-path optimisation (issue #19) and the
-spatial-field coarse-grid evaluation (issue #16). The breakdown before #19 totalled
-**34.03 s**; the three convolution paths it called out are now markedly cheaper — model
-convolve 4.16→2.16 s, matched filter 3.88→0.81 s, decorrelation 5.76→1.28 s. Issue #16
-then halved-and-more the spatial-field evaluation (**6.21→2.51 s**), dropping it from
-the tall pole, for a total of 23.25→19.70 s.
+These numbers are *post* the GLS-solve optimisation (issue #17); the convolution-path
+(#19) and spatial-field coarse-grid (#16) wins are folded in. Re-captured on this host,
+the pre-#17 baseline was **21.33 s** (the absolute seconds are host-specific — an earlier
+capture on a different 14-core machine read 19.70 s for the same pre-#17 code; treat the
+*ratios* as durable). Issue #17 cut the **GLS solve 5.26→3.62 s** (−31%, see below),
+dropping the total 21.33→19.70 s and leaving `variance propagation` as the new tall pole
+(issue #18 tracks it).
 
 Two findings fall straight out of the splits:
 
-- **The tall poles are now both ~`O(stamp)·O(area)`-bounded sub-stages**: the `GLS
-  solve` (~24%, fixed cost set by stamp/λ-grid/CV-fold count) and `variance
-  propagation` (~21%, the block-effective squared-kernel convolution). `spatial fields`
-  was the previous #1 (~27%) until #16 evaluated the thin-plate-spline coefficient maps
-  on a knot-scale coarse lattice and bilinearly interpolated to full resolution — what
-  remains there (~13%) is the memory-bound interpolation + full-frame field
-  materialisation, not the RBF/`log` cost.
-- **`B_n` precompute is negligible (~0.9%)** because the fit convolves only the stamp
+- **The tall poles are now `variance propagation` (~23%, the block-effective
+  squared-kernel convolution — a near-full-frame second convolution) and the `GLS solve`
+  (~18%, a fixed cost set by stamp/λ-grid/CV-fold count, now cut by #17).** `spatial
+  fields` (~14%) is third, down from the previous #1 (~27%) after #16 moved it to a
+  knot-scale coarse lattice + bilinear interpolation.
+- **`B_n` precompute is negligible (~1.0%)** because the fit convolves only the stamp
   windows, not the whole frame — so the kernel solve is essentially all *solve*
   (the λ-grid × CV-fold factorisations), not convolution.
 
@@ -129,13 +128,29 @@ convolve reads `aₙ` per pixel), not the RBF/`log` cost — a further win would
 fuse field evaluation into the convolve so the full-resolution fields are never
 materialised.
 
-### `kernel solve` (GLS) — ~15% (and dominant on small frames) (`src/solve.cpp`, `src/fit.cpp`)
-Now confirmed to be ~all *solve* (`B_n` precompute is ~0.6%). Builds `M = XᵀWX`
-(threaded symmetric `rankUpdate` over row chunks) and solves it across the
-**λ-grid × CV-fold** grid: `np.logspace(-6, 6, 25)` × `cv_folds=5` ⇒ up to ~125
-factorise/solve passes of the normal equations.
-- **Reuse factorisations** across the λ-grid (the penalty changes `M` by a known
-  low-rank/diagonal term), **warm-start CV folds**, or prune the λ range adaptively.
+### `kernel solve` (GLS) — ~18%, was ~24% (and dominant on small frames) (`src/solve.cpp`, `src/fit.cpp`) — **DONE (issue #17)**
+~All *solve* (`B_n` precompute is ~1.0%). Builds `M = XᵀWX` (threaded symmetric
+`rankUpdate` over row chunks) and solves it across the **λ-grid × CV-fold** grid:
+`np.logspace(-6, 6, 25)` × `cv_folds=5` ⇒ up to ~125 factorise/solve passes of the
+normal equations. Two *exact* levers cut it **5.26→3.62 s** (−31%):
+
+- **Cholesky (`LLT`) instead of the pivoted `LDLT`** for the per-(λ, fold) factorisation
+  of the SPD penalised normal matrix `A = M_train + λP₀` (with an `LDLT` fallback if a
+  fold's system loses positive-definiteness at tiny λ). This was the larger win — on the
+  real per-stamp normal matrices Eigen's `LDLT` is far slower than its `LLT` (≈ −44% on
+  the solve), though on random matrices the two are within ~6%, so it only showed up
+  end-to-end.
+- **Coarse-to-fine λ search** in the CV path: the held-out CV error is unimodal in
+  log-λ, so a stride-2 coarse scan plus a ±2 bracket refinement around its minimum
+  evaluates 15 of 25 grid points and selects the *identical* λ as the full sweep for any
+  unimodal curve. The reduced-χ²/effective-dof diagnostics come from the exact final
+  solve, so they are untouched.
+
+The hypothesised **factorisation reuse across the λ-grid** (a single generalised
+eigendecomposition of the `(M, P₀)` pencil, then O(P)-per-λ diagnostics) was implemented
+and measured but *does not pay off* at the relevant size: one symmetric eigensolve at
+P = (nc+1)k ≈ 812 costs ≈ 25–50 Cholesky factorisations, so it is a net loss for both
+the 25-point GCV grid and the 5-fold CV path. Left out.
 
 ### `subtract: variance propagation` — ~14% (`src/subtract.cpp`)
 The *block-effective squared-kernel* convolution (freeze `K=Σaₙφₙ` per tile, square it,

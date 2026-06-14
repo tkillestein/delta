@@ -339,44 +339,66 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       dilate_mask(grown, ww, hh, r);
       for (std::size_t i = 0; i < out.size(); ++i) out[i] |= grown[i];
     }
+    // `exact_bad` records the un-dilated pixels whose difference value is truly
+    // garbage (no valid input data, or non-linear), as opposed to pixels merely
+    // flagged by mask *growth*. Only these exact pixels are overwritten; the grown
+    // footprint is preserved (see the resolution loop below).
+    std::vector<char> exact_bad(out.size(), 0);
+
     // Bright/saturated cores are non-linear and never match the model; flag them
     // so their large residual stays out of the difference (SPEC §3.6). A saturated
     // *reference* (convolved) pixel contaminates a whole kernel footprint, so it
     // is grown by the kernel radius; a saturated *science* (target) pixel is not
     // convolved, so it propagates one-to-one -- growing it too is what produced
-    // the oversized boxes around every bright star. `exact_sat` records the
-    // un-dilated saturated pixels (the only ones whose value is truly garbage).
-    std::vector<char> exact_sat;
+    // the oversized boxes around every bright star.
     if (saturation > 0.0) {
       const float sat = static_cast<float>(saturation);
       const float* rd = reference.data();
       const float* sd = science.data();
-      exact_sat.assign(out.size(), 0);
       std::vector<MaskType> hot(out.size(), kMaskGood);
       for (std::size_t i = 0; i < out.size(); ++i)
         if (rd[i] >= sat) hot[i] = kMaskSaturated;
       dilate_mask(hot, ww, hh, r);
       for (std::size_t i = 0; i < out.size(); ++i) {
         if (sd[i] >= sat) hot[i] |= kMaskSaturated;  // target pixel: 1:1
-        if (rd[i] >= sat || sd[i] >= sat) exact_sat[i] = 1;
+        if (rd[i] >= sat || sd[i] >= sat) exact_bad[i] = 1;
         out[i] |= hot[i];
       }
     }
-    // Edge border of one kernel half-width, and any non-finite difference pixel.
+    // No-overlap / no-data pixels: a location directly flagged in the *input*
+    // science or reference mask has no valid science-template overlap there, so
+    // its difference is meaningless (typically a huge value at the registered
+    // frame border). These are exact (un-dilated) bad pixels -- the reference
+    // mask's dilated footprint is handled separately above and is preserved.
+    if (science.has_mask()) {
+      const std::vector<MaskType>& sm = science.mask();
+      for (std::size_t i = 0; i < out.size(); ++i)
+        if (sm[i] != kMaskGood) exact_bad[i] = 1;
+    }
+    if (reference.has_mask()) {
+      const std::vector<MaskType>& rm = reference.mask();
+      for (std::size_t i = 0; i < out.size(); ++i)
+        if (rm[i] != kMaskGood) exact_bad[i] = 1;
+    }
+    // Edge border of one kernel half-width, and any non-finite difference pixel
+    // (also garbage, so it joins the exact-fill set).
     for (int y = 0; y < hh; ++y) {
       for (int x = 0; x < ww; ++x) {
         const std::size_t i = static_cast<std::size_t>(y) * w + x;
         if (x < r || x >= ww - r || y < r || y >= hh - r)
           out[i] |= kMaskEdge;
-        if (!std::isfinite(diff.data()[i])) out[i] |= kMaskNonFinite;
+        if (!std::isfinite(diff.data()[i])) {
+          out[i] |= kMaskNonFinite;
+          exact_bad[i] = 1;
+        }
       }
     }
-    // Background median of the good difference, for filling the saturated cores.
+    // Background median of the good difference, for filling the garbage pixels.
     float fill = 0.0f;
     const bool has_var = diff.has_variance();
     float* dd = diff.data();
     float* vv = has_var ? diff.variance().data() : nullptr;
-    if (!exact_sat.empty()) {
+    {
       std::vector<float> good;
       good.reserve(out.size() / 7 + 1);
       for (std::size_t i = 0; i < out.size(); i += 7)
@@ -387,23 +409,20 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       }
     }
     // Resolve masked-pixel values. Only genuinely meaningless pixels are
-    // overwritten: non-finite ones are zeroed, and the exact (un-dilated)
-    // saturated cores -- which are non-linear and never match the model -- are
-    // set to the background median. Every other masked pixel keeps its real
-    // difference (and variance): the mask grows to flag the affected footprint,
-    // but the subtraction itself is preserved so PSF wings and transients close
-    // to bright stars / mask edges stay assessable. (Setting the whole grown
-    // footprint to a constant boxed out exactly those wings.)
+    // overwritten with the background median: the exact (un-dilated) saturated
+    // cores, the no-overlap / input-masked pixels, and any non-finite pixel.
+    // Every other masked pixel keeps its real difference (and variance): the mask
+    // grows to flag the affected footprint, but the subtraction itself is
+    // preserved so PSF wings and transients close to bright stars / mask edges
+    // stay assessable. (Setting the whole grown footprint to a constant boxed out
+    // exactly those wings.) Filled pixels remain masked -- the value is cosmetic.
     for (std::size_t i = 0; i < out.size(); ++i) {
       if (out[i] == kMaskGood) continue;
-      if (!std::isfinite(dd[i])) {
-        dd[i] = 0.0f;
-        if (has_var) vv[i] = 0.0f;
-      } else if (!exact_sat.empty() && exact_sat[i]) {
+      if (exact_bad[i]) {
         dd[i] = fill;
         if (has_var) vv[i] = 0.0f;
       }
-      // otherwise: masked by mask growth / edge / input layers -> preserve.
+      // otherwise: masked by mask growth / edge -> preserve.
     }
   }
 

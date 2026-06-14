@@ -168,19 +168,31 @@ std::vector<float> local_kernel(const ThinPlateBasis& spatial,
   return kernel;
 }
 
-// Mean of a variance map over the block region clipped to the image.
-double block_mean(const ImageF& var, int bx, int by, int block, int w, int h) {
-  double sum = 0.0;
-  int count = 0;
+// Robust block-level noise variance: the median of the (finite, positive)
+// variance over the block region clipped to the image. The median (rather than
+// the mean) is deliberate: callers flag bad/masked pixels with a large sentinel
+// variance (e.g. 1e30), and a plain mean lets even a handful of those poison the
+// whole block -- a hugely inflated `vr` makes the decorrelation filter blow up at
+// high frequencies (where |Khat|^2 -> 0) and paints large artifacts around masked
+// regions and the frame edge. The median is immune to a minority of fill pixels
+// and is also a cleaner white-noise level estimate than the mean (which sources
+// and the sentinel both bias high).
+double block_variance(const ImageF& var, int bx, int by, int block, int w,
+                      int h) {
+  std::vector<float> vals;
+  vals.reserve(static_cast<std::size_t>(block) * block);
   for (int y = by; y < by + block; ++y) {
     if (y < 0 || y >= h) continue;
     for (int x = bx; x < bx + block; ++x) {
       if (x < 0 || x >= w) continue;
-      sum += var.data()[static_cast<std::size_t>(y) * w + x];
-      ++count;
+      const float v = var.data()[static_cast<std::size_t>(y) * w + x];
+      if (std::isfinite(v) && v > 0.0f) vals.push_back(v);
     }
   }
-  return count > 0 ? sum / count : 0.0;
+  if (vals.empty()) return 0.0;
+  const std::size_t mid = vals.size() / 2;
+  std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+  return static_cast<double>(vals[mid]);
 }
 
 }  // namespace
@@ -258,8 +270,8 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       const double cx = std::clamp(bx + block / 2.0, 0.0, w - 1.0);
       const double cy = std::clamp(by + block / 2.0, 0.0, h - 1.0);
       const std::vector<float> kern = local_kernel(spatial, theta, basis, cx, cy);
-      const double vs = block_mean(var_science, bx, by, block, w, h);
-      const double vr = block_mean(var_reference, bx, by, block, w, h);
+      const double vs = block_variance(var_science, bx, by, block, w, h);
+      const double vr = block_variance(var_reference, bx, by, block, w, h);
 
       // Decorrelation filter from |Khat|^2 (kernel_power reuses the thread's FFT
       // buffers, so it must run before the block data is loaded into fft.real).

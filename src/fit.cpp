@@ -7,6 +7,7 @@
 
 #include "delta/convolve.hpp"
 #include "delta/subtract.hpp"
+#include "delta/timing.hpp"
 
 namespace delta {
 
@@ -64,7 +65,9 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   std::vector<int> pix_stamp;     // contributing-stamp index per pixel
   std::vector<int> stamp_cx, stamp_cy;  // centre of each contributing stamp
 
-  for (std::size_t s = 0; s < stamp_x.size(); ++s) {
+  {
+   DELTA_TIME("fit: stamp B_n convolve");
+   for (std::size_t s = 0; s < stamp_x.size(); ++s) {
     const int cx = stamp_x[s], cy = stamp_y[s];
     const int x0 = std::max(0, cx - stamp_radius);
     const int x1 = std::min(iw - 1, cx + stamp_radius);
@@ -123,6 +126,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
       stamp_cx.push_back(cx);
       stamp_cy.push_back(cy);
     }
+   }
   }
 
   const int npix_all = static_cast<int>(target.size());
@@ -176,6 +180,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   GlsResult gls;
   int npix = 0;
   double reduced_chi2 = std::numeric_limits<double>::quiet_NaN();
+  delta::timing::ScopedTimer solve_timer("fit: GLS solve");
   for (int iter = 0;; ++iter) {
     // Active pixel rows = pixels whose stamp is still accepted.
     std::vector<int> rows;

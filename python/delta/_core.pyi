@@ -60,6 +60,8 @@ KernelFit = TypedDict(
         "stamp_y": NDArray[np.int32],
         "stamp_chi2": NDArray[np.float64],
         "stamp_accepted": NDArray[np.uint8],
+        # Opt-in C++ sub-stage timings (DELTA_TIMING); None otherwise.
+        "timing": dict[str, float] | None,
     },
 )
 
@@ -67,6 +69,8 @@ class DiffProducts(TypedDict):
     difference: NDArray[np.float32]
     variance: NDArray[np.float32] | None
     mask: NDArray[np.uint8] | None
+    # Opt-in C++ sub-stage timings (DELTA_TIMING); None otherwise.
+    timing: dict[str, float] | None
 
 class StampSelection(TypedDict):
     x: NDArray[np.int32]

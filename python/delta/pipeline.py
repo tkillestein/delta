@@ -20,6 +20,20 @@ from .solution import KernelSolution
 _FWHM_TO_SIGMA = 1.0 / 2.35482
 
 
+def _log_core_timings(timing: dict | None) -> None:
+    """Emit the C++ core's opt-in sub-stage timers (set ``DELTA_TIMING``).
+
+    The core returns a ``{label: seconds}`` dict (or ``None`` when ``DELTA_TIMING``
+    is unset) splitting e.g. the kernel solve into ``B_n`` convolve vs GLS solve.
+    They are logged in the same ``"<label> done in <s>s"`` form as
+    :func:`log_timing` so timing consumers (the benchmark) pick them up uniformly.
+    """
+    if not timing:
+        return
+    for label, seconds in timing.items():
+        logger.debug("{} done in {:.3f}s", label, seconds)
+
+
 @dataclass
 class DiffResult:
     """Products of a subtraction run."""
@@ -274,6 +288,7 @@ class Subtractor:
                 science_mask=tmask,
                 reference_mask=cmask,
             )
+        _log_core_timings(fit.get("timing"))
         selector = f"{self.cv_folds}-fold CV" if self.cv_folds > 1 else "GCV"
         logger.info(
             "kernel fit: lambda={:.3g} ({}), eff.dof={:.1f}, "
@@ -399,6 +414,7 @@ class Subtractor:
                 science_mask=tmask,
                 reference_mask=cmask,
             )
+        _log_core_timings(diff.get("timing"))
         difference = (sign * diff["difference"]).astype(np.float32)
         variance = diff["variance"]
         mask = diff["mask"]

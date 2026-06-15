@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -207,12 +208,65 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     }
 
     if (cv_folds > 1) {
-      // Group folds: pixels inherit their stamp's fold, so whole stamps are
-      // held out (leave-stamp-out CV).
-      std::vector<int> grp(npix);
-      for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
-      gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
-                         cv_folds, warm_start);
+      // Stamps (≈2*stamp_radius wide) are far smaller than the knot spacing (the
+      // field length-scale), so the spatial design is ~constant across a stamp;
+      // freezing it per stamp lets the O(N·P²) normal-equation build factorise
+      // (solve_gls_cv_stamped). Only safe when stamp ≪ knot spacing; otherwise the
+      // exact per-row solve is used. DELTA_STAMP_APPROX forces the choice (1/0) for
+      // validation; unset = the automatic scale gate.
+      // Gate: require the knot spacing to be >= 16x the stamp width. The frozen-
+      // design error grows steeply as the stamp approaches the knot scale; 16x
+      // keeps the difference-image relative error below ~1e-3 (well under the
+      // image noise floor) -- measured in benchmarks/validate_stamped_solve.py.
+      const double knot_spacing = spatial.min_knot_spacing();
+      const double stamp_width = 2.0 * stamp_radius + 1.0;
+      bool use_stamped = knot_spacing > 0.0 && knot_spacing >= 16.0 * stamp_width;
+      if (const char* e = std::getenv("DELTA_STAMP_APPROX"))
+        use_stamped = std::atoi(e) != 0;
+
+      if (use_stamped) {
+        // Map the active (unclipped) stamps to contiguous local ids, accumulate
+        // each stamp's pixel centroid (the representative spatial location), and
+        // record its CV fold (== global stamp index mod cv_folds, matching the
+        // leave-stamp-out grouping the exact path uses).
+        std::vector<int> g2l(n_stamps, -1);
+        std::vector<int> stamp_id(npix);
+        std::vector<double> sx, sy;
+        std::vector<int> cnt, stamp_fold;
+        for (int j = 0; j < npix; ++j) {
+          const int gid = pix_stamp[rows[j]];
+          int loc = g2l[gid];
+          if (loc < 0) {
+            loc = static_cast<int>(sx.size());
+            g2l[gid] = loc;
+            sx.push_back(0.0);
+            sy.push_back(0.0);
+            cnt.push_back(0);
+            stamp_fold.push_back(gid % cv_folds);
+          }
+          stamp_id[j] = loc;
+          sx[loc] += points(j, 0);
+          sy[loc] += points(j, 1);
+          cnt[loc] += 1;
+        }
+        const int s_active = static_cast<int>(sx.size());
+        Eigen::MatrixXd centroids(s_active, 2);
+        for (int s = 0; s < s_active; ++s) {
+          centroids(s, 0) = sx[s] / cnt[s];
+          centroids(s, 1) = sy[s] / cnt[s];
+        }
+        const Eigen::MatrixXd stamp_design = spatial.design(centroids);  // S x k
+        gls = solve_gls_cv_stamped(tgt, wts, bn_mat, stamp_design, stamp_id,
+                                   stamp_fold, spatial, lambda_grid, cv_folds,
+                                   warm_start);
+      } else {
+        // Group folds: pixels inherit their stamp's fold, so whole stamps are
+        // held out (leave-stamp-out CV).
+        std::vector<int> grp(npix);
+        for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
+        gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
+                           cv_folds, warm_start);
+      }
       // Recover the selected grid index (min of the CV-error curve; unevaluated
       // entries are +inf) to warm-start the next IRLS pass.
       warm_start = static_cast<int>(

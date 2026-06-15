@@ -207,12 +207,18 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   const int p = (nc + 1) * k;
 
   // Whitened design Xs = W^{1/2} X and target ds = W^{1/2} y (see assemble()).
+  // Xs is an N x P matrix rebuilt every IRLS pass; building it serially was ~19%
+  // of the GLS solve. The nc+1 column blocks are independent (block c is D scaled
+  // row-wise by sqrt(w)*B_c, the trailing block by sqrt(w) alone), so build them
+  // in parallel.
   const Eigen::ArrayXd sw = weights.array().sqrt();
   Eigen::MatrixXd xs(n, p);
-  for (int c = 0; c < nc; ++c)
-    xs.block(0, c * k, n, k) =
-        (d.array().colwise() * (bn.col(c).array() * sw)).matrix();
-  xs.block(0, nc * k, n, k) = (d.array().colwise() * sw).matrix();
+#pragma omp parallel for schedule(static)
+  for (int c = 0; c <= nc; ++c) {
+    const Eigen::ArrayXd col =
+        (c < nc) ? (bn.col(c).array() * sw).eval() : sw;
+    xs.block(0, c * k, n, k) = (d.array().colwise() * col).matrix();
+  }
   const Eigen::VectorXd ds = (sw * target.array()).matrix();
 
   // Row indices per fold, then each fold's normal-equation contribution

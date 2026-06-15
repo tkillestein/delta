@@ -137,10 +137,10 @@ void evaluate_fields_exact(const ThinPlateBasis& spatial, const Eigen::MatrixXd&
     }
     const Eigen::MatrixXd fields = spatial.design(points) * c;  // w x n_fields
     for (int n = 0; n < n_components; ++n) {
-      float* row = out.coeff[n].data() + static_cast<std::size_t>(y) * w;
+      float* row = out.coeff[n].get() + static_cast<std::size_t>(y) * w;
       for (int x = 0; x < w; ++x) row[x] = static_cast<float>(fields(x, n));
     }
-    float* bg = out.background.data() + static_cast<std::size_t>(y) * w;
+    float* bg = out.background.get() + static_cast<std::size_t>(y) * w;
     for (int x = 0; x < w; ++x)
       bg[x] = static_cast<float>(fields(x, n_components));
   }
@@ -166,8 +166,11 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
   const Eigen::MatrixXd c = coeff_matrix(theta, k, n_fields);
 
   SpatialFields out;
-  out.coeff.assign(n_components, ImageF(width, height));
-  out.background = ImageF(width, height);
+  const std::size_t npix = width * height;
+  out.coeff.resize(n_components);
+  for (int n = 0; n < n_components; ++n)
+    out.coeff[n] = std::unique_ptr<float[]>(new float[npix]);
+  out.background = std::unique_ptr<float[]>(new float[npix]);
 
   const int w = static_cast<int>(width);
   const int h = static_cast<int>(height);
@@ -206,42 +209,57 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
   }
 
   // --- bilinearly interpolate to full resolution ---------------------------------
-  // Per-axis lookup: containing coarse cell + fractional weight, computed once.
-  std::vector<int> ix0(w);
+  // Per-axis fractional weight within the containing coarse cell, precomputed once
+  // and shared across every field/row. The x-weight is what lets the inner loop run
+  // as a pure FMA ramp over a coarse cell (no per-pixel gather); the y-weight blends
+  // the two bracketing coarse rows.
   std::vector<float> wx(w);
   for (int x = 0; x < w; ++x) {
-    int c0 = std::min(x / stride, ncx - 2);
+    const int c0 = std::min(x / stride, ncx - 2);
     const int x0 = gx[c0], x1 = gx[c0 + 1];
-    ix0[x] = c0;
     wx[x] = x1 > x0 ? static_cast<float>(x - x0) / (x1 - x0) : 0.0f;
   }
   std::vector<int> iy0(h);
   std::vector<float> wy(h);
   for (int y = 0; y < h; ++y) {
-    int c0 = std::min(y / stride, ncy - 2);
+    const int c0 = std::min(y / stride, ncy - 2);
     const int y0 = gy[c0], y1 = gy[c0 + 1];
     iy0[y] = c0;
     wy[y] = y1 > y0 ? static_cast<float>(y - y0) / (y1 - y0) : 0.0f;
   }
 
-#pragma omp parallel for schedule(static)
-  for (int y = 0; y < h; ++y) {
-    const int jy0 = iy0[y], jy1 = jy0 + 1;
-    const float fy = wy[y];
-    for (int f = 0; f < n_fields; ++f) {
-      const double* c00 = coarse.data() +
-                          (static_cast<std::size_t>(f) * ncy + jy0) * ncx;
-      const double* c10 = coarse.data() +
-                          (static_cast<std::size_t>(f) * ncy + jy1) * ncx;
-      float* dst = (f < n_components ? out.coeff[f].data()
-                                     : out.background.data()) +
+  // Collapsing the field and row loops keeps each iteration writing one field's row
+  // end-to-end. The earlier field-innermost order juggled n_fields simultaneous
+  // output streams, which throttled the interpolation to a fraction of memory
+  // bandwidth and refused to scale; here a thread's static chunk sweeps one field's
+  // rows sequentially. Within a row the bilinear value is affine in x across each
+  // coarse cell, so the cell reduces to dst[x] = base + slope*wx[x] -- a unit-stride
+  // FMA over the precomputed weight, with no per-pixel gather or index lookup.
+#pragma omp parallel for collapse(2) schedule(static)
+  for (int f = 0; f < n_fields; ++f) {
+    for (int y = 0; y < h; ++y) {
+      const int jy0 = iy0[y], jy1 = jy0 + 1;
+      const float fy = wy[y];
+      const double* c0row =
+          coarse.data() + (static_cast<std::size_t>(f) * ncy + jy0) * ncx;
+      const double* c1row =
+          coarse.data() + (static_cast<std::size_t>(f) * ncy + jy1) * ncx;
+      float* dst = (f < n_components ? out.coeff[f].get()
+                                     : out.background.get()) +
                    static_cast<std::size_t>(y) * w;
-      for (int x = 0; x < w; ++x) {
-        const int jx0 = ix0[x], jx1 = jx0 + 1;
-        const float fx = wx[x];
-        const double top = c00[jx0] + (c00[jx1] - c00[jx0]) * fx;
-        const double bot = c10[jx0] + (c10[jx1] - c10[jx0]) * fx;
-        dst[x] = static_cast<float>(top + (bot - top) * fy);
+      for (int ix = 0; ix < ncx - 1; ++ix) {
+        const float a00 = static_cast<float>(c0row[ix]);
+        const float a01 = static_cast<float>(c0row[ix + 1]);
+        const float a10 = static_cast<float>(c1row[ix]);
+        const float a11 = static_cast<float>(c1row[ix + 1]);
+        // val(fx) = base + slope*fx, with base/slope the y-blended cell corners.
+        const float base = a00 + (a10 - a00) * fy;
+        const float top_slope = a01 - a00;
+        const float slope = top_slope + ((a11 - a10) - top_slope) * fy;
+        const int xa = gx[ix];
+        const int xb = (ix == ncx - 2) ? w : gx[ix + 1];
+#pragma omp simd
+        for (int x = xa; x < xb; ++x) dst[x] = base + slope * wx[x];
       }
     }
   }
@@ -290,7 +308,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     const int kh = (basis.ksize() - 1) / 2;
 
     const float* s = science.data();
-    const float* bg = fields.background.data();
+    const float* bg = fields.background.get();
 
     // Cache-blocked, fully fused model convolve. The earlier version looped
     // components on the outside and ran a full-frame y-pass each, so the running
@@ -331,7 +349,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           const float* src = tx[orders[n].first].data();
           const std::vector<float>& kyn = ky[n];
           const int ks = static_cast<int>(kyn.size());
-          const float* a = fields.coeff[n].data();
+          const float* a = fields.coeff[n].get();
           for (int ly = 0; ly < bh; ++ly) {
             const int y = by + ly;
             std::fill(bn.begin(), bn.begin() + bw, 0.0f);
@@ -422,7 +440,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           // unit-stride correlation against the gathered window.
           std::fill(k2.begin(), k2.end(), 0.0f);
           for (int n = 0; n < nc; ++n) {
-            const float an = fields.coeff[n].data()[cidx];
+            const float an = fields.coeff[n].get()[cidx];
             const float* p = phi[n].data();
             for (std::size_t i = 0; i < k2.size(); ++i) k2[i] += an * p[i];
           }

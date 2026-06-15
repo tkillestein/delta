@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "delta/basis.hpp"
@@ -15,8 +16,12 @@ namespace delta {
 // `coeff[n](x,y)` is a_n(x,y), the field multiplying basis-convolved template
 // B_n; `background(x,y)` is the differential background b(x,y) (SPEC §3.2).
 struct SpatialFields {
-  std::vector<ImageF> coeff;  // one field per kernel component
-  ImageF background;
+  // Raw row-major (index = y*width + x) buffers, allocated uninitialised: every
+  // pixel is written by evaluate_fields before any read, so the value-initialising
+  // pass an ImageF would do is pure redundant write traffic over a ~1.9 GB set of
+  // fields per full frame. coeff[n] is a_n(x,y); background is b(x,y) (SPEC §3.2).
+  std::vector<std::unique_ptr<float[]>> coeff;
+  std::unique_ptr<float[]> background;
 };
 
 // Evaluate a_n(x,y) and b(x,y) from a fitted theta on a (width x height) grid.

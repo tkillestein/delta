@@ -321,7 +321,7 @@ ImageF photometric_scale(const ThinPlateBasis& spatial,
   for (std::size_t i = 0; i < n; ++i) out[i] = 0.0f;
   for (int c = 0; c < nc; ++c) {
     const float s = static_cast<float>(component_sums[c]);
-    const float* a = fields.coeff[c].data();
+    const float* a = fields.coeff[c].get();
     for (std::size_t i = 0; i < n; ++i) out[i] += s * a[i];
   }
   return scale;

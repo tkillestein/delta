@@ -231,10 +231,20 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   // over threads. Each thread builds its own FFTW plans/buffers once -- planning
   // is not thread-safe (guarded) and was previously redone for every block via
   // the per-call decorrelation_filter / apply_filter_fft helpers.
-  std::vector<std::pair<int, int>> origins_xy;
-  origins_xy.reserve(oxs.size() * oys.size());
-  for (int by : oys)
-    for (int bx : oxs) origins_xy.emplace_back(bx, by);
+  //
+  // The Hann overlap-add writes into the shared `acc`, and adjacent blocks'
+  // 50%-overlapping footprints touch the same pixels, so a naive blend has to be
+  // serialised against a lock. Instead, 9-colour the block grid by
+  // (ix % 3, iy % 3): two distinct same-colour blocks either share a column
+  // (|dix| = 0 => |diy| >= 3) or differ by >= 3 columns, and a 3-index
+  // separation along either axis is >= block even for the irregular flush origin
+  // (origins[L] - origins[L-3] >= 2*stride = block). So same-colour blocks never
+  // touch the same pixel and blend lock-free; a barrier between colours keeps
+  // cross-colour writes from racing.
+  std::vector<std::vector<std::pair<int, int>>> color_blocks(9);
+  for (std::size_t iy = 0; iy < oys.size(); ++iy)
+    for (std::size_t ix = 0; ix < oxs.size(); ++ix)
+      color_blocks[(ix % 3) * 3 + (iy % 3)].emplace_back(oxs[ix], oys[iy]);
 
   const std::size_t nn = static_cast<std::size_t>(block) * block;
   const float inv_n2 = 1.0f / static_cast<float>(nn);
@@ -266,67 +276,72 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
     std::vector<float> buf(nn);
     std::vector<float> filter(nspec);
 
+    // One worksharing pass per colour; the implicit barrier at the end of each
+    // `omp for` orders the colours so cross-colour writes never overlap in time.
+    for (const auto& blocks : color_blocks) {
 #pragma omp for schedule(dynamic)
-    for (std::size_t bi = 0; bi < origins_xy.size(); ++bi) {
-      const int bx = origins_xy[bi].first, by = origins_xy[bi].second;
+      for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+        const int bx = blocks[bi].first, by = blocks[bi].second;
 
-      // Reflect-pad the block region into a local buffer.
-      for (int iy = 0; iy < block; ++iy) {
-        int sy = by + iy;
-        if (sy < 0) sy = -sy - 1;
-        if (sy >= h) sy = 2 * h - sy - 1;
-        sy = std::clamp(sy, 0, h - 1);
-        for (int ix = 0; ix < block; ++ix) {
-          int sx = bx + ix;
-          if (sx < 0) sx = -sx - 1;
-          if (sx >= w) sx = 2 * w - sx - 1;
-          sx = std::clamp(sx, 0, w - 1);
-          buf[static_cast<std::size_t>(iy) * block + ix] =
-              difference.data()[static_cast<std::size_t>(sy) * w + sx];
+        // Reflect-pad the block region into a local buffer.
+        for (int iy = 0; iy < block; ++iy) {
+          int sy = by + iy;
+          if (sy < 0) sy = -sy - 1;
+          if (sy >= h) sy = 2 * h - sy - 1;
+          sy = std::clamp(sy, 0, h - 1);
+          for (int ix = 0; ix < block; ++ix) {
+            int sx = bx + ix;
+            if (sx < 0) sx = -sx - 1;
+            if (sx >= w) sx = 2 * w - sx - 1;
+            sx = std::clamp(sx, 0, w - 1);
+            buf[static_cast<std::size_t>(iy) * block + ix] =
+                difference.data()[static_cast<std::size_t>(sy) * w + sx];
+          }
         }
-      }
 
-      const double cx = std::clamp(bx + block / 2.0, 0.0, w - 1.0);
-      const double cy = std::clamp(by + block / 2.0, 0.0, h - 1.0);
-      const std::vector<float> kern = local_kernel(spatial, theta, basis, cx, cy);
-      const double vs = block_variance(var_science, bx, by, block, w, h);
-      const double vr = block_variance(var_reference, bx, by, block, w, h);
+        const double cx = std::clamp(bx + block / 2.0, 0.0, w - 1.0);
+        const double cy = std::clamp(by + block / 2.0, 0.0, h - 1.0);
+        const std::vector<float> kern =
+            local_kernel(spatial, theta, basis, cx, cy);
+        const double vs = block_variance(var_science, bx, by, block, w, h);
+        const double vr = block_variance(var_reference, bx, by, block, w, h);
 
-      // Decorrelation filter from |Khat|^2 (kernel_power reuses the thread's FFT
-      // buffers, so it must run before the block data is loaded into fft.real).
-      const std::vector<double> power = kernel_power(kern, ks, block, fft);
-      double sumk2 = 0.0;
-      for (float v : kern) sumk2 += static_cast<double>(v) * v;
-      const double cnum = std::sqrt(std::max(vs + vr * sumk2, 0.0));
-      for (std::size_t i = 0; i < nspec; ++i) {
-        const double denom = vs + vr * power[i];
-        filter[i] = denom > 0.0 ? static_cast<float>(cnum / std::sqrt(denom)) : 0.0f;
-      }
+        // Decorrelation filter from |Khat|^2 (kernel_power reuses the thread's
+        // FFT buffers, so it must run before block data is loaded into fft.real).
+        const std::vector<double> power = kernel_power(kern, ks, block, fft);
+        double sumk2 = 0.0;
+        for (float v : kern) sumk2 += static_cast<double>(v) * v;
+        const double cnum = std::sqrt(std::max(vs + vr * sumk2, 0.0));
+        for (std::size_t i = 0; i < nspec; ++i) {
+          const double denom = vs + vr * power[i];
+          filter[i] =
+              denom > 0.0 ? static_cast<float>(cnum / std::sqrt(denom)) : 0.0f;
+        }
 
-      // Apply the filter to this block.
-      std::copy(buf.begin(), buf.end(), fft.real);
-      fftwf_execute(fft.fwd);
-      for (std::size_t i = 0; i < nspec; ++i) {
-        fft.freq[i][0] *= filter[i];
-        fft.freq[i][1] *= filter[i];
-      }
-      fftwf_execute(fft.inv);
+        // Apply the filter to this block.
+        std::copy(buf.begin(), buf.end(), fft.real);
+        fftwf_execute(fft.fwd);
+        for (std::size_t i = 0; i < nspec; ++i) {
+          fft.freq[i][0] *= filter[i];
+          fft.freq[i][1] *= filter[i];
+        }
+        fftwf_execute(fft.inv);
 
-      // Hann-weighted overlap-add into the shared accumulator. The weight is the
-      // precomputed separable window; wsum is handled analytically (see above),
-      // so the blend only touches acc. Still serialised against other blocks'
-      // blends (overlapping writes race), but now just a weighted add per pixel.
-#pragma omp critical(delta_decorr_blend)
-      for (int iy = 0; iy < block; ++iy) {
-        const int y = by + iy;
-        if (y < 0 || y >= h) continue;
-        const double wy = hwin[iy] * inv_n2;
-        const float* frow = fft.real + static_cast<std::size_t>(iy) * block;
-        double* arow = acc.data() + static_cast<std::size_t>(y) * w;
-        for (int ix = 0; ix < block; ++ix) {
-          const int x = bx + ix;
-          if (x < 0 || x >= w) continue;
-          arow[x] += wy * hwin[ix] * frow[ix];
+        // Hann-weighted overlap-add into the shared accumulator. The weight is
+        // the precomputed separable window; wsum is handled analytically (see
+        // above), so the blend only touches acc. Lock-free: same-colour blocks
+        // are pairwise disjoint, so no two threads in this pass write a pixel.
+        for (int iy = 0; iy < block; ++iy) {
+          const int y = by + iy;
+          if (y < 0 || y >= h) continue;
+          const double wy = hwin[iy] * inv_n2;
+          const float* frow = fft.real + static_cast<std::size_t>(iy) * block;
+          double* arow = acc.data() + static_cast<std::size_t>(y) * w;
+          for (int ix = 0; ix < block; ++ix) {
+            const int x = bx + ix;
+            if (x < 0 || x >= w) continue;
+            arow[x] += wy * hwin[ix] * frow[ix];
+          }
         }
       }
     }

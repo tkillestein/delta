@@ -71,9 +71,20 @@ BackgroundStats estimate_background(const ImageF& image) {
   const std::size_t n = image.size();
   const bool has_mask = image.has_mask();
 
+  // The median/MAD of the sky only feeds a robust detection threshold, so we
+  // estimate it from a decimated sample rather than every pixel: the two
+  // O(n) nth_element passes below are the bulk of stamp selection (~90% of
+  // detect_stamps), and a few hundred-k background pixels pin the median to far
+  // better than the 5-sigma cut needs (fractional error ~ 1/sqrt(samples)).
+  // Small frames (n <= target) keep the exact full-frame path. The stride walks
+  // the flat index, so the sample spans the whole frame; the median/MAD are
+  // robust to the handful of source pixels a coarse stride may land on.
+  constexpr std::size_t kTargetSamples = 1u << 18;  // 262144
+  const std::size_t step = n > kTargetSamples ? n / kTargetSamples : 1;
+
   std::vector<float> good;
-  good.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
+  good.reserve(n / step + 1);
+  for (std::size_t i = 0; i < n; i += step) {
     const float v = image.data()[i];
     if (!is_finite(v)) continue;
     if (has_mask && image.mask()[i] != kMaskGood) continue;

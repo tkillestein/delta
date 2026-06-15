@@ -69,4 +69,29 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const std::vector<int>& group, int n_groups,
                        int warm_start = -1);
 
+// Per-stamp factorised group-CV solve (SPEC §3.2-3.3 approximation). Stamps are
+// small (≈30 px) relative to the knot spacing (which sets the field length-scale),
+// so the spatial design row d(x,y) is ~constant across a stamp. Freezing it at the
+// stamp's representative row d_s collapses the design row to the Kronecker product
+// B_i ⊗ d_s, so the O(N·P²) normal-equation build factorises into
+//
+//   M = Σ_s A_s ⊗ (d_s d_s^T),   A_s = Σ_{i∈s} w_i B_i B_i^T   (B_i = [bn_i, 1]),
+//
+// i.e. an O(N·nc²) per-stamp accumulate plus an O(S·P²) Kronecker assembly --
+// hundreds× fewer FLOPs than the exact per-row rankUpdate when stamps ≪ knots. The
+// caller supplies the representative spatial design per stamp (`stamp_design`, S×k,
+// e.g. the design at each stamp's pixel centroid), the stamp index per pixel
+// (`stamp_id`, in [0,S)), and the CV fold per stamp (`stamp_fold`, in [0,n_groups)).
+// The lambda search and final fit are identical to solve_gls_cv. Only valid when the
+// stamp is small vs the knot spacing; the caller gates on that and falls back to the
+// exact solve otherwise.
+GlsResult solve_gls_cv_stamped(
+    const Eigen::Ref<const Eigen::VectorXd>& target,
+    const Eigen::Ref<const Eigen::VectorXd>& weights,
+    const Eigen::Ref<const Eigen::MatrixXd>& bn,
+    const Eigen::Ref<const Eigen::MatrixXd>& stamp_design,
+    const std::vector<int>& stamp_id, const std::vector<int>& stamp_fold,
+    const ThinPlateBasis& basis, const std::vector<double>& lambda_grid,
+    int n_groups, int warm_start = -1);
+
 }  // namespace delta

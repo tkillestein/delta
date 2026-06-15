@@ -187,108 +187,19 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   return best;
 }
 
-GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
-                       const Eigen::Ref<const Eigen::VectorXd>& target,
-                       const Eigen::Ref<const Eigen::VectorXd>& weights,
-                       const Eigen::Ref<const Eigen::MatrixXd>& bn,
-                       const ThinPlateBasis& basis,
-                       const std::vector<double>& lambda_grid,
-                       const std::vector<int>& group, int n_groups,
-                       int warm_start) {
-  if (lambda_grid.empty())
-    throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
-  const int n = static_cast<int>(points.rows());
-  if (n_groups < 2 || static_cast<int>(group.size()) != n)
-    return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+namespace {
 
-  const int nc = static_cast<int>(bn.cols());
-  const Eigen::MatrixXd d = basis.design(points);  // N x k
-  const int k = static_cast<int>(d.cols());
+// Shared tail of the group-CV solve: given each fold's pre-built normal-equation
+// pieces (M_g, rhs_g, held-out ds_g^T ds_g), assemble the full-data system, select
+// lambda by the unimodal CV-error search (warm or coarse-to-fine), and return the
+// final all-data fit. Both the exact (per-row) and the per-stamp builders feed this
+// the same mf/rf/ysq, so the selection logic lives in one place.
+GlsResult cv_finish(const std::vector<Eigen::MatrixXd>& mf,
+                    const std::vector<Eigen::VectorXd>& rf,
+                    const std::vector<double>& ysq, int n_groups,
+                    const ThinPlateBasis& basis, int n, int nc, int k,
+                    const std::vector<double>& lambda_grid, int warm_start) {
   const int p = (nc + 1) * k;
-
-  // Whitened design Xs = W^{1/2} X and target ds = W^{1/2} y (see assemble()).
-  // Xs is an N x P matrix rebuilt every IRLS pass; building it serially was ~19%
-  // of the GLS solve. The nc+1 column blocks are independent (block c is D scaled
-  // row-wise by sqrt(w)*B_c, the trailing block by sqrt(w) alone), so build them
-  // in parallel.
-  const Eigen::ArrayXd sw = weights.array().sqrt();
-  Eigen::MatrixXd xs(n, p);
-#pragma omp parallel for schedule(static)
-  for (int c = 0; c <= nc; ++c) {
-    const Eigen::ArrayXd col =
-        (c < nc) ? (bn.col(c).array() * sw).eval() : sw;
-    xs.block(0, c * k, n, k) = (d.array().colwise() * col).matrix();
-  }
-  const Eigen::VectorXd ds = (sw * target.array()).matrix();
-
-  // Row indices per fold, then each fold's normal-equation contribution
-  // M_g = Xs_g^T Xs_g, rhs_g = Xs_g^T ds_g, and held-out sum of squares ds_g^T ds_g.
-  std::vector<std::vector<int>> rows(n_groups);
-  for (int i = 0; i < n; ++i) {
-    const int g = group[i];
-    if (g < 0 || g >= n_groups)
-      throw std::runtime_error("solve_gls_cv: group id out of range");
-    rows[g].push_back(i);
-  }
-  std::vector<Eigen::MatrixXd> mf(n_groups);
-  std::vector<Eigen::VectorXd> rf(n_groups);
-  std::vector<double> ysq(n_groups, 0.0);
-  // Build each fold's M_g = Xs_g^T Xs_g with full row-chunked thread parallelism:
-  // the fold loop is serial on the outside, but each fold's rank update is split
-  // over row chunks across *all* threads (mirroring assemble()). The earlier
-  // one-thread-per-fold loop capped parallelism at n_groups (=5) regardless of core
-  // count -- the build is O(N P^2) and was the solve's main scaling limiter.
-  //
-  // The chunk size is adaptive: a fold holds only ~N/n_groups rows, so a fixed
-  // coarse chunk leaves most cores idle (4 chunks over 14 threads capped the build
-  // at ~1.3x and made it the solve's headline cost), while a fixed fine chunk pays
-  // per-call rankUpdate overhead that slows the serial path. Targeting ~3 chunks
-  // per thread engages every core when threaded yet stays coarse at low thread
-  // counts -- 1.7x faster at 14 cores with no single-thread regression.
-  int n_threads = 1;
-#ifdef _OPENMP
-  n_threads = omp_get_max_threads();
-#endif
-  constexpr int kMaxFoldChunk = 2048;
-  for (int g = 0; g < n_groups; ++g) {
-    const std::vector<int>& idx = rows[g];
-    const int nf = static_cast<int>(idx.size());
-    const int fold_chunk =
-        std::clamp(nf / (3 * n_threads), 256, kMaxFoldChunk);
-    Eigen::MatrixXd m_acc = Eigen::MatrixXd::Zero(p, p);
-    Eigen::VectorXd rhs_acc = Eigen::VectorXd::Zero(p);
-    double ysq_acc = 0.0;
-#pragma omp parallel
-    {
-      Eigen::MatrixXd m_loc = Eigen::MatrixXd::Zero(p, p);
-      Eigen::VectorXd rhs_loc = Eigen::VectorXd::Zero(p);
-      double ysq_loc = 0.0;
-      // Reused per-thread gather buffers (sized to the largest possible chunk).
-      Eigen::MatrixXd xb(kMaxFoldChunk, p);
-      Eigen::VectorXd yb(kMaxFoldChunk);
-#pragma omp for schedule(dynamic) nowait
-      for (int r0 = 0; r0 < nf; r0 += fold_chunk) {
-        const int nr = std::min(fold_chunk, nf - r0);
-        for (int j = 0; j < nr; ++j) {
-          xb.row(j) = xs.row(idx[r0 + j]);
-          yb(j) = ds(idx[r0 + j]);
-        }
-        const auto xt = xb.topRows(nr).transpose();
-        m_loc.selfadjointView<Eigen::Lower>().rankUpdate(xt);
-        rhs_loc.noalias() += xt * yb.head(nr);
-        ysq_loc += yb.head(nr).squaredNorm();
-      }
-#pragma omp critical
-      {
-        m_acc.triangularView<Eigen::Lower>() += m_loc;
-        rhs_acc += rhs_loc;
-        ysq_acc += ysq_loc;
-      }
-    }
-    mf[g] = m_acc.selfadjointView<Eigen::Lower>();
-    rf[g] = std::move(rhs_acc);
-    ysq[g] = ysq_acc;
-  }
 
   // Full-data system (sum of folds) + the block-diagonal bending penalty.
   System s;
@@ -419,6 +330,188 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   best.lambda_grid = lambda_grid;
   best.gcv_curve = std::move(curve);  // holds the CV-error curve here
   return best;
+}
+
+}  // namespace
+
+GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
+                       const Eigen::Ref<const Eigen::VectorXd>& target,
+                       const Eigen::Ref<const Eigen::VectorXd>& weights,
+                       const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                       const ThinPlateBasis& basis,
+                       const std::vector<double>& lambda_grid,
+                       const std::vector<int>& group, int n_groups,
+                       int warm_start) {
+  if (lambda_grid.empty())
+    throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
+  const int n = static_cast<int>(points.rows());
+  if (n_groups < 2 || static_cast<int>(group.size()) != n)
+    return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+
+  const int nc = static_cast<int>(bn.cols());
+  const Eigen::MatrixXd d = basis.design(points);  // N x k
+  const int k = static_cast<int>(d.cols());
+  const int p = (nc + 1) * k;
+
+  // Whitened design Xs = W^{1/2} X and target ds = W^{1/2} y (see assemble()).
+  // Xs is an N x P matrix rebuilt every IRLS pass; building it serially was ~19%
+  // of the GLS solve. The nc+1 column blocks are independent (block c is D scaled
+  // row-wise by sqrt(w)*B_c, the trailing block by sqrt(w) alone), so build them
+  // in parallel.
+  const Eigen::ArrayXd sw = weights.array().sqrt();
+  Eigen::MatrixXd xs(n, p);
+#pragma omp parallel for schedule(static)
+  for (int c = 0; c <= nc; ++c) {
+    const Eigen::ArrayXd col =
+        (c < nc) ? (bn.col(c).array() * sw).eval() : sw;
+    xs.block(0, c * k, n, k) = (d.array().colwise() * col).matrix();
+  }
+  const Eigen::VectorXd ds = (sw * target.array()).matrix();
+
+  // Row indices per fold, then each fold's normal-equation contribution
+  // M_g = Xs_g^T Xs_g, rhs_g = Xs_g^T ds_g, and held-out sum of squares ds_g^T ds_g.
+  std::vector<std::vector<int>> rows(n_groups);
+  for (int i = 0; i < n; ++i) {
+    const int g = group[i];
+    if (g < 0 || g >= n_groups)
+      throw std::runtime_error("solve_gls_cv: group id out of range");
+    rows[g].push_back(i);
+  }
+  std::vector<Eigen::MatrixXd> mf(n_groups);
+  std::vector<Eigen::VectorXd> rf(n_groups);
+  std::vector<double> ysq(n_groups, 0.0);
+  // Build each fold's M_g = Xs_g^T Xs_g with full row-chunked thread parallelism:
+  // the fold loop is serial on the outside, but each fold's rank update is split
+  // over row chunks across *all* threads (mirroring assemble()). The earlier
+  // one-thread-per-fold loop capped parallelism at n_groups (=5) regardless of core
+  // count -- the build is O(N P^2) and was the solve's main scaling limiter.
+  //
+  // The chunk size is adaptive: a fold holds only ~N/n_groups rows, so a fixed
+  // coarse chunk leaves most cores idle (4 chunks over 14 threads capped the build
+  // at ~1.3x and made it the solve's headline cost), while a fixed fine chunk pays
+  // per-call rankUpdate overhead that slows the serial path. Targeting ~3 chunks
+  // per thread engages every core when threaded yet stays coarse at low thread
+  // counts -- 1.7x faster at 14 cores with no single-thread regression.
+  int n_threads = 1;
+#ifdef _OPENMP
+  n_threads = omp_get_max_threads();
+#endif
+  constexpr int kMaxFoldChunk = 2048;
+  for (int g = 0; g < n_groups; ++g) {
+    const std::vector<int>& idx = rows[g];
+    const int nf = static_cast<int>(idx.size());
+    const int fold_chunk =
+        std::clamp(nf / (3 * n_threads), 256, kMaxFoldChunk);
+    Eigen::MatrixXd m_acc = Eigen::MatrixXd::Zero(p, p);
+    Eigen::VectorXd rhs_acc = Eigen::VectorXd::Zero(p);
+    double ysq_acc = 0.0;
+#pragma omp parallel
+    {
+      Eigen::MatrixXd m_loc = Eigen::MatrixXd::Zero(p, p);
+      Eigen::VectorXd rhs_loc = Eigen::VectorXd::Zero(p);
+      double ysq_loc = 0.0;
+      // Reused per-thread gather buffers (sized to the largest possible chunk).
+      Eigen::MatrixXd xb(kMaxFoldChunk, p);
+      Eigen::VectorXd yb(kMaxFoldChunk);
+#pragma omp for schedule(dynamic) nowait
+      for (int r0 = 0; r0 < nf; r0 += fold_chunk) {
+        const int nr = std::min(fold_chunk, nf - r0);
+        for (int j = 0; j < nr; ++j) {
+          xb.row(j) = xs.row(idx[r0 + j]);
+          yb(j) = ds(idx[r0 + j]);
+        }
+        const auto xt = xb.topRows(nr).transpose();
+        m_loc.selfadjointView<Eigen::Lower>().rankUpdate(xt);
+        rhs_loc.noalias() += xt * yb.head(nr);
+        ysq_loc += yb.head(nr).squaredNorm();
+      }
+#pragma omp critical
+      {
+        m_acc.triangularView<Eigen::Lower>() += m_loc;
+        rhs_acc += rhs_loc;
+        ysq_acc += ysq_loc;
+      }
+    }
+    mf[g] = m_acc.selfadjointView<Eigen::Lower>();
+    rf[g] = std::move(rhs_acc);
+    ysq[g] = ysq_acc;
+  }
+
+  return cv_finish(mf, rf, ysq, n_groups, basis, n, nc, k, lambda_grid,
+                   warm_start);
+}
+
+GlsResult solve_gls_cv_stamped(
+    const Eigen::Ref<const Eigen::VectorXd>& target,
+    const Eigen::Ref<const Eigen::VectorXd>& weights,
+    const Eigen::Ref<const Eigen::MatrixXd>& bn,
+    const Eigen::Ref<const Eigen::MatrixXd>& stamp_design,
+    const std::vector<int>& stamp_id, const std::vector<int>& stamp_fold,
+    const ThinPlateBasis& basis, const std::vector<double>& lambda_grid,
+    int n_groups, int warm_start) {
+  if (lambda_grid.empty())
+    throw std::runtime_error("solve_gls_cv_stamped: lambda_grid is empty");
+  const int n = static_cast<int>(target.size());
+  const int nc = static_cast<int>(bn.cols());
+  const int nf = nc + 1;
+  const int k = static_cast<int>(stamp_design.cols());
+  const int ns = static_cast<int>(stamp_design.rows());
+  const int p = nf * k;
+  if (weights.size() != n || bn.rows() != n ||
+      static_cast<int>(stamp_id.size()) != n)
+    throw std::runtime_error("solve_gls_cv_stamped: row counts disagree");
+  if (static_cast<int>(stamp_fold.size()) != ns)
+    throw std::runtime_error("solve_gls_cv_stamped: stamp_fold size mismatch");
+
+  // Per-stamp moments (the only O(N) pass): A_s = Σ_{i∈s} w_i B_i B_i^T with
+  // B_i = [bn_i, 1] (nf), r_s = Σ w_i t_i B_i, and ds2_s = Σ w_i t_i^2.
+  std::vector<Eigen::MatrixXd> a_stamp(ns, Eigen::MatrixXd::Zero(nf, nf));
+  std::vector<Eigen::VectorXd> r_stamp(ns, Eigen::VectorXd::Zero(nf));
+  std::vector<double> ds2(ns, 0.0);
+  Eigen::VectorXd b(nf);
+  for (int i = 0; i < n; ++i) {
+    const int s = stamp_id[i];
+    if (s < 0 || s >= ns)
+      throw std::runtime_error("solve_gls_cv_stamped: stamp_id out of range");
+    const double wi = weights(i);
+    const double ti = target(i);
+    for (int c = 0; c < nc; ++c) b(c) = bn(i, c);
+    b(nc) = 1.0;
+    a_stamp[s].selfadjointView<Eigen::Lower>().rankUpdate(b, wi);
+    r_stamp[s].noalias() += (wi * ti) * b;
+    ds2[s] += wi * ti * ti;
+  }
+  for (int s = 0; s < ns; ++s)
+    a_stamp[s] = a_stamp[s].selfadjointView<Eigen::Lower>();
+
+  // Per-fold normal equations via the Kronecker factorisation:
+  //   M_g = Σ_{s∈g} A_s ⊗ (d_s d_s^T),  rhs_g(c-block) = Σ_{s∈g} r_s(c) d_s,
+  //   ysq_g = Σ_{s∈g} ds2_s. Folds are independent, so build them in parallel.
+  std::vector<Eigen::MatrixXd> mf(n_groups, Eigen::MatrixXd::Zero(p, p));
+  std::vector<Eigen::VectorXd> rf(n_groups, Eigen::VectorXd::Zero(p));
+  std::vector<double> ysq(n_groups, 0.0);
+#pragma omp parallel for schedule(dynamic)
+  for (int g = 0; g < n_groups; ++g) {
+    Eigen::MatrixXd& m = mf[g];
+    Eigen::VectorXd& r = rf[g];
+    double y = 0.0;
+    for (int s = 0; s < ns; ++s) {
+      if (stamp_fold[s] != g) continue;
+      const Eigen::VectorXd d = stamp_design.row(s).transpose();
+      const Eigen::MatrixXd dd = d * d.transpose();  // k x k, rank-1
+      const Eigen::MatrixXd& as = a_stamp[s];
+      for (int c = 0; c < nf; ++c) {
+        for (int cp = 0; cp < nf; ++cp)
+          m.block(c * k, cp * k, k, k).noalias() += as(c, cp) * dd;
+        r.segment(c * k, k).noalias() += r_stamp[s](c) * d;
+      }
+      y += ds2[s];
+    }
+    ysq[g] = y;
+  }
+
+  return cv_finish(mf, rf, ysq, n_groups, basis, n, nc, k, lambda_grid,
+                   warm_start);
 }
 
 }  // namespace delta

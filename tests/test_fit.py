@@ -233,3 +233,26 @@ def test_sigma_clipping_rejects_bad_stamps():
     rx, ry = clipped.stamp_x[rej], clipped.stamp_y[rej]
     hits = sum(np.min((rx - bx) ** 2 + (ry - by) ** 2) < 9 for bx, by in badpos)
     assert hits >= 5  # of the 6 corrupted stars
+
+
+def test_stamped_solve_matches_exact(monkeypatch):
+    # The per-stamp factorised M-build (DELTA_STAMP_APPROX=1) freezes the spatial
+    # design across each stamp; when stamps are small vs the knot spacing this is a
+    # tiny approximation. On a frame where the gate engages (size 1024, n_knots=3,
+    # stamp_radius=12 -> knot spacing ~20x the stamp), the difference image must
+    # track the exact per-row solve to well under the image noise floor (~1e-3),
+    # which is the quantity that matters downstream (theta itself can differ more in
+    # the heavily-smoothed near-null directions without changing the model).
+    sci, ref, svar, rvar, _ = _matched_pair(11, size=1024, n=120)
+    kw = dict(science_var=svar, reference_var=rvar, n_knots=3, stamp_radius=12, cv_folds=5)
+
+    monkeypatch.setenv("DELTA_STAMP_APPROX", "0")
+    exact = delta.subtract(sci, ref, **kw)
+    monkeypatch.setenv("DELTA_STAMP_APPROX", "1")
+    stamped = delta.subtract(sci, ref, **kw)
+
+    diff_rel = np.linalg.norm(stamped.difference - exact.difference) / np.linalg.norm(
+        exact.difference
+    )
+    assert diff_rel < 1e-3
+    assert abs(stamped.solution.reduced_chi2 - exact.solution.reduced_chi2) < 0.02

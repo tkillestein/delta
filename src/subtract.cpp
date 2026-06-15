@@ -53,6 +53,10 @@ ImageF sanitised_reference(const ImageF& reference) {
     fill = sample[sample.size() / 2];
   }
 
+  // Left serial deliberately: the fill is well under memory-bandwidth saturation
+  // (the serial median sample above dominates this stage), and threading a
+  // freshly-allocated buffer's first-touch only adds concurrent page-fault
+  // contention -- measured net-slower than the single-threaded sweep.
   for (std::size_t i = 0; i < n; ++i) {
     const float v = src[i];
     const bool bad = (has_mask && m[i] != kMaskGood) || !std::isfinite(v);
@@ -69,7 +73,11 @@ ImageF sanitised_reference(const ImageF& reference) {
 void dilate_mask(std::vector<MaskType>& mask, int w, int h, int r) {
   if (r <= 0) return;
   std::vector<MaskType> tmp(mask.size(), kMaskGood);
-  // x-pass: mask -> tmp
+  // x-pass: mask -> tmp. Each output row reads only its own input row, and the
+  // y-pass reads a +/-r band of `tmp` it never writes, so both passes are
+  // row-independent -- thread them (this O(N r) dilation is the last sizeable
+  // serial cost in mask growth, run once per reference/saturation layer).
+#pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
     const std::size_t row = static_cast<std::size_t>(y) * w;
     for (int x = 0; x < w; ++x) {
@@ -80,6 +88,7 @@ void dilate_mask(std::vector<MaskType>& mask, int w, int h, int r) {
     }
   }
   // y-pass: tmp -> mask
+#pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
     const int y0 = std::max(0, y - r), y1 = std::min(h - 1, y + r);
     for (int x = 0; x < w; ++x) {
@@ -501,6 +510,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     }
     if (science.has_variance()) {
       const std::vector<float>& vs = science.variance();
+#pragma omp parallel for schedule(static)
       for (std::size_t i = 0; i < var.size(); ++i) var[i] += vs[i];
     }
   }
@@ -567,7 +577,9 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
         if (rm[i] != kMaskGood) exact_bad[i] = 1;
     }
     // Edge border of one kernel half-width, and any non-finite difference pixel
-    // (also garbage, so it joins the exact-fill set).
+    // (also garbage, so it joins the exact-fill set). The non-finite scan reads
+    // the whole float difference, so thread it over rows (each row independent).
+#pragma omp parallel for schedule(static)
     for (int y = 0; y < hh; ++y) {
       for (int x = 0; x < ww; ++x) {
         const std::size_t i = static_cast<std::size_t>(y) * w + x;

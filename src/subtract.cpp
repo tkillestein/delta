@@ -454,6 +454,30 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
             qsum += static_cast<double>(v) * v;
           }
 
+          // Shrink the K^2 footprint to the smallest centred (2*hw+1)^2 box that
+          // holds (1 - kVarBoxTol) of qsum. Because K is squared, K^2 is far more
+          // concentrated than K itself -- for a smooth matching kernel ~99.99% of
+          // the weight sits within ~rk/2, so the dense correlation only needs the
+          // central box, not the full ks^2 footprint (a ~4x tap reduction here).
+          // The dropped outer taps carry < kVarBoxTol of the weight, well below the
+          // block-effective freeze's own error.
+          constexpr float kVarBoxTol = 1e-4f;
+          int hw = 0;
+          {
+            const double target = (1.0 - kVarBoxTol) * qsum;
+            double box = 0.0;
+            for (; hw < rk; ++hw) {
+              box = 0.0;
+              const int lo = rk - hw, hi = rk + hw;
+              for (int yy = lo; yy <= hi; ++yy) {
+                const float* krow = kf.data() + static_cast<std::size_t>(yy) * ks;
+                for (int xx = lo; xx <= hi; ++xx) box += krow[xx];
+              }
+              if (box >= target) break;
+            }
+          }
+          const int lo = rk - hw, hi = rk + hw;  // dense-conv tap bounds
+
           // Gather the (bh+2rk) x (bw+2rk) input window, zero-padded at the frame
           // edge, into a contiguous buffer of row stride ibw. Track the min/max of
           // the gathered Var(R) to decide whether it is flat over the footprint.
@@ -500,11 +524,14 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
 
           // Tap-outer dense convolution on the cache-resident window/tile: each
           // tap is a contiguous multiply-add over the tile row (auto-vectorised).
+          // Only the central [lo,hi]^2 box of the K^2 footprint is swept (see the
+          // box-shrink above); the gathered window keeps its full rk halo so the
+          // src indexing is unchanged.
           std::fill(out.begin(), out.begin() + static_cast<std::size_t>(bh) * bw,
                     0.0f);
-          for (int ly = 0; ly < ks; ++ly) {
+          for (int ly = lo; ly <= hi; ++ly) {
             const float* krow = kf.data() + static_cast<std::size_t>(ly) * ks;
-            for (int lx = 0; lx < ks; ++lx) {
+            for (int lx = lo; lx <= hi; ++lx) {
               const float c = krow[lx];
               if (c == 0.0f) continue;
               for (int oy = 0; oy < bh; ++oy) {

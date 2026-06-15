@@ -52,12 +52,21 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
 // held-out weighted SSE is chosen, then the final fit uses all pixels. The
 // per-fold normal equations are formed once and reused (M_train = M_all - M_fold),
 // so the cost is k*|grid| small dense solves, not k*|grid| re-assemblies.
+//
+// `warm_start` optionally seeds the lambda search at a known-good grid index (the
+// previous IRLS pass's optimum, whose clipping barely moves the curve). When >= 0
+// the search evaluates a bracket around the hint and descends to the interior
+// minimum instead of sweeping a coarse subset -- a handful of factorisations vs.
+// ~half the grid. The CV error is unimodal in log-lambda, so the descent lands on
+// the same lambda the full coarse-to-fine search would pick. Pass -1 for the
+// cold-start (first-pass) coarse-to-fine search.
 GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const Eigen::Ref<const Eigen::VectorXd>& target,
                        const Eigen::Ref<const Eigen::VectorXd>& weights,
                        const Eigen::Ref<const Eigen::MatrixXd>& bn,
                        const ThinPlateBasis& basis,
                        const std::vector<double>& lambda_grid,
-                       const std::vector<int>& group, int n_groups);
+                       const std::vector<int>& group, int n_groups,
+                       int warm_start = -1);
 
 }  // namespace delta

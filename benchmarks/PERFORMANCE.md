@@ -24,6 +24,23 @@ Per-stage timings are read back out of the pipeline's own `log_timing`
 instrumentation (a temporary loguru sink), so the breakdown stays in lock-step with
 the stages the pipeline actually reports.
 
+### Measurement hygiene — use `--reps` (warm min-of-N)
+
+**A single warm sample is not trustworthy on this host.** First-touch/page-fault
+cost and thermal throttling drift any one run by 20-40%, and back-to-back A/B
+comparisons are worse: the second variant runs on a hotter chip, so whichever you
+measure second looks slower. This is not hypothetical — an early "the GLS solve is
+nearly serial (1.04× over 14 threads)" finding was pure artifact of cold,
+single-sample runs; warm min-of-N showed the same code already scaling ~1.8×.
+
+The robust estimator is **warm min-of-N**: warm up once, run N timed iterations,
+take the *minimum* per stage (the least-contended sample — the floor a regression
+has to beat). Pass `--reps N` (≥5 for A/B work). For thread scaling, drive
+`OMP_NUM_THREADS` across separate processes (OpenMP latches the count at the first
+parallel region) and let the per-process min absorb the thermal drift::
+
+    OMP_NUM_THREADS=14 python -m benchmarks.bench_subtract --size 4096 --reps 7
+
 ## Reference numbers
 
 The headline is host-specific (treat the *shape* of the breakdown, not the absolute
@@ -84,16 +101,20 @@ Same 14-core host, 4096×4096 (16.8 Mpix), 419 stars, no warm-up:
 |      14 |    12.29 |   1.69x |        12% |
 
 Scaling is far from ideal: it saturates at ~1.7× by 4 threads and barely moves after.
-The convolution/subtract paths (SPEC §5: *threaded over rows/tiles purely for
-parallelism*) do parallelise, but a large serial/memory-bound fraction (Amdahl) caps
-the win — at this frame size the full-frame passes are memory-bandwidth bound, so
-extra cores contend for the same bus rather than adding throughput. This confirmed the
-headline lever is **per-core efficiency (SIMD/cache), not more threads** — acted on in
-issue #19 (cache-blocking the convolutions): the single-thread baseline dropped from
-23.25→20.83 s here while the scaling *shape* is unchanged, because the dominant tall
-pole (the GLS solve) is not a convolution. (Spatial-field evaluation, the other large
-non-convolution cost at the time, has since been cut by issue #16.) See the per-stage
-gaps below.
+The cap is **memory bandwidth, not a serial section**: at this frame size the
+full-frame convolution/subtract passes (SPEC §5: *threaded over rows/tiles purely for
+parallelism*) are bandwidth-bound, so beyond ~4 threads extra cores contend for the
+same bus rather than adding throughput. The headline lever is therefore **per-core
+efficiency (SIMD/cache), not more threads** — acted on in issue #19 (cache-blocking the
+convolutions): the single-thread baseline dropped 23.25→20.83 s while the scaling
+*shape* is unchanged.
+
+Note this is a *wall-time* ceiling on the area-proportional passes, **not** evidence
+that any one stage is serial. The GLS solve in particular — long mis-read as serial
+from cold single-sample runs — scales ~1.8× warm via its threaded fold M-build (see
+the GLS section), the same bandwidth-limited ceiling as the rest. Measure stage
+scaling with `--reps` (warm min-of-N); a cold sample will not show it. See the
+per-stage gaps below.
 
 ## Sub-stage instrumentation (`DELTA_TIMING`)
 
@@ -146,6 +167,34 @@ normal equations. Two *exact* levers cut it **5.26→3.62 s** (−31%):
   evaluates 15 of 25 grid points and selects the *identical* λ as the full sweep for any
   unimodal curve. The reduced-χ²/effective-dof diagnostics come from the exact final
   solve, so they are untouched.
+
+Two further *exact* refinements (this branch) trim it again, ~5-8% on solve-min each
+measured with `--reps`:
+
+- **Row-chunked CV fold M-build.** Building each fold's `M_g = Xs_gᵀ Xs_g` was
+  threaded one-fold-per-thread, capping parallelism at `cv_folds` (=5) regardless of
+  core count — and the build (O(N·P²)) is the solve's *dominant* cost. It now mirrors
+  the full-data `assemble()`: the fold loop is serial on the outside but each fold's
+  symmetric `rankUpdate` is split over 2048-row chunks across *all* threads (per-thread
+  gather buffers hoisted out of the chunk loop — allocating them per chunk regressed the
+  1-thread path). This is what lifts the warm solve scaling to ~1.8× (below); the earlier
+  "solve is serial" read was the cold-sample artifact, not the M-build.
+- **λ-search warm start across IRLS passes.** The σ-clip loop re-runs the whole CV solve
+  each pass, but a pass only clips a handful of stamps off a curve the previous pass
+  already located — the optimum barely moves. Passes after the first now seed a ±1
+  bracket at the previous pass's CV-selected index and descend to the interior minimum
+  (a handful of factorisations) instead of the cold coarse-to-fine sweep. The CV curve is
+  unimodal in log-λ, so the descent lands on the *identical* λ (verified: same selected λ
+  and difference image to the threaded-reduction FP-noise floor, ~1e-5, which two *cold*
+  runs already differ by). First pass stays cold-start. Smaller than hoped because the
+  M-build, not the λ-grid factorisations (O(P³), small P), is the solve's floor — see
+  below.
+
+**Where the solve's floor now is.** With both above, the per-fold M-build dominates: it
+runs once per IRLS pass regardless of how many λ points are factorised, so cutting λ
+work only trims the tail. The next real lever is avoiding the rebuild on passes that
+clip few pixels — a rank downdate of the clipped rows out of the existing `M_g` rather
+than a full re-accumulate — which is materially more complex than these two changes.
 
 The hypothesised **factorisation reuse across the λ-grid** (a single generalised
 eigendecomposition of the `(M, P₀)` pencil, then O(P)-per-λ diagnostics) was implemented

@@ -193,7 +193,8 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const Eigen::Ref<const Eigen::MatrixXd>& bn,
                        const ThinPlateBasis& basis,
                        const std::vector<double>& lambda_grid,
-                       const std::vector<int>& group, int n_groups) {
+                       const std::vector<int>& group, int n_groups,
+                       int warm_start) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
   const int n = static_cast<int>(points.rows());
@@ -226,22 +227,48 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   std::vector<Eigen::MatrixXd> mf(n_groups);
   std::vector<Eigen::VectorXd> rf(n_groups);
   std::vector<double> ysq(n_groups, 0.0);
-#pragma omp parallel for schedule(dynamic)
+  // Build each fold's M_g = Xs_g^T Xs_g with full row-chunked thread parallelism:
+  // the fold loop is serial on the outside, but each fold's rank update is split
+  // over row chunks across *all* threads (mirroring assemble()). The earlier
+  // one-thread-per-fold loop capped parallelism at n_groups (=5) regardless of core
+  // count -- the build is O(N P^2) and was the solve's main scaling limiter.
+  constexpr int kFoldChunk = 2048;
   for (int g = 0; g < n_groups; ++g) {
     const std::vector<int>& idx = rows[g];
     const int nf = static_cast<int>(idx.size());
-    Eigen::MatrixXd xf(nf, p);
-    Eigen::VectorXd yf(nf);
-    for (int j = 0; j < nf; ++j) {
-      xf.row(j) = xs.row(idx[j]);
-      yf(j) = ds(idx[j]);
+    Eigen::MatrixXd m_acc = Eigen::MatrixXd::Zero(p, p);
+    Eigen::VectorXd rhs_acc = Eigen::VectorXd::Zero(p);
+    double ysq_acc = 0.0;
+#pragma omp parallel
+    {
+      Eigen::MatrixXd m_loc = Eigen::MatrixXd::Zero(p, p);
+      Eigen::VectorXd rhs_loc = Eigen::VectorXd::Zero(p);
+      double ysq_loc = 0.0;
+      // Reused per-thread gather buffers (allocated once, not per chunk).
+      Eigen::MatrixXd xb(kFoldChunk, p);
+      Eigen::VectorXd yb(kFoldChunk);
+#pragma omp for schedule(dynamic) nowait
+      for (int r0 = 0; r0 < nf; r0 += kFoldChunk) {
+        const int nr = std::min(kFoldChunk, nf - r0);
+        for (int j = 0; j < nr; ++j) {
+          xb.row(j) = xs.row(idx[r0 + j]);
+          yb(j) = ds(idx[r0 + j]);
+        }
+        const auto xt = xb.topRows(nr).transpose();
+        m_loc.selfadjointView<Eigen::Lower>().rankUpdate(xt);
+        rhs_loc.noalias() += xt * yb.head(nr);
+        ysq_loc += yb.head(nr).squaredNorm();
+      }
+#pragma omp critical
+      {
+        m_acc.triangularView<Eigen::Lower>() += m_loc;
+        rhs_acc += rhs_loc;
+        ysq_acc += ysq_loc;
+      }
     }
-    Eigen::MatrixXd m = Eigen::MatrixXd::Zero(p, p);
-    if (nf > 0) m.selfadjointView<Eigen::Lower>().rankUpdate(xf.transpose());
-    mf[g] = m.selfadjointView<Eigen::Lower>();
-    rf[g] = nf > 0 ? Eigen::VectorXd(xf.transpose() * yf)
-                   : Eigen::VectorXd::Zero(p);
-    ysq[g] = yf.squaredNorm();
+    mf[g] = m_acc.selfadjointView<Eigen::Lower>();
+    rf[g] = std::move(rhs_acc);
+    ysq[g] = ysq_acc;
   }
 
   // Full-data system (sum of folds) + the block-diagonal bending penalty.
@@ -300,30 +327,65 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
     }
   };
 
-  // Coarse-to-fine lambda search. The held-out CV error is unimodal in log-lambda
-  // (the bias-variance tradeoff is convex over a log grid), so the full grid need
-  // not be swept: evaluate a stride-`kCoarseStep` coarse subset, then refine the
-  // bracket around its minimum. With stride 2 the true grid minimum is always
-  // within +/-2 of the coarse argmin (an interior minimum lies between, or on, the
-  // two bracketing coarse samples), so the selected lambda is identical to the
-  // full-grid sweep for any unimodal curve -- at ~0.6x the factorisations. The
-  // reduced-chi2 / effective-dof diagnostics come from the exact final solve below,
-  // not the curve, so they are unaffected.
-  constexpr int kCoarseStep = 2;
-  std::vector<int> coarse;
-  for (int li = 0; li < nl; li += kCoarseStep) coarse.push_back(li);
-  if (coarse.empty() || coarse.back() != nl - 1) coarse.push_back(nl - 1);
-  evaluate(coarse);
+  // Both search strategies below exploit the same property: the held-out CV error
+  // is unimodal in log-lambda (the bias-variance tradeoff is convex over a log
+  // grid), so the global minimum is found without sweeping the whole grid.
+  auto argmin_done = [&]() {
+    int b = -1;
+    double bc = kInf;
+    for (int li = 0; li < nl; ++li)
+      if (done[li] && curve[li] < bc) {
+        bc = curve[li];
+        b = li;
+      }
+    return b;
+  };
 
-  int coarse_best = coarse.front();
-  for (int li : coarse)
-    if (curve[li] < curve[coarse_best]) coarse_best = li;
+  if (warm_start >= 0 && warm_start < nl) {
+    // Warm start: a later IRLS pass clips a handful of pixels off a curve already
+    // located the previous pass, so the optimum barely moves. Seed a +/-1 bracket
+    // at the hint and descend -- each step evaluates the unexplored neighbour of
+    // the current argmin, walking downhill until both neighbours (or the grid
+    // edges) are evaluated and no lower. On a unimodal curve that interior
+    // minimum is the global one, identical to the coarse-to-fine pick, but in a
+    // handful of factorisations instead of ~half the grid.
+    std::vector<int> seed;
+    for (int li = std::max(0, warm_start - 1);
+         li <= std::min(nl - 1, warm_start + 1); ++li)
+      seed.push_back(li);
+    evaluate(seed);
+    while (true) {
+      const int b = argmin_done();
+      std::vector<int> step;
+      if (b > 0 && !done[b - 1]) step.push_back(b - 1);
+      if (b < nl - 1 && !done[b + 1]) step.push_back(b + 1);
+      if (step.empty()) break;  // both neighbours pinned -> interior minimum
+      evaluate(step);
+    }
+  } else {
+    // Cold start: coarse-to-fine. Evaluate a stride-`kCoarseStep` coarse subset,
+    // then refine the bracket around its minimum. With stride 2 the true grid
+    // minimum is always within +/-2 of the coarse argmin (an interior minimum
+    // lies between, or on, the two bracketing coarse samples), so the selected
+    // lambda is identical to the full-grid sweep for any unimodal curve -- at
+    // ~0.6x the factorisations. The reduced-chi2 / effective-dof diagnostics come
+    // from the exact final solve below, not the curve, so they are unaffected.
+    constexpr int kCoarseStep = 2;
+    std::vector<int> coarse;
+    for (int li = 0; li < nl; li += kCoarseStep) coarse.push_back(li);
+    if (coarse.empty() || coarse.back() != nl - 1) coarse.push_back(nl - 1);
+    evaluate(coarse);
 
-  std::vector<int> refine;
-  for (int li = std::max(0, coarse_best - kCoarseStep);
-       li <= std::min(nl - 1, coarse_best + kCoarseStep); ++li)
-    if (!done[li]) refine.push_back(li);
-  if (!refine.empty()) evaluate(refine);
+    int coarse_best = coarse.front();
+    for (int li : coarse)
+      if (curve[li] < curve[coarse_best]) coarse_best = li;
+
+    std::vector<int> refine;
+    for (int li = std::max(0, coarse_best - kCoarseStep);
+         li <= std::min(nl - 1, coarse_best + kCoarseStep); ++li)
+      if (!done[li]) refine.push_back(li);
+    if (!refine.empty()) evaluate(refine);
+  }
 
   int best_i = 0;
   double best_cv = kInf;

@@ -180,6 +180,9 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   GlsResult gls;
   int npix = 0;
   double reduced_chi2 = std::numeric_limits<double>::quiet_NaN();
+  // Carries the previous pass's CV-selected lambda index into the next pass so the
+  // search warm-starts at it (the clip barely moves the curve). -1 = cold start.
+  int warm_start = -1;
   delta::timing::ScopedTimer solve_timer("fit: GLS solve");
   for (int iter = 0;; ++iter) {
     // Active pixel rows = pixels whose stamp is still accepted.
@@ -209,7 +212,12 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
       std::vector<int> grp(npix);
       for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
       gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
-                         cv_folds);
+                         cv_folds, warm_start);
+      // Recover the selected grid index (min of the CV-error curve; unevaluated
+      // entries are +inf) to warm-start the next IRLS pass.
+      warm_start = static_cast<int>(
+          std::min_element(gls.gcv_curve.begin(), gls.gcv_curve.end()) -
+          gls.gcv_curve.begin());
     } else {
       gls = solve_gls_gcv(points, tgt, wts, bn_mat, spatial, lambda_grid);
     }

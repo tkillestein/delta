@@ -4,6 +4,16 @@
 
 namespace delta {
 
+// Row-parallelism is only worth its fork/join cost above this much work. The
+// stamp fit convolves ~35-row patches per component (fit.cpp), where spawning a
+// full thread team per call is pure overhead -- it made the `B_n` precompute
+// *slower* with more threads. Full-frame convolutions (subtract.cpp, ~6000 rows)
+// clear this by orders of magnitude and stay threaded. Gating on total work
+// (height*width) keeps both: small patch -> serial, full frame -> parallel.
+namespace {
+constexpr std::size_t kParallelMinWork = 1u << 15;  // ~32k elements
+}
+
 // 1-D convolution along x (fast axis), zero-padded, 'same' size.
 // out[y,x] = sum_j k[j] * in[y, x + h - j]   (j = m + h, h = ksize/2).
 //
@@ -21,7 +31,8 @@ ImageF convolve_x(const ImageF& in, const std::vector<float>& k) {
   const float* src = in.data();
   float* dst = out.data();
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) \
+    if (static_cast<std::size_t>(height) * width >= kParallelMinWork)
   for (int y = 0; y < height; ++y) {
     const std::size_t row = static_cast<std::size_t>(y) * width;
     float* drow = dst + row;
@@ -52,7 +63,8 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
   const float* src = in.data();
   float* dst = out.data();
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) \
+    if (static_cast<std::size_t>(height) * width >= kParallelMinWork)
   for (int y = 0; y < height; ++y) {
     float* drow = dst + static_cast<std::size_t>(y) * width;
     for (int x = 0; x < width; ++x) drow[x] = 0.0f;

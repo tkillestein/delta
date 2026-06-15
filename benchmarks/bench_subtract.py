@@ -6,12 +6,21 @@ and the HOTPANTS runtime target (SPEC §13.4) are visible over time.
 
 Two modes:
 
-* single run — synthesize a frame, run the full pipeline once (after a warm-up),
-  and report a per-stage timing breakdown::
+* single run — synthesize a frame, run the full pipeline (after a warm-up), and
+  report a per-stage timing breakdown::
 
       python -m benchmarks.bench_subtract                 # 8000x6000 reference
       python -m benchmarks.bench_subtract --size 4096     # square shortcut
       OMP_NUM_THREADS=8 python -m benchmarks.bench_subtract
+
+  Pass ``--reps N`` for the robust **warm min-of-N** estimator: warm up once, time
+  N iterations, and report the *minimum* per stage. Use this for any A/B or scaling
+  comparison — a single warm sample drifts 20-40% under thermal throttling and
+  first-touch cost, enough to invent or mask a regression (it once made the GLS
+  solve look serial). The min is the least-contended sample, which is what a real
+  change has to beat::
+
+      python -m benchmarks.bench_subtract --size 4096 --reps 7
 
 * thread sweep — re-run the single mode in subprocesses across a range of
   ``OMP_NUM_THREADS`` and report speedup vs the single-thread baseline (OpenMP
@@ -149,9 +158,20 @@ def run_once(
     decorrelate: bool,
     score: bool,
     warmup: bool,
+    reps: int = 1,
     seed: int = 0,
 ) -> RunResult:
-    """Synthesize a frame and time one full subtraction (with optional warm-up)."""
+    """Synthesize a frame and time the subtraction, reporting the warm min over `reps`.
+
+    Benchmarking this pipeline cold or single-shot is unreliable: page-fault /
+    first-touch cost and thermal-throttle spikes inflate a single sample by 20-40%
+    and made earlier scaling reads (e.g. "the GLS solve is serial") pure artifact.
+    The robust estimator is **warm min-of-N**: warm up once, run `reps` timed
+    iterations, and take the *minimum* per stage (the least-contended sample, which
+    is what a regression actually has to beat). Drive thread scaling from
+    ``OMP_NUM_THREADS`` across separate processes; min absorbs the within-process
+    thermal drift that corrupts back-to-back A/B comparisons.
+    """
     sci, ref, var = build_pair(width, height, n_stars, seed)
     kwargs = dict(
         science_var=var,
@@ -165,11 +185,22 @@ def run_once(
         # First-touch allocation, FFTW plan caches: run once and discard.
         delta.subtract(sci, ref, **kwargs)
 
-    with capture_stage_timings() as stages:
-        t0 = time.perf_counter()
-        res = delta.subtract(sci, ref, **kwargs)
-        wall = time.perf_counter() - t0
+    wall = float("inf")
+    stage_min: dict[str, float] = {}
+    res = None
+    for _ in range(max(1, reps)):
+        with capture_stage_timings() as stages:
+            t0 = time.perf_counter()
+            res = delta.subtract(sci, ref, **kwargs)
+            w = time.perf_counter() - t0
+        wall = min(wall, w)
+        # Per-stage min independently: each stage's least-contended sample. (The
+        # column won't sum to the min wall, by construction -- that's intended; we
+        # want each stage's floor, not one run's snapshot.)
+        for label, secs in stages.items():
+            stage_min[label] = min(stage_min.get(label, float("inf")), secs)
 
+    assert res is not None  # loop runs at least once
     mpix = width * height / 1e6
     threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count() or 1
     return RunResult(
@@ -182,7 +213,7 @@ def run_once(
         lam=float(res.solution.lam),
         wall_s=wall,
         mpix_per_s=mpix / wall,
-        stages=dict(stages),
+        stages=stage_min,
     )
 
 
@@ -216,6 +247,7 @@ def thread_sweep(
     *,
     decorrelate: bool,
     score: bool,
+    reps: int = 1,
 ) -> list[RunResult]:
     """Re-run single mode in a subprocess per thread count, parsing emitted JSON."""
     results: list[RunResult] = []
@@ -231,6 +263,8 @@ def thread_sweep(
             str(height),
             "--n-stars",
             str(n_stars),
+            "--reps",
+            str(reps),
             "--emit-json",
         ]
         if not decorrelate:
@@ -293,6 +327,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--no-decorrelate", action="store_true")
     parser.add_argument("--no-score", action="store_true")
     parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument(
+        "--reps",
+        type=int,
+        default=1,
+        help="timed warm iterations; report the per-stage min (default: 1)",
+    )
     parser.add_argument("--record", action="store_true", help="append results to history.jsonl")
     parser.add_argument(
         "--emit-json", action="store_true", help="print one JSON line to stdout (sweep subprocess)"
@@ -308,7 +348,13 @@ def main(argv: list[str]) -> int:
     if args.threads:
         threads = [int(t) for t in args.threads.split(",")]
         results = thread_sweep(
-            threads, width, height, n_stars, decorrelate=decorrelate, score=score
+            threads,
+            width,
+            height,
+            n_stars,
+            decorrelate=decorrelate,
+            score=score,
+            reps=args.reps,
         )
         for r in results:
             print_run(r)
@@ -325,6 +371,7 @@ def main(argv: list[str]) -> int:
         decorrelate=decorrelate,
         score=score,
         warmup=not args.no_warmup,
+        reps=args.reps,
     )
     if args.emit_json:
         # Logs go to the captured sink; stdout stays pure JSON for the parent.

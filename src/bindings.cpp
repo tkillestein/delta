@@ -597,20 +597,25 @@ nb::ndarray<nb::numpy, float> decorrelate(
   return to_numpy<float>(std::move(out.pixels()), {h, w});
 }
 
-// Match-filtered score image (S/N map).
+// Match-filtered score image (S/N map). `variance` is a same-shape per-pixel
+// noise variance image; each output pixel is normalised by sqrt(var * sumpsf2).
 nb::ndarray<nb::numpy, float> matched_filter(InArray<float> image,
                                              InArray<float> psf,
-                                             double noise_var) {
+                                             InArray<float> variance) {
   const std::size_t h = image.shape(0);
   const std::size_t w = image.shape(1);
   const int ps = static_cast<int>(psf.shape(0));
   if (psf.shape(1) != static_cast<std::size_t>(ps))
     throw std::runtime_error("matched_filter: psf must be square");
+  if (variance.shape(0) != h || variance.shape(1) != w)
+    throw std::runtime_error("matched_filter: variance must match image shape");
 
   delta::ImageF img(w, h);
   std::copy(image.data(), image.data() + h * w, img.pixels().begin());
+  delta::ImageF var(w, h);
+  std::copy(variance.data(), variance.data() + h * w, var.pixels().begin());
   const std::vector<float> p(psf.data(), psf.data() + psf.size());
-  delta::ImageF out = delta::matched_filter(img, p, ps, noise_var);
+  delta::ImageF out = delta::matched_filter(img, p, ps, var);
   return to_numpy<float>(std::move(out.pixels()), {h, w});
 }
 
@@ -711,6 +716,7 @@ NB_MODULE(_core, m) {
         "beta"_a, "n_max"_a, "var_science"_a, "var_reference"_a, "block"_a = 256,
         "radius"_a = 0,
         "Spatially-varying noise decorrelation via apodized FFT blocks.");
-  m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "noise_var"_a,
-        "Match-filtered score image (per-pixel S/N map).");
+  m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "variance"_a,
+        "Match-filtered score image (per-pixel S/N map). variance must be a "
+        "same-shape float32 image of per-pixel noise variance.");
 }

@@ -365,29 +365,32 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
 }
 
 ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
-                      int psf_size, double noise_var) {
+                      int psf_size, const ImageF& variance) {
   if (static_cast<int>(psf.size()) != psf_size * psf_size)
     throw std::runtime_error("matched_filter: psf size mismatch");
   const int w = static_cast<int>(image.width());
   const int h = static_cast<int>(image.height());
+  if (static_cast<int>(variance.width()) != w ||
+      static_cast<int>(variance.height()) != h)
+    throw std::runtime_error("matched_filter: variance size mismatch");
   const int ks = psf_size;
   const int r = psf_size / 2;
 
-  double sumpsf2 = 0.0;
-  for (float v : psf) sumpsf2 += static_cast<double>(v) * v;
-  const double norm = std::sqrt(std::max(noise_var, 0.0) * sumpsf2);
-  const float inv_norm = norm > 0.0 ? static_cast<float>(1.0 / norm) : 0.0f;
+  float sumpsf2 = 0.0f;
+  for (float v : psf) sumpsf2 += v * v;
 
   ImageF out(w, h);
 
-  // Cache-blocked correlation: out(x) = (1/norm) sum_u psf(u) image(x+u). Done
-  // naively (output-outer, kernel-inner) every output pixel re-reads the whole
-  // ks x ks window straight off the strided frame, thrashing the cache. Instead
-  // tile the frame, gather each tile's haloed input window once into a small
-  // contiguous buffer (so it stays hot in L1/L2 across the ks^2 taps), and apply
-  // the PSF taps as unit-stride multiply-adds. Unlike the variance pass this is a
-  // correlation, so the PSF is applied directly (no axis mirror).
+  // Cache-blocked correlation: out(x) = (1/norm(x)) sum_u psf(u) image(x+u).
+  // Done naively (output-outer, kernel-inner) every output pixel re-reads the
+  // whole ks x ks window straight off the strided frame, thrashing the cache.
+  // Instead tile the frame, gather each tile's haloed input window once into a
+  // small contiguous buffer (so it stays hot in L1/L2 across the ks^2 taps),
+  // and apply the PSF taps as unit-stride multiply-adds. Unlike the variance
+  // pass this is a correlation, so the PSF is applied directly (no axis mirror).
+  // Normalisation is per-pixel: norm(x) = sqrt(var(x) * sumpsf2).
   const float* img = image.data();
+  const float* var = variance.data();
   constexpr int bsz = 64;
   const int ibw = bsz + 2 * r;  // gathered window side (tile + halo)
   std::vector<std::pair<int, int>> blocks;
@@ -404,8 +407,9 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
       const int bw = std::min(bsz, w - bx);
       const int bh = std::min(bsz, h - by);
 
-      // Gather the (bh+2r) x (bw+2r) input window, zero-padded at the frame edge
-      // (matching the original zero-padding contract), into a contiguous buffer.
+      // Gather the (bh+2r) x (bw+2r) input window, zero-padded at the frame
+      // edge (matching the original zero-padding contract), into a contiguous
+      // buffer.
       const int iwh = bh + 2 * r;
       const int iww = bw + 2 * r;
       for (int iy = 0; iy < iwh; ++iy) {
@@ -422,8 +426,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
         }
       }
 
-      // Tap-outer correlation on the cache-resident window: win[(oy+ly)*ibw +
-      // ox+lx] is image[by+oy+(ly-r), bx+ox+(lx-r)], i.e. the (ly-r, lx-r) tap.
+      // Tap-outer correlation on the cache-resident window.
       std::fill(acc.begin(), acc.begin() + static_cast<std::size_t>(bh) * bw,
                 0.0f);
       for (int ly = 0; ly < ks; ++ly) {
@@ -441,16 +444,29 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
         }
       }
 
-      // Normalise and scatter into the output frame.
+      // Per-pixel normalise and scatter: score(x) = conv(x) / sqrt(var(x) * sumpsf2).
       for (int oy = 0; oy < bh; ++oy) {
         float* orow = out.data() + static_cast<std::size_t>(by + oy) * w + bx;
         const float* arow = acc.data() + static_cast<std::size_t>(oy) * bw;
-#pragma omp simd
-        for (int ox = 0; ox < bw; ++ox) orow[ox] = arow[ox] * inv_norm;
+        const float* vrow = var + static_cast<std::size_t>(by + oy) * w + bx;
+        for (int ox = 0; ox < bw; ++ox) {
+          const float v = vrow[ox];
+          orow[ox] = v > 0.0f ? arow[ox] / std::sqrt(v * sumpsf2) : 0.0f;
+        }
       }
     }
   }
   return out;
+}
+
+ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
+                      int psf_size, double noise_var) {
+  const int w = static_cast<int>(image.width());
+  const int h = static_cast<int>(image.height());
+  ImageF var(w, h);
+  std::fill(var.pixels().begin(), var.pixels().end(),
+            static_cast<float>(std::max(noise_var, 0.0)));
+  return matched_filter(image, psf, psf_size, var);
 }
 
 }  // namespace delta

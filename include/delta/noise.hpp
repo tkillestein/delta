@@ -53,10 +53,15 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
                    const ImageF& var_reference, int block);
 
 // Match-filtered score image: the normalised correlation of `image` with the
-// point-source profile `psf` (side `psf_size`), giving a per-pixel S/N map for
-// white noise of variance `noise_var`. A source of amplitude A with profile psf
-// produces a peak of A * sqrt(sum psf^2 / noise_var); source-free noise is unit
-// Gaussian.
+// point-source profile `psf` (side `psf_size`), giving a per-pixel S/N map.
+// `variance` is a same-shape image of per-pixel noise variance (e.g. the
+// propagated difference-image variance). Each output pixel is normalised by
+// sqrt(var(x,y) * sum(psf^2)), so source-free noise is a unit Gaussian even
+// under spatially-varying noise. Pixels with zero or negative variance yield 0.
+ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
+                      int psf_size, const ImageF& variance);
+
+// Convenience overload with a spatially-constant noise variance.
 ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
                       int psf_size, double noise_var);
 

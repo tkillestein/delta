@@ -451,12 +451,12 @@ class Subtractor:
             with log_timing("matched-filter score"):
                 psf_radius = min(self.stamp_radius, 8)
                 psf = _estimate_psf(target, stamp_x, stamp_y, psf_radius)
-                noise_var = (
-                    float(np.median(variance[variance > 0]))
-                    if variance is not None
-                    else float(np.var(whitened))
-                )
-                score = _core.matched_filter(whitened, psf, noise_var)
+                if variance is not None:
+                    score_var = np.asarray(variance, dtype=np.float32)
+                else:
+                    fallback = float(np.var(whitened))
+                    score_var = np.full(whitened.shape, fallback, dtype=np.float32)
+                score = _core.matched_filter(whitened, psf, score_var)
 
         out_diff = whitened if self.decorrelate else difference
         return DiffResult(

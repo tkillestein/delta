@@ -150,8 +150,9 @@ namespace {
 // spatial solution: K = sum_n a_n(cx,cy) phi_n, returned as a ksize^2 footprint.
 std::vector<float> local_kernel(const ThinPlateBasis& spatial,
                                 const Eigen::Ref<const Eigen::VectorXd>& theta,
-                                const GaussHermiteBasis& basis, double cx,
-                                double cy) {
+                                const GaussHermiteBasis& basis,
+                                const std::vector<std::vector<float>>& phi,
+                                double cx, double cy) {
   const int nc = basis.component_count();
   const int k = spatial.n_basis();
   const Eigen::MatrixXd c = Eigen::Map<const Eigen::MatrixXd>(theta.data(), k,
@@ -164,9 +165,9 @@ std::vector<float> local_kernel(const ThinPlateBasis& spatial,
   const int ks = basis.ksize();
   std::vector<float> kernel(static_cast<std::size_t>(ks) * ks, 0.0f);
   for (int n = 0; n < nc; ++n) {
-    const std::vector<float> phi = basis.kernel2d(n);
     const float an = static_cast<float>(a(0, n));
-    for (std::size_t i = 0; i < kernel.size(); ++i) kernel[i] += an * phi[i];
+    const float* p = phi[n].data();
+    for (std::size_t i = 0; i < kernel.size(); ++i) kernel[i] += an * p[i];
   }
   return kernel;
 }
@@ -226,6 +227,13 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   };
   const std::vector<int> oxs = origins(w, block, stride);
   const std::vector<int> oys = origins(h, block, stride);
+
+  // Component footprints, built once and shared across every block's local-kernel
+  // reconstruction (they are frame-invariant; rebuilding all nc per block churned
+  // ~nc allocations per block over the thousands of overlap-add blocks).
+  const int nc = basis.component_count();
+  std::vector<std::vector<float>> phi(nc);
+  for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
 
   // Flatten the block grid so the (independent, FFT-heavy) blocks distribute
   // over threads. Each thread builds its own FFTW plans/buffers once -- planning
@@ -302,7 +310,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
         const double cx = std::clamp(bx + block / 2.0, 0.0, w - 1.0);
         const double cy = std::clamp(by + block / 2.0, 0.0, h - 1.0);
         const std::vector<float> kern =
-            local_kernel(spatial, theta, basis, cx, cy);
+            local_kernel(spatial, theta, basis, phi, cx, cy);
         const double vs = block_variance(var_science, bx, by, block, w, h);
         const double vr = block_variance(var_reference, bx, by, block, w, h);
 

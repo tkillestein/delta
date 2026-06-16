@@ -297,16 +297,15 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   {
     DELTA_TIME("subtract: model convolve");
     const int n_max = basis.n_max();
-    std::vector<ImageF> tx;
-    tx.reserve(n_max + 1);
-    for (int nx = 0; nx <= n_max; ++nx)
-      tx.push_back(convolve_x(clean, basis.kernel1d(nx)));
-
     const auto& orders = basis.orders();
+    std::vector<std::vector<float>> kx(n_max + 1);
+    for (int nx = 0; nx <= n_max; ++nx) kx[nx] = basis.kernel1d(nx);
     std::vector<std::vector<float>> ky(nc);
     for (int n = 0; n < nc; ++n) ky[n] = basis.kernel1d(orders[n].second);
-    const int kh = (basis.ksize() - 1) / 2;
+    const int ks = basis.ksize();
+    const int kh = (ks - 1) / 2;
 
+    const float* cl = clean.data();
     const float* s = science.data();
     const float* bg = fields.background.get();
 
@@ -314,26 +313,65 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     // components on the outside and ran a full-frame y-pass each, so the running
     // diff was read-modify-written nc(=28) times and every tx[nx] was re-read
     // from DRAM per component -- memory-bandwidth bound (the pipeline's headline
-    // bottleneck). Here we tile the frame: a tile-local diff accumulator and the
-    // shared x-passes for the tile's rows (+halo) all fit in L2, so we sweep all
-    // components over the tile while diff stays hot and write it out once. The
-    // per-pixel accumulation order (component order) is unchanged, so the result
-    // is bit-identical to the streamed version.
+    // bottleneck). It then materialised the whole (n_max+1)-deep x-pass stack
+    // (~1.3 GB at the reference frame) and streamed it back per tile.
+    //
+    // Here the shared x-passes are computed *per tile* into a thread-local buffer
+    // covering the tile rows + kh y-halo, then fused in place: the x-pass stack
+    // never touches DRAM (it stays in L2 and is consumed immediately by the
+    // y-pass), trading the 1.3 GB write + repeated streaming reads for a ~1.17x
+    // halo re-convolution of `clean`. The per-pixel accumulation order (x taps
+    // 0..ks-1, then component order) is unchanged, so the result is bit-identical
+    // to the materialised-B_n version.
     constexpr int tw = 128;
     constexpr int th = 128;
     std::vector<std::pair<int, int>> tiles;
     for (int by = 0; by < hh; by += th)
       for (int bx = 0; bx < ww; bx += tw) tiles.emplace_back(bx, by);
 
+    const int nrows_max = th + 2 * kh;
+    const std::size_t per_nx_max = static_cast<std::size_t>(nrows_max) * tw;
+
 #pragma omp parallel
     {
       std::vector<float> dtile(static_cast<std::size_t>(tw) * th);
       std::vector<float> bn(tw);
+      // Thread-local x-pass stack: (n_max+1) buffers of (bh+2kh) x bw rows.
+      std::vector<float> txt(static_cast<std::size_t>(n_max + 1) * per_nx_max);
 #pragma omp for schedule(dynamic)
       for (std::size_t ti = 0; ti < tiles.size(); ++ti) {
         const int bx = tiles[ti].first, by = tiles[ti].second;
         const int bw = std::min(tw, ww - bx);
         const int bh = std::min(th, hh - by);
+        const int nrows = bh + 2 * kh;
+        const int hy0 = by - kh;  // global y of buffer row 0
+        const std::size_t per_nx = static_cast<std::size_t>(nrows) * bw;
+
+        // Tile-local separable x-pass for every nx over the tile rows + y-halo.
+        // Tap-outer accumulation in the same order as convolve_x; out-of-range
+        // source columns are skipped (the zero-pad contract). Rows whose global y
+        // is off-frame are never read by the y-pass (its jmin/jmax clamp), so they
+        // are just zeroed.
+        for (int nx = 0; nx <= n_max; ++nx) {
+          const std::vector<float>& kxn = kx[nx];
+          float* base = txt.data() + static_cast<std::size_t>(nx) * per_nx;
+          for (int r = 0; r < nrows; ++r) {
+            float* orow = base + static_cast<std::size_t>(r) * bw;
+            std::fill(orow, orow + bw, 0.0f);
+            const int gy = hy0 + r;
+            if (gy < 0 || gy >= hh) continue;
+            const float* crow = cl + static_cast<std::size_t>(gy) * w;
+            for (int j = 0; j < ks; ++j) {
+              const float kc = kxn[j];
+              const int sh = kh - j;  // global x = bx + lx + sh
+              const int lxlo = std::max(0, -(bx + sh));
+              const int lxhi = std::min(bw - 1, ww - 1 - (bx + sh));
+              const float* src = crow + bx + sh;
+#pragma omp simd
+              for (int lx = lxlo; lx <= lxhi; ++lx) orow[lx] += kc * src[lx];
+            }
+          }
+        }
 
         // Initialise the tile accumulator to S - b.
         for (int ly = 0; ly < bh; ++ly) {
@@ -342,23 +380,25 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           for (int lx = 0; lx < bw; ++lx) drow[lx] = s[off + lx] - bg[off + lx];
         }
 
-        // Fuse every component's y-pass + a_n accumulate over the tile. tx[nx]
-        // for the tile rows (+kh halo) is read once and reused across the (up to
-        // n_max+1) components that share nx.
+        // Fuse every component's y-pass + a_n accumulate over the tile, reading
+        // the tile-local x-passes (one per nx, shared across the components that
+        // use that nx).
         for (int n = 0; n < nc; ++n) {
-          const float* src = tx[orders[n].first].data();
+          const float* src = txt.data() +
+                             static_cast<std::size_t>(orders[n].first) * per_nx;
           const std::vector<float>& kyn = ky[n];
-          const int ks = static_cast<int>(kyn.size());
+          const int kys = static_cast<int>(kyn.size());
           const float* a = fields.coeff[n].get();
           for (int ly = 0; ly < bh; ++ly) {
             const int y = by + ly;
             std::fill(bn.begin(), bn.begin() + bw, 0.0f);
             const int jmin = std::max(0, y + kh - hh + 1);
-            const int jmax = std::min(ks - 1, y + kh);
+            const int jmax = std::min(kys - 1, y + kh);
             for (int j = jmin; j <= jmax; ++j) {
               const int sy = y + kh - j;
               const float c = kyn[j];
-              const float* srow = src + static_cast<std::size_t>(sy) * w + bx;
+              const float* srow =
+                  src + static_cast<std::size_t>(sy - hy0) * bw;
 #pragma omp simd
               for (int lx = 0; lx < bw; ++lx) bn[lx] += c * srow[lx];
             }

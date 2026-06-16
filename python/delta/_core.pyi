@@ -291,6 +291,7 @@ def decorrelate(
 def matched_filter(
     image: NDArray[np.float32],
     psf: NDArray[np.float32],
-    noise_var: float,
+    variance: NDArray[np.float32],
 ) -> NDArray[np.float32]:
-    """Match-filtered score image (per-pixel S/N map)."""
+    """Match-filtered score image (per-pixel S/N map). variance must be a
+    same-shape float32 image of per-pixel noise variance."""

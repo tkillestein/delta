@@ -111,10 +111,11 @@ def test_matched_filter_unit_variance_noise():
     rng = np.random.default_rng(3)
     noise_var = 2.3
     img = (np.sqrt(noise_var) * rng.standard_normal((n, n))).astype(np.float32)
+    var = np.full((n, n), noise_var, dtype=np.float32)
 
     _, kernels = delta.gauss_hermite_kernels(2.0, 0)
     psf = kernels[0]
-    score = delta.matched_filter(img, psf, noise_var)
+    score = delta.matched_filter(img, psf, var)
 
     # Source-free score is ~unit-variance Gaussian.
     np.testing.assert_allclose(score.std(), 1.0, rtol=0.05)
@@ -134,8 +135,28 @@ def test_matched_filter_recovers_source_snr():
     r = psf.shape[0] // 2
     cy = cx = n // 2
     img[cy - r : cy + r + 1, cx - r : cx + r + 1] += amp * psf
-    score = delta.matched_filter(img.astype(np.float32), psf.astype(np.float32), noise_var)
+    var = np.full((n, n), noise_var, dtype=np.float32)
+    score = delta.matched_filter(img.astype(np.float32), psf.astype(np.float32), var)
 
     expected_peak = amp * np.sqrt(sumpsf2 / noise_var)
     assert abs(score[cy, cx] - expected_peak) / expected_peak < 1e-3
     assert score.argmax() == cy * n + cx
+
+
+def test_matched_filter_spatially_varying_noise():
+    """Score is ~unit-Gaussian under spatially-varying noise."""
+    n = 256
+    rng = np.random.default_rng(7)
+
+    # Two-region variance map: left half 1.0, right half 4.0.
+    var = np.ones((n, n), dtype=np.float32)
+    var[:, n // 2 :] = 4.0
+    img = (np.sqrt(var) * rng.standard_normal((n, n))).astype(np.float32)
+
+    _, kernels = delta.gauss_hermite_kernels(2.0, 0)
+    psf = kernels[0]
+    score = delta.matched_filter(img, psf, var)
+
+    # Both halves should be ~unit-variance when normalised correctly.
+    np.testing.assert_allclose(score[:, : n // 2].std(), 1.0, rtol=0.07)
+    np.testing.assert_allclose(score[:, n // 2 :].std(), 1.0, rtol=0.07)

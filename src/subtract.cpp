@@ -22,47 +22,38 @@ Eigen::MatrixXd coeff_matrix(const Eigen::Ref<const Eigen::VectorXd>& theta,
   return Eigen::Map<const Eigen::MatrixXd>(theta.data(), k, n_fields);
 }
 
-// A copy of the reference with masked / non-finite pixels replaced by the image
-// median (the background level). Convolving the raw reference smears NaNs and the
-// spurious values under bad pixels across the kernel footprint, polluting B_n
-// within a kernel radius of any defect (SPEC §3.6). Filling with the *median*
+// Background fill level for masked / non-finite reference pixels: the median of
+// a strided sample of the good pixels. Convolving the raw reference smears NaNs
+// and the spurious values under bad pixels across the kernel footprint, polluting
+// B_n within a kernel radius of any defect (SPEC §3.6). Filling with the *median*
 // rather than zero matters at mask boundaries: a zero fill convolves a hard step
 // (0 vs background) and rings the model just outside every masked region, which
 // shows up as cruft around the masked template and the frame edge. Median fill
 // removes that step, so the model stays smooth right up to the (dilated-masked)
-// boundary. The median is estimated from a strided sample of the good pixels.
-ImageF sanitised_reference(const ImageF& reference) {
-  ImageF clean(reference.width(), reference.height());
+// boundary.
+//
+// Only the fill *scalar* is produced here; the substitution itself is fused into
+// the model-convolve tile gather (see below), so the sanitised reference never
+// materialises full-frame -- that copy was a 512 MB DRAM round-trip whose only
+// consumer was the convolution. The strided sample (stride 7, as before) leaves
+// the fill value, and hence the whole result, bit-for-bit identical to the
+// previous full-frame sanitised copy.
+float reference_fill_value(const ImageF& reference) {
   const std::size_t n = reference.size();
   const float* src = reference.data();
-  float* dst = clean.data();
   const bool has_mask = reference.has_mask();
   const MaskType* m = has_mask ? reference.mask().data() : nullptr;
 
-  // Background estimate: median of a strided sample of finite, unmasked pixels.
   std::vector<float> sample;
-  sample.reserve(n / 16 + 1);
+  sample.reserve(n / 7 + 1);
   for (std::size_t i = 0; i < n; i += 7) {
     const float v = src[i];
     if (std::isfinite(v) && !(has_mask && m[i] != kMaskGood)) sample.push_back(v);
   }
-  float fill = 0.0f;
-  if (!sample.empty()) {
-    std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
-                     sample.end());
-    fill = sample[sample.size() / 2];
-  }
-
-  // Left serial deliberately: the fill is well under memory-bandwidth saturation
-  // (the serial median sample above dominates this stage), and threading a
-  // freshly-allocated buffer's first-touch only adds concurrent page-fault
-  // contention -- measured net-slower than the single-threaded sweep.
-  for (std::size_t i = 0; i < n; ++i) {
-    const float v = src[i];
-    const bool bad = (has_mask && m[i] != kMaskGood) || !std::isfinite(v);
-    dst[i] = bad ? fill : v;
-  }
-  return clean;
+  if (sample.empty()) return 0.0f;
+  std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
+                   sample.end());
+  return sample[sample.size() / 2];
 }
 
 // Separable OR-dilation of a uint8 bitmask by Chebyshev radius r, in place.
@@ -447,10 +438,15 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     return build_coarse_fields(spatial, theta, nc, static_cast<int>(w),
                                static_cast<int>(h));
   }();
-  const ImageF clean = [&] {
+  // Reference sanitisation is fused into the model-convolve gather below; only
+  // the median fill scalar is computed up front (the full-frame substitution
+  // copy is gone -- see reference_fill_value).
+  const float ref_fill = [&] {
     DELTA_TIME("subtract: sanitise reference");
-    return sanitised_reference(reference);
+    return reference_fill_value(reference);
   }();
+  const bool ref_has_mask = reference.has_mask();
+  const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
   const int hh = static_cast<int>(h);
   const int ww = static_cast<int>(w);
 
@@ -470,7 +466,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     const int ks = basis.ksize();
     const int kh = (ks - 1) / 2;
 
-    const float* cl = clean.data();
+    const float* rd = reference.data();
     const float* s = science.data();
     const int bg_field = nc;  // background is field index nc in CoarseFields
 
@@ -485,9 +481,19 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     // covering the tile rows + kh y-halo, then fused in place: the x-pass stack
     // never touches DRAM (it stays in L2 and is consumed immediately by the
     // y-pass), trading the 1.3 GB write + repeated streaming reads for a ~1.17x
-    // halo re-convolution of `clean`. The per-pixel accumulation order (x taps
-    // 0..ks-1, then component order) is unchanged, so the result is bit-identical
-    // to the materialised-B_n version.
+    // halo re-convolution of the reference. The per-pixel accumulation order (x
+    // taps 0..ks-1, then component order) is unchanged, so the result is
+    // bit-identical to the materialised-B_n version.
+    //
+    // Reference sanitisation is fused in: each tile first gathers its haloed
+    // reference window (tile cols +/- kh, rows +/- kh) into a thread-local `rtile`
+    // buffer, substituting the median fill for masked / non-finite pixels and 0
+    // for off-frame columns. The x-pass then reads `rtile` with no per-tap bounds
+    // test (off-frame already zeroed) -- so the full-frame sanitised copy and its
+    // 512 MB DRAM round-trip are gone, and the gather largely replaces the read
+    // the x-pass already did from the reference. `rtile` matches the old `clean`
+    // bit-for-bit (good pixels are an exact float copy), keeping the result
+    // identical.
     //
     // 96x96 tiles measured fastest on a 14-thread Ultra 7 (vs 64/128/192): small
     // enough that the per-thread working set (x-pass stack + tile a_n/b/diff
@@ -500,6 +506,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       for (int bx = 0; bx < ww; bx += tw) tiles.emplace_back(bx, by);
 
     const int nrows_max = th + 2 * kh;
+    const int gbw_max = tw + 2 * kh;  // gathered reference window width
     const std::size_t per_nx_max = static_cast<std::size_t>(nrows_max) * tw;
 
 #pragma omp parallel
@@ -508,6 +515,8 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       std::vector<float> bn(tw);
       // Thread-local x-pass stack: (n_max+1) buffers of (bh+2kh) x bw rows.
       std::vector<float> txt(static_cast<std::size_t>(n_max + 1) * per_nx_max);
+      // Thread-local gathered + sanitised reference window: (bh+2kh) x (bw+2kh).
+      std::vector<float> rtile(static_cast<std::size_t>(nrows_max) * gbw_max);
       // Tile-local interpolated field buffers (one component's a_n; the background).
       std::vector<float> abuf(static_cast<std::size_t>(tw) * th);
       std::vector<float> bgbuf(static_cast<std::size_t>(tw) * th);
@@ -517,14 +526,43 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
         const int bw = std::min(tw, ww - bx);
         const int bh = std::min(th, hh - by);
         const int nrows = bh + 2 * kh;
-        const int hy0 = by - kh;  // global y of buffer row 0
+        const int gbw = bw + 2 * kh;  // gathered window width
+        const int hy0 = by - kh;      // global y of buffer row 0
+        const int gx0 = bx - kh;      // global x of gathered column 0
         const std::size_t per_nx = static_cast<std::size_t>(nrows) * bw;
 
+        // Gather the haloed reference window once, sanitising in place: masked /
+        // non-finite in-frame pixels take the median fill; off-frame columns take
+        // 0 (the zero-pad contract). Each pixel is read once per tile here instead
+        // of once per nx from the full frame.
+        for (int r = 0; r < nrows; ++r) {
+          float* rrow = rtile.data() + static_cast<std::size_t>(r) * gbw;
+          const int gy = hy0 + r;
+          if (gy < 0 || gy >= hh) {
+            std::fill(rrow, rrow + gbw, 0.0f);
+            continue;
+          }
+          const float* srow = rd + static_cast<std::size_t>(gy) * w;
+          const MaskType* mrow =
+              ref_has_mask ? ref_mask + static_cast<std::size_t>(gy) * w : nullptr;
+          for (int c = 0; c < gbw; ++c) {
+            const int gx = gx0 + c;
+            if (gx < 0 || gx >= ww) {
+              rrow[c] = 0.0f;
+              continue;
+            }
+            const float v = srow[gx];
+            const bool bad =
+                (mrow && mrow[gx] != kMaskGood) || !std::isfinite(v);
+            rrow[c] = bad ? ref_fill : v;
+          }
+        }
+
         // Tile-local separable x-pass for every nx over the tile rows + y-halo.
-        // Tap-outer accumulation in the same order as convolve_x; out-of-range
-        // source columns are skipped (the zero-pad contract). Rows whose global y
-        // is off-frame are never read by the y-pass (its jmin/jmax clamp), so they
-        // are just zeroed.
+        // Tap-outer accumulation in the same order as convolve_x, reading the
+        // pre-gathered (already zero-padded) window so no per-tap bounds test is
+        // needed. Rows whose global y is off-frame are never read by the y-pass
+        // (its jmin/jmax clamp), so they are just zeroed.
         for (int nx = 0; nx <= n_max; ++nx) {
           const std::vector<float>& kxn = kx[nx];
           float* base = txt.data() + static_cast<std::size_t>(nx) * per_nx;
@@ -533,15 +571,12 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
             std::fill(orow, orow + bw, 0.0f);
             const int gy = hy0 + r;
             if (gy < 0 || gy >= hh) continue;
-            const float* crow = cl + static_cast<std::size_t>(gy) * w;
+            const float* rrow = rtile.data() + static_cast<std::size_t>(r) * gbw;
             for (int j = 0; j < ks; ++j) {
               const float kc = kxn[j];
-              const int sh = kh - j;  // global x = bx + lx + sh
-              const int lxlo = std::max(0, -(bx + sh));
-              const int lxhi = std::min(bw - 1, ww - 1 - (bx + sh));
-              const float* src = crow + bx + sh;
+              const float* src = rrow + (2 * kh - j);  // col = lx + (2kh - j)
 #pragma omp simd
-              for (int lx = lxlo; lx <= lxhi; ++lx) orow[lx] += kc * src[lx];
+              for (int lx = 0; lx < bw; ++lx) orow[lx] += kc * src[lx];
             }
           }
         }

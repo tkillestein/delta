@@ -68,9 +68,10 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
   for (int y = 0; y < height; ++y) {
     float* drow = dst + static_cast<std::size_t>(y) * width;
     for (int x = 0; x < width; ++x) drow[x] = 0.0f;
-    for (int j = 0; j < ks; ++j) {
+    const int jmin = std::max(0, y + h - height + 1);
+    const int jmax = std::min(ks - 1, y + h);
+    for (int j = jmin; j <= jmax; ++j) {
       const int sy = y + h - j;
-      if (sy < 0 || sy >= height) continue;
       const float kc = k[j];
       const float* srow = src + static_cast<std::size_t>(sy) * width;
 #pragma omp simd

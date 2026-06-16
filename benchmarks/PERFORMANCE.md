@@ -45,41 +45,64 @@ parallel region) and let the per-process min absorb the thermal drift::
 
 The headline is host-specific (treat the *shape* of the breakdown, not the absolute
 seconds, as the durable signal). Captured on a 14-core machine, 8000×6000 frame
-(48 Mpix), 1200 stars, decorrelation + score on, with `DELTA_TIMING=1` for the
-indented C++ sub-stage splits:
+(48 Mpix), 1200 stars, decorrelation + score on, warm min-of-7 (`--reps 7`), with
+`DELTA_TIMING=1` for the indented C++ sub-stage splits:
 
 | stage                              | time (s) | share |
 |------------------------------------|---------:|------:|
-| stamp selection                    |     2.16 | 13.8% |
-| kernel solve                       |     4.24 | 27.0% |
-| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.19 |  1.2% |
-| &nbsp;&nbsp;↳ GLS solve            |     3.62 | 23.1% |
-| full-frame subtraction             |     6.68 | 42.5% |
-| &nbsp;&nbsp;↳ spatial fields       |     2.72 | 17.3% |
-| &nbsp;&nbsp;↳ model convolve       |     2.26 | 14.4% |
-| &nbsp;&nbsp;↳ variance propagation |     0.47 |  3.0% |
-| noise decorrelation                |     1.41 |  9.0% |
-| matched-filter score               |     0.87 |  5.5% |
-| orchestration                      |     0.34 |  2.2% |
-| **total**                          |**15.70** |  100% |
+| stamp selection                    |     0.39 |  7.6% |
+| kernel solve                       |     1.17 | 22.7% |
+| &nbsp;&nbsp;↳ stamp `B_n` convolve |     0.09 |  1.7% |
+| &nbsp;&nbsp;↳ GLS solve            |     0.55 | 10.7% |
+| full-frame subtraction             |     1.49 | 28.9% |
+| &nbsp;&nbsp;↳ spatial fields       |     0.00 |  0.0% |
+| &nbsp;&nbsp;↳ sanitise reference   |     0.10 |  1.9% |
+| &nbsp;&nbsp;↳ model convolve       |     0.60 | 11.6% |
+| &nbsp;&nbsp;↳ variance propagation |     0.21 |  4.0% |
+| noise decorrelation                |     1.30 | 25.3% |
+| matched-filter score               |     0.56 | 10.8% |
+| orchestration                      |     0.25 |  4.8% |
+| **wall**                           | **5.15** |  100% |
 
-These numbers are *post* the GLS-solve and variance-propagation optimisations (issues
-#17 and #18); the convolution-path (#19) and spatial-field coarse-grid (#16) wins are
-folded in. Re-captured on this host, the pre-#17/#18 baseline was **21.33 s** (the
-absolute seconds are host-specific — an earlier capture on a different 14-core machine
-read 19.70 s for the same pre-#17/#18 code; treat the *ratios* as durable). The two tall
-poles it called out are now markedly cheaper: **GLS solve 5.26→3.62 s** (#17) and
-**variance propagation 4.46→0.47 s** (#18), dropping the total 21.33→15.70 s (−26%) and
-flipping `full-frame subtraction` from 50% to ~42% of wall time.
+(Per-stage figures are each an independent warm min, so they need not sum to the min
+wall — the floor each stage has to beat is what a regression is measured against. The
+sub-stage splits also do not fully account for their parent: `kernel solve` carries
+~0.5 s of Python-side stamp prep + CV orchestration outside the two C++ timers, and
+`full-frame subtraction` carries mask growth + difference assembly.)
+
+This is *post* the full optimisation arc — spatial-field coarse grid (#16), GLS solve
+(#17), variance propagation (#18), convolution-path cache-blocking (#19) — **and** the
+later round folded in on this branch. Treat the *shape*, not the absolute seconds, as
+durable (an earlier capture of the pre-#17/#18 code on this class of host read ~21 s;
+the ratios are the signal). The later round, all bit-identical or validated within
+tolerance:
+
+- **`spatial fields` → ~0 and `model convolve` 2.26→0.60 s**: the coefficient fields are
+  no longer materialised full-frame — they are interpolated tile-local *inside* the
+  model convolve, and the separable x-pass is streamed per tile rather than staged to
+  DRAM (issue #32). The separate `spatial fields` stage is now effectively free.
+- **`noise decorrelation` 1.41→1.30 s**: per-cell kernel-power cache (one kernel FFT per
+  coarse cell) + subsampled block-noise median, after the overlap-add blend was
+  de-serialised (#28).
+- **`sanitise reference` fused** into the model-convolve gather (the full-frame median-
+  filled copy — a 512 MB round-trip — is gone; only the fill scalar is computed up front).
+- **`matched-filter score` 0.87→0.56 s**: the dense PSF correlation reordered to
+  output-row-outer so the accumulator stays L1-resident (it was L1-bandwidth bound, not
+  tap bound — a separable PSF was tried and ran *slower*).
+- **orchestration** trimmed: the redundant full-frame difference copy/`astype` removed
+  and the rms log made lazy (the silent-by-default library no longer computes a 48 Mpix
+  `np.std` for a message no sink emits).
 
 Two findings fall straight out of the splits:
 
-- **No single tall pole remains**: the largest sub-stages — `GLS solve` (~23%),
-  `spatial fields` (~17%), and `model convolve` (~14%) — are now within ~1.6× of each
-  other, so further wins must spread across them rather than chase one. `variance
-  propagation`, the previous #2 at ~23%, has collapsed to ~3% (#18); `spatial fields`
-  (#16) and the convolution paths (#19) were cut earlier.
-- **`B_n` precompute is negligible (~1.2%)** because the fit convolves only the stamp
+- **`noise decorrelation` is now the single tallest stage (~25%)**, ahead of `model
+  convolve` (~12%), `matched-filter score` (~11%), and `GLS solve` (~11%) — which are
+  themselves within ~1.1× of each other. The FFT is genuine (the ZOGY filter is
+  non-compact in Fourier space) so it stays; further decorrelation wins need
+  approximation, and the cheap structural levers across the other stages are largely
+  spent. `variance propagation` (~4%) and `spatial fields` (~0%) have collapsed from
+  their former top-two status.
+- **`B_n` precompute is negligible (~1.7%)** because the fit convolves only the stamp
   windows, not the whole frame — so the kernel solve is essentially all *solve*
   (the λ-grid × CV-fold factorisations), not convolution.
 
@@ -88,26 +111,27 @@ count and the λ-grid × CV-fold solve count, independent of frame area), so on 
 frames it dominates (~62% at 2048²), while on the reference frame the
 **area-proportional `full-frame subtraction` dominates at ~42%**.
 
-## Thread scaling (4096², no warm-up)
+## Thread scaling (4096², warm min-of-5)
 
-Same 14-core host, 4096×4096 (16.8 Mpix), 419 stars, no warm-up:
+Same 14-core host, 4096×4096 (16.8 Mpix), 419 stars, warm min-of-5 (`--reps 5`):
 
 | threads | wall (s) | speedup | efficiency |
 |--------:|---------:|--------:|-----------:|
-|       1 |    20.83 |   1.00x |       100% |
-|       2 |    14.54 |   1.43x |        72% |
-|       4 |    12.97 |   1.61x |        40% |
-|       8 |    12.31 |   1.69x |        21% |
-|      14 |    12.29 |   1.69x |        12% |
+|       1 |     4.74 |   1.00x |       100% |
+|       2 |     3.14 |   1.51x |        76% |
+|       4 |     2.67 |   1.78x |        44% |
+|       8 |     2.23 |   2.13x |        27% |
+|      14 |     2.43 |   1.95x |        14% |
 
-Scaling is far from ideal: it saturates at ~1.7× by 4 threads and barely moves after.
-The cap is **memory bandwidth, not a serial section**: at this frame size the
+Scaling is far from ideal: it climbs to ~2.1× by 8 threads, then *regresses* at 14 as
+the extra cores contend for the bus (and oversubscribe alongside the FFTW/Eigen thread
+teams). The cap is **memory bandwidth, not a serial section**: at this frame size the
 full-frame convolution/subtract passes (SPEC §5: *threaded over rows/tiles purely for
-parallelism*) are bandwidth-bound, so beyond ~4 threads extra cores contend for the
+parallelism*) are bandwidth-bound, so beyond ~4–8 threads extra cores contend for the
 same bus rather than adding throughput. The headline lever is therefore **per-core
-efficiency (SIMD/cache), not more threads** — acted on in issue #19 (cache-blocking the
-convolutions): the single-thread baseline dropped 23.25→20.83 s while the scaling
-*shape* is unchanged.
+efficiency (SIMD/cache), not more threads** — the cache-blocking and tile-local fusion
+across the convolution/score paths (#19, #32) cut the single-thread baseline hard while
+leaving the scaling *shape* bandwidth-limited.
 
 Note this is a *wall-time* ceiling on the area-proportional passes, **not** evidence
 that any one stage is serial. The GLS solve in particular — long mis-read as serial
@@ -134,23 +158,24 @@ Ordered by the share each lever had *when first identified* (completed ones are 
 marked **DONE**, for the history). Each big lever has a tracking GitHub issue (search
 the repo issues for "perf:").
 
-### `subtract: spatial fields` — ~13%, was ~27% (`src/subtract.cpp`, `evaluate_fields`) — **DONE (issue #16)**
+### `subtract: spatial fields` — ~0%, was ~27% (`src/subtract.cpp`, `evaluate_fields`) — **DONE (issues #16, #32)**
 Was the single biggest lever, and a surprise — coefficient-field evaluation, not
 convolution: `evaluate_fields` rebuilt the thin-plate-spline design matrix
 `spatial.design(points)` for *every frame row* (~6000× over identical structure), an
-`h·w·k` count of `log()` evaluations. Fixed by **coarse-grid evaluation +
+`h·w·k` count of `log()` evaluations. First fixed (#16) by **coarse-grid evaluation +
 bilinear interpolation**: the fields `aₙ(x,y)` vary on the knot length-scale (≫ a
-pixel), so they are now evaluated exactly on a coarse lattice and bilinearly
-interpolated to full resolution. The stride is chosen adaptively from the smallest knot
-spacing (`ThinPlateBasis::min_knot_spacing()`, ~16 samples per knot interval, capped at
-64 px), so the relative error stays well below 1e-3; small frames fall back to the exact
-per-pixel path (bit-for-bit). This cut the stage 6.21→2.51 s (~2.5×). What remains is
-the memory-bound interpolation + full-frame field materialisation (the downstream model
-convolve reads `aₙ` per pixel), not the RBF/`log` cost — a further win would need to
-fuse field evaluation into the convolve so the full-resolution fields are never
-materialised.
+pixel), so they are evaluated exactly on a coarse lattice and bilinearly interpolated to
+full resolution (stride chosen adaptively from `ThinPlateBasis::min_knot_spacing()`, ~16
+samples per knot interval, capped at 64 px, keeping the relative error well below 1e-3;
+small frames fall back to the exact per-pixel path, bit-for-bit). That cut it 6.21→2.51 s.
+The remaining materialisation cost was then **eliminated (#32)** by fusing the field
+interpolation *into* the model convolve: the coarse lattice (`CoarseFields`) is
+interpolated tile-local inside the convolution loop (point-sampled in variance prop), so
+the full-resolution `aₙ`/background are never written to DRAM. The separate stage is now
+effectively free (~0 s); its former cost moved into — and is hidden by — the model
+convolve, which dropped overall (below).
 
-### `kernel solve` (GLS) — ~18%, was ~24% (and dominant on small frames) (`src/solve.cpp`, `src/fit.cpp`) — **DONE (issue #17)**
+### `kernel solve` (GLS) — ~11%, was ~24% (and dominant on small frames) (`src/solve.cpp`, `src/fit.cpp`) — **DONE (issue #17)**
 ~All *solve* (`B_n` precompute is ~1.0%). Builds `M = XᵀWX` (threaded symmetric
 `rankUpdate` over row chunks) and solves it across the **λ-grid × CV-fold** grid:
 `np.logspace(-6, 6, 25)` × `cv_folds=5` ⇒ up to ~125 factorise/solve passes of the
@@ -219,35 +244,59 @@ near sources sees less, but the sky tiles that dominate a survey frame still get
 - Remaining lever: **adaptive tile size** where the kernel itself is near-constant, and
   **fusing with the model-convolve pass** (same neighbourhoods, read once).
 
-### `subtract: model convolve` — ~10% (`src/subtract.cpp`, `src/convolve.cpp`)
-The separable model convolution, now **2D-tiled and fully fused** (issue #19): the
-per-component loop runs *inside* a 128×128 tile loop, so a tile-local difference
-accumulator plus the shared x-passes for the tile's rows stay in L2 while every
-component is swept. The earlier version looped components on the outside with a
-full-frame y-pass each, read-modify-writing the whole `diff` `nc`(=28)× and re-reading
-each `tx[nx]` from DRAM per component — memory-bandwidth bound. Per-pixel accumulation
-order is unchanged, so the result is bit-identical. Remaining levers: **fusing with the
-variance pass** (same neighbourhoods, read once) and wider SIMD.
+### `subtract: model convolve` — ~12%, was ~14% (`src/subtract.cpp`, `src/convolve.cpp`) — **DONE (issues #19, #32)**
+The separable model convolution, **2D-tiled and fully fused** (#19): the per-component
+loop runs *inside* a 96×96 tile loop, so a tile-local difference accumulator plus the
+shared x-passes for the tile's rows stay in L2 while every component is swept. The
+earlier version looped components on the outside with a full-frame y-pass each,
+read-modify-writing the whole `diff` `nc`(=28)× and re-reading each `tx[nx]` from DRAM
+per component — memory-bandwidth bound. **#32** then removed the two remaining DRAM
+round-trips: the separable x-pass is computed *per tile* into a thread-local buffer
+(never staged full-frame, ~1.3 GB saved) and the coefficient fields are interpolated
+tile-local (the `spatial fields` ~5.4 GB materialisation, above). The **reference
+sanitisation is also fused in** (its own stage below): each tile gathers its haloed
+reference window with the median fill applied in place, so the convolution reads it with
+no per-tap bounds test and the full-frame sanitised copy never materialises. Per-pixel
+accumulation order is unchanged throughout, so the result stays bit-identical. y-pass
+micro-opts (register-blocking, tap-reorder) are duds — compute/L1-bound at a local
+optimum. Remaining lever: **fusing with the variance pass** (same neighbourhoods).
 
-### `noise decorrelation` — ~5% (`src/noise.cpp`)
+### `subtract: sanitise reference` — ~2% (`src/subtract.cpp`) — **DONE (fused)**
+Masked / non-finite reference pixels are replaced by the median background before the
+convolution (a zero fill would ring the model at every mask boundary; SPEC §3.6). This
+used to materialise a full-frame sanitised *copy* (256 MB write + 256 MB read) whose only
+consumer was the model convolve. Now only the median fill **scalar** is computed up front
+(stride-7 sample → bit-identical fill) and the substitution is fused into the model-
+convolve tile gather. What remains in the stage is just the serial median sample;
+coarsening its stride would speed it further but changes the fill value, so it is kept at
+7 to preserve bit-identity.
+
+### `noise decorrelation` — ~25% (now the tallest stage) (`src/noise.cpp`)
 Apodised FFT blocks (FFTW, per-thread reused plans, threaded over blocks). The FFT is
 genuine (the ZOGY decorrelation filter is non-compact in Fourier space), so it stays.
-The recent win (issue #19) was in the *blend*, not the FFT: the overlap-add Hann window
-is precomputed once (it was evaluating two `std::cos` per pixel of every overlapping
-block, ~370M calls) and the weight normalisation is computed as a **separable outer
-product** rather than accumulating a `w·h` weight image in the serialised critical
-section. Remaining levers: sweep `block` size (default 256); it is optional
+Wins so far: the overlap-add *blend* was de-serialised via a 9-colour lock-free scheme
+and the Hann window precomputed (#28); then a **per-cell kernel-power cache** — `|K̂|²`
+and `ΣK²` depend only on the matching kernel, which varies on the knot scale ≫ the block
+stride, so they are cached one kernel FFT per coarse cell (auto-sized from knot spacing)
+and reused across the cell's blocks, dropping one of the three FFTs per block — plus a
+**subsampled block-noise median** (`block_variance` ran an `nth_element` over 65 k floats
+twice per block; now ~4 k samples). Validated within tolerance against the exact
+per-block path (`kernel_cell_blocks=1`). As the now-tallest stage with the FFT
+irreducible, further wins need a coarser approximation; it is optional
 (`decorrelate=False`).
 
-### `matched-filter score` — ~3% (`src/noise.cpp`)
-A PSF correlation of the (decorrelated) difference, now **cache-blocked** (issue #19):
-each tile gathers its haloed input window once into a contiguous buffer (kept hot in
-L1/L2 across the `ks²` taps) and applies the PSF taps as unit-stride `#pragma omp simd`
-multiply-adds — mirroring the variance pass. The earlier output-outer/kernel-inner loop
-re-read a full `ks²` window per output pixel straight off the strided frame. Also
-optional (`score=False`).
+### `matched-filter score` — ~11% (`src/noise.cpp`) — **DONE (reorder)**
+A dense PSF correlation of the (decorrelated) difference. Each tile gathers its haloed
+input window once into a contiguous L1/L2-hot buffer (#19). The hot loop is now
+**output-row-outer** (`oy, ly, lx, ox`): a single output row's accumulator stays
+L1/register-resident while all `ks²` taps reduce into it, and each tap reads only the
+`ks` window rows directly above the row. The earlier tap-outer order swept the whole tile
+per tap, so the accumulator and haloed window together overran L1 and the window
+thrashed — the stage was **L1-bandwidth bound, not tap bound** (a separable low-rank PSF
+was tried and ran *slower* for exactly this reason, and is not worth the approximation).
+Same per-pixel `(ly,lx)` sum order → bit-identical. Also optional (`score=False`).
 
-### `stamp selection` — ~5% (`src/detect.cpp`)
+### `stamp selection` — ~8% (`src/detect.cpp`)
 Smallest share; a full-frame threshold/FWHM scan. Low priority on wall time, but its
 *absolute* time was observed to rise slightly with thread count in small-frame sweeps,
 which would make it a relative serial bottleneck once the convolutions are sped up —

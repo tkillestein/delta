@@ -81,15 +81,15 @@ def _default_beta(fwhm_a: float, fwhm_b: float) -> float:
         return 2.0
     broad, narrow = max(fwhms), min(fwhms)
     sig_broad = broad * _FWHM_TO_SIGMA
-    # Width of the broadening kernel sqrt(sig_broad^2 - sig_narrow^2).
+    # Width of the Gaussian broadening kernel: K ≈ Gaussian(k_sigma).
     diff = sig_broad**2 - (narrow * _FWHM_TO_SIGMA) ** 2
     k_sigma = np.sqrt(diff) if diff > 0 else 0.0
-    # Tie the basis scale to the PSF, not to the (possibly tiny) broadening
-    # kernel: the Gauss-Hermite basis must represent the matching kernel even
-    # for an already well-matched pair, so scale beta with the broad PSF sigma.
-    # The broadening width is a lower bound for a badly mismatched pair; the
-    # 1.0 floor only guards a critically undersampled PSF.
-    return float(max(k_sigma, 0.6 * sig_broad, 1.0))
+    # Real PSFs share wing structure that largely cancels in the matching kernel,
+    # making the effective kernel narrower than the Gaussian model predicts.
+    # Empirically, 0.8 × k_sigma captures the matching kernel scale better than
+    # k_sigma itself on realistic ground-based data. The 0.5 px floor prevents
+    # degenerate footprints for nearly-matched or undersampled PSF pairs.
+    return float(max(0.8 * k_sigma, 0.5))
 
 
 def _estimate_psf(image: NDArray[np.float32], xs, ys, radius: int) -> NDArray[np.float32]:

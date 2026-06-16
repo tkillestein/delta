@@ -415,19 +415,31 @@ class Subtractor:
                 reference_mask=cmask,
             )
         _log_core_timings(diff.get("timing"))
-        difference = (sign * diff["difference"]).astype(np.float32)
+        # diff["difference"] is already a fresh float32 array owned by this
+        # result; the sign flip (transients-positive convention) is the only
+        # transform needed. Negate in place when flipping and alias otherwise --
+        # the old `(sign * arr).astype(float32)` allocated a full-frame temporary
+        # and re-cast an already-float32 array on every call (and copied for free
+        # when sign == +1).
+        difference = diff["difference"]
+        if sign < 0:
+            np.negative(difference, out=difference)
         variance = diff["variance"]
         mask = diff["mask"]
+        # rms / masked-fraction are log-only and span the full frame (np.std over
+        # 64 Mpix is ~0.4s); evaluate them lazily so the silent-by-default library
+        # never pays for a message no sink will emit.
         if mask is not None:
-            n_bad = int(np.count_nonzero(mask))
-            logger.info(
-                "difference: rms={:.4g}, {} masked px ({:.2f}%)",
-                float(np.std(difference)),
-                n_bad,
-                100.0 * n_bad / difference.size,
+            logger.opt(lazy=True).info(
+                "difference: rms={rms:.4g}, {n} masked px ({pct:.2f}%)",
+                rms=lambda: float(np.std(difference)),
+                n=lambda: int(np.count_nonzero(mask)),
+                pct=lambda: 100.0 * int(np.count_nonzero(mask)) / difference.size,
             )
         else:
-            logger.info("difference: rms={:.4g}", float(np.std(difference)))
+            logger.opt(lazy=True).info(
+                "difference: rms={rms:.4g}", rms=lambda: float(np.std(difference))
+            )
 
         whitened = difference
         if self.decorrelate:

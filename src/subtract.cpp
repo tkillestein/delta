@@ -155,6 +155,166 @@ std::vector<int> coarse_coords(int len, int stride) {
   return g;
 }
 
+// Coarse-lattice field representation for the *subtraction* path: the thin-plate
+// fields are evaluated exactly on a coarse lattice (or full-frame for small frames)
+// and bilinearly interpolated to full resolution lazily, one tile at a time, inside
+// the model-convolve loop. This avoids materialising the ~nc full-frame coefficient
+// arrays (~5.4 GB at the reference frame) and the DRAM round-trip of writing them in
+// a separate pass and streaming them back during the convolution -- the tile-local
+// interpolation stays in cache. The interpolation formula is identical to the
+// full-frame materialisation in evaluate_fields(), so the result is bit-identical to
+// the previously-materialised path (and exact, for the small-frame fallback).
+struct CoarseFields {
+  bool exact = false;
+  int n_components = 0;
+  int w = 0, h = 0;
+
+  // Exact (small-frame) fallback: full-resolution fields.
+  SpatialFields full;
+
+  // Coarse path: coarse[(f*ncy+iy)*ncx+ix], f in [0, n_components] (n_components is
+  // the background), plus the per-axis bracketing cell index + fractional weight.
+  std::vector<double> coarse;
+  int ncx = 0, ncy = 0;
+  std::vector<int> gx;      // ncx coarse x coordinates
+  std::vector<int> cellx;   // w:  bracketing coarse x cell
+  std::vector<float> wx;    // w:  fractional x weight within that cell
+  std::vector<int> celly;   // h:  bracketing coarse y cell
+  std::vector<float> wy;    // h:  fractional y weight within that cell
+
+  // Interpolated value of field f at integer (x,y); f == n_components is the
+  // background. Matches the coarse-cell bilinear blend used by fill_tile().
+  float point(int f, int x, int y) const {
+    if (exact) {
+      const float* a =
+          (f < n_components ? full.coeff[f].get() : full.background.get());
+      return a[static_cast<std::size_t>(y) * w + x];
+    }
+    const int jx = cellx[x], jy = celly[y];
+    const double* c0 = coarse.data() + (static_cast<std::size_t>(f) * ncy + jy) * ncx;
+    const double* c1 = c0 + ncx;
+    const float a00 = static_cast<float>(c0[jx]);
+    const float a01 = static_cast<float>(c0[jx + 1]);
+    const float a10 = static_cast<float>(c1[jx]);
+    const float a11 = static_cast<float>(c1[jx + 1]);
+    const float fy = wy[y];
+    const float base = a00 + (a10 - a00) * fy;
+    const float top_slope = a01 - a00;
+    const float slope = top_slope + ((a11 - a10) - top_slope) * fy;
+    return base + slope * wx[x];
+  }
+
+  // Interpolate field f over a (bh x bw, row stride bw) tile at origin (bx,by) into
+  // dst. Within a coarse cell the bilinear value is affine in x, so each cell reduces
+  // to a unit-stride FMA ramp `base + slope*wx[x]` over the precomputed x-weight --
+  // the same per-cell ramp evaluate_fields() uses for full-frame materialisation.
+  void fill_tile(int f, int bx, int by, int bw, int bh, float* dst) const {
+    if (exact) {
+      const float* a =
+          (f < n_components ? full.coeff[f].get() : full.background.get());
+      for (int ly = 0; ly < bh; ++ly) {
+        const float* src = a + static_cast<std::size_t>(by + ly) * w + bx;
+        std::copy(src, src + bw, dst + static_cast<std::size_t>(ly) * bw);
+      }
+      return;
+    }
+    for (int ly = 0; ly < bh; ++ly) {
+      const int y = by + ly;
+      const int jy = celly[y];
+      const float fy = wy[y];
+      const double* c0row =
+          coarse.data() + (static_cast<std::size_t>(f) * ncy + jy) * ncx;
+      const double* c1row = c0row + ncx;
+      float* drow = dst + static_cast<std::size_t>(ly) * bw;
+      const int xend = bx + bw;
+      for (int ix = cellx[bx]; ix <= ncx - 2; ++ix) {
+        const int xa = std::max(bx, gx[ix]);
+        if (xa >= xend) break;
+        const int xb_cell = (ix == ncx - 2) ? w : gx[ix + 1];
+        const int xb = std::min(xend, xb_cell);
+        const float a00 = static_cast<float>(c0row[ix]);
+        const float a01 = static_cast<float>(c0row[ix + 1]);
+        const float a10 = static_cast<float>(c1row[ix]);
+        const float a11 = static_cast<float>(c1row[ix + 1]);
+        const float base = a00 + (a10 - a00) * fy;
+        const float top_slope = a01 - a00;
+        const float slope = top_slope + ((a11 - a10) - top_slope) * fy;
+#pragma omp simd
+        for (int x = xa; x < xb; ++x) drow[x - bx] = base + slope * wx[x];
+        if (xb >= xend) break;
+      }
+    }
+  }
+};
+
+// Build the coarse-lattice (or exact, for small frames) field representation used by
+// subtract(). Mirrors evaluate_fields()'s stride choice and coarse evaluation, but
+// keeps the lattice rather than materialising the full-frame fields.
+CoarseFields build_coarse_fields(const ThinPlateBasis& spatial,
+                                 const Eigen::Ref<const Eigen::VectorXd>& theta,
+                                 int n_components, int w, int h) {
+  const int k = spatial.n_basis();
+  const int n_fields = n_components + 1;
+  const Eigen::MatrixXd c = coeff_matrix(theta, k, n_fields);
+
+  CoarseFields cf;
+  cf.n_components = n_components;
+  cf.w = w;
+  cf.h = h;
+
+  const int stride = choose_field_stride(spatial);
+  if (stride < kMinFieldStride || w <= 2 * stride || h <= 2 * stride) {
+    cf.exact = true;
+    const std::size_t npix = static_cast<std::size_t>(w) * h;
+    cf.full.coeff.resize(n_components);
+    for (int n = 0; n < n_components; ++n)
+      cf.full.coeff[n] = std::unique_ptr<float[]>(new float[npix]);
+    cf.full.background = std::unique_ptr<float[]>(new float[npix]);
+    evaluate_fields_exact(spatial, c, n_components, w, h, cf.full);
+    return cf;
+  }
+
+  cf.gx = coarse_coords(w, stride);
+  const std::vector<int> gy = coarse_coords(h, stride);
+  cf.ncx = static_cast<int>(cf.gx.size());
+  cf.ncy = static_cast<int>(gy.size());
+  const int ncx = cf.ncx, ncy = cf.ncy;
+
+  cf.coarse.assign(static_cast<std::size_t>(n_fields) * ncy * ncx, 0.0);
+#pragma omp parallel for schedule(static)
+  for (int iy = 0; iy < ncy; ++iy) {
+    Eigen::MatrixXd points(ncx, 2);
+    for (int ix = 0; ix < ncx; ++ix) {
+      points(ix, 0) = static_cast<double>(cf.gx[ix]);
+      points(ix, 1) = static_cast<double>(gy[iy]);
+    }
+    const Eigen::MatrixXd fields = spatial.design(points) * c;
+    for (int f = 0; f < n_fields; ++f) {
+      double* dst =
+          cf.coarse.data() + (static_cast<std::size_t>(f) * ncy + iy) * ncx;
+      for (int ix = 0; ix < ncx; ++ix) dst[ix] = fields(ix, f);
+    }
+  }
+
+  cf.wx.resize(w);
+  cf.cellx.resize(w);
+  for (int x = 0; x < w; ++x) {
+    const int c0 = std::min(x / stride, ncx - 2);
+    const int x0 = cf.gx[c0], x1 = cf.gx[c0 + 1];
+    cf.cellx[x] = c0;
+    cf.wx[x] = x1 > x0 ? static_cast<float>(x - x0) / (x1 - x0) : 0.0f;
+  }
+  cf.wy.resize(h);
+  cf.celly.resize(h);
+  for (int y = 0; y < h; ++y) {
+    const int c0 = std::min(y / stride, ncy - 2);
+    const int y0 = gy[c0], y1 = gy[c0 + 1];
+    cf.celly[y] = c0;
+    cf.wy[y] = y1 > y0 ? static_cast<float>(y - y0) / (y1 - y0) : 0.0f;
+  }
+  return cf;
+}
+
 }  // namespace
 
 SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
@@ -278,9 +438,14 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
   // D = S - b - sum_n a_n (phi_n (x) R)   (SPEC §3.2). The reference is sanitised
   // first so masked/non-finite pixels do not bleed into the model.
   const int nc = basis.component_count();
-  const SpatialFields fields = [&] {
+  // Coarse field lattice: a_n(x,y) and b(x,y) are interpolated lazily, tile-local,
+  // inside the model-convolve loop (and point-sampled in variance prop) rather than
+  // materialised full-frame -- see CoarseFields. This drops the ~5.4 GB full-frame
+  // coefficient write + the matching streamed read during the convolution.
+  const CoarseFields fields = [&] {
     DELTA_TIME("subtract: spatial fields");
-    return evaluate_fields(spatial, theta, nc, w, h);
+    return build_coarse_fields(spatial, theta, nc, static_cast<int>(w),
+                               static_cast<int>(h));
   }();
   const ImageF clean = [&] {
     DELTA_TIME("subtract: sanitise reference");
@@ -307,7 +472,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
 
     const float* cl = clean.data();
     const float* s = science.data();
-    const float* bg = fields.background.get();
+    const int bg_field = nc;  // background is field index nc in CoarseFields
 
     // Cache-blocked, fully fused model convolve. The earlier version looped
     // components on the outside and ran a full-frame y-pass each, so the running
@@ -323,8 +488,13 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     // halo re-convolution of `clean`. The per-pixel accumulation order (x taps
     // 0..ks-1, then component order) is unchanged, so the result is bit-identical
     // to the materialised-B_n version.
-    constexpr int tw = 128;
-    constexpr int th = 128;
+    //
+    // 96x96 tiles measured fastest on a 14-thread Ultra 7 (vs 64/128/192): small
+    // enough that the per-thread working set (x-pass stack + tile a_n/b/diff
+    // buffers) stays L2-resident, large enough that the kh y-halo re-convolution
+    // overhead (2*kh/th) stays modest.
+    constexpr int tw = 96;
+    constexpr int th = 96;
     std::vector<std::pair<int, int>> tiles;
     for (int by = 0; by < hh; by += th)
       for (int bx = 0; bx < ww; bx += tw) tiles.emplace_back(bx, by);
@@ -338,6 +508,9 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       std::vector<float> bn(tw);
       // Thread-local x-pass stack: (n_max+1) buffers of (bh+2kh) x bw rows.
       std::vector<float> txt(static_cast<std::size_t>(n_max + 1) * per_nx_max);
+      // Tile-local interpolated field buffers (one component's a_n; the background).
+      std::vector<float> abuf(static_cast<std::size_t>(tw) * th);
+      std::vector<float> bgbuf(static_cast<std::size_t>(tw) * th);
 #pragma omp for schedule(dynamic)
       for (std::size_t ti = 0; ti < tiles.size(); ++ti) {
         const int bx = tiles[ti].first, by = tiles[ti].second;
@@ -373,22 +546,24 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           }
         }
 
-        // Initialise the tile accumulator to S - b.
+        // Initialise the tile accumulator to S - b, interpolating b tile-local.
+        fields.fill_tile(bg_field, bx, by, bw, bh, bgbuf.data());
         for (int ly = 0; ly < bh; ++ly) {
           const std::size_t off = static_cast<std::size_t>(by + ly) * w + bx;
+          const float* brow = bgbuf.data() + static_cast<std::size_t>(ly) * bw;
           float* drow = dtile.data() + static_cast<std::size_t>(ly) * bw;
-          for (int lx = 0; lx < bw; ++lx) drow[lx] = s[off + lx] - bg[off + lx];
+          for (int lx = 0; lx < bw; ++lx) drow[lx] = s[off + lx] - brow[lx];
         }
 
         // Fuse every component's y-pass + a_n accumulate over the tile, reading
         // the tile-local x-passes (one per nx, shared across the components that
-        // use that nx).
+        // use that nx) and the tile-local interpolated a_n field.
         for (int n = 0; n < nc; ++n) {
           const float* src = txt.data() +
                              static_cast<std::size_t>(orders[n].first) * per_nx;
           const std::vector<float>& kyn = ky[n];
           const int kys = static_cast<int>(kyn.size());
-          const float* a = fields.coeff[n].get();
+          fields.fill_tile(n, bx, by, bw, bh, abuf.data());
           for (int ly = 0; ly < bh; ++ly) {
             const int y = by + ly;
             std::fill(bn.begin(), bn.begin() + bw, 0.0f);
@@ -402,7 +577,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
 #pragma omp simd
               for (int lx = 0; lx < bw; ++lx) bn[lx] += c * srow[lx];
             }
-            const float* arow = a + static_cast<std::size_t>(y) * w + bx;
+            const float* arow = abuf.data() + static_cast<std::size_t>(ly) * bw;
             float* drow = dtile.data() + static_cast<std::size_t>(ly) * bw;
 #pragma omp simd
             for (int lx = 0; lx < bw; ++lx) drow[lx] -= arow[lx] * bn[lx];
@@ -472,16 +647,15 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           const int bx = blocks[bi].first, by = blocks[bi].second;
           const int bw = std::min(bsz, ww - bx);
           const int bh = std::min(bsz, hh - by);
-          const std::size_t cidx =
-              static_cast<std::size_t>(std::min(by + bh / 2, hh - 1)) * w +
-              std::min(bx + bw / 2, ww - 1);
+          const int cpx = std::min(bx + bw / 2, ww - 1);
+          const int cpy = std::min(by + bh / 2, hh - 1);
 
           // Effective kernel at the tile centre, squared elementwise, then
           // mirrored in both axes (kf) so out(x) = sum K^2(u) Var(x-u) becomes a
           // unit-stride correlation against the gathered window.
           std::fill(k2.begin(), k2.end(), 0.0f);
           for (int n = 0; n < nc; ++n) {
-            const float an = fields.coeff[n].get()[cidx];
+            const float an = fields.point(n, cpx, cpy);
             const float* p = phi[n].data();
             for (std::size_t i = 0; i < k2.size(); ++i) k2[i] += an * p[i];
           }

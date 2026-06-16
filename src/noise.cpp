@@ -479,7 +479,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
 #pragma omp parallel
   {
     std::vector<float> win(static_cast<std::size_t>(ibw) * ibw);
-    std::vector<float> acc(static_cast<std::size_t>(bsz) * bsz);
+    std::vector<float> accrow(bsz);
 #pragma omp for schedule(dynamic)
     for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
       const int bx = blocks[bi].first, by = blocks[bi].second;
@@ -505,32 +505,35 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
         }
       }
 
-      // Tap-outer correlation on the cache-resident window.
-      std::fill(acc.begin(), acc.begin() + static_cast<std::size_t>(bh) * bw,
-                0.0f);
-      for (int ly = 0; ly < ks; ++ly) {
-        const float* prow = psf.data() + static_cast<std::size_t>(ly) * ks;
-        for (int lx = 0; lx < ks; ++lx) {
-          const float p = prow[lx];
-          if (p == 0.0f) continue;
-          for (int oy = 0; oy < bh; ++oy) {
-            const float* src =
-                win.data() + static_cast<std::size_t>(oy + ly) * ibw + lx;
-            float* dst = acc.data() + static_cast<std::size_t>(oy) * bw;
+      // Output-row-outer correlation on the cache-resident window. The earlier
+      // tap-outer order swept the *whole tile* once per (ly,lx) tap, so `acc`
+      // (bh*bw) and `win` together overran L1 and `win` thrashed across the ks^2
+      // taps. Here a single output row's accumulator (`accrow`, bw floats) stays
+      // L1/register-resident while all ks^2 taps reduce into it, and each tap
+      // reads only the ks haloed `win` rows above this output row (reused across
+      // the lx shifts). Each output pixel still sums the taps in the same (ly,lx)
+      // order, so the result is bit-identical. The per-row normalise is folded in
+      // so `acc` is never re-streamed.
+      for (int oy = 0; oy < bh; ++oy) {
+        std::fill(accrow.begin(), accrow.begin() + bw, 0.0f);
+        for (int ly = 0; ly < ks; ++ly) {
+          const float* prow = psf.data() + static_cast<std::size_t>(ly) * ks;
+          const float* wrow =
+              win.data() + static_cast<std::size_t>(oy + ly) * ibw;
+          for (int lx = 0; lx < ks; ++lx) {
+            const float p = prow[lx];
+            if (p == 0.0f) continue;
+            const float* src = wrow + lx;
 #pragma omp simd
-            for (int ox = 0; ox < bw; ++ox) dst[ox] += p * src[ox];
+            for (int ox = 0; ox < bw; ++ox) accrow[ox] += p * src[ox];
           }
         }
-      }
-
-      // Per-pixel normalise and scatter: score(x) = conv(x) / sqrt(var(x) * sumpsf2).
-      for (int oy = 0; oy < bh; ++oy) {
+        // Per-pixel normalise + scatter: score = conv / sqrt(var * sumpsf2).
         float* orow = out.data() + static_cast<std::size_t>(by + oy) * w + bx;
-        const float* arow = acc.data() + static_cast<std::size_t>(oy) * bw;
         const float* vrow = var + static_cast<std::size_t>(by + oy) * w + bx;
         for (int ox = 0; ox < bw; ++ox) {
           const float v = vrow[ox];
-          orow[ox] = v > 0.0f ? arow[ox] / std::sqrt(v * sumpsf2) : 0.0f;
+          orow[ox] = v > 0.0f ? accrow[ox] / std::sqrt(v * sumpsf2) : 0.0f;
         }
       }
     }

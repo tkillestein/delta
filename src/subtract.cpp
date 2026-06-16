@@ -353,9 +353,10 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           for (int ly = 0; ly < bh; ++ly) {
             const int y = by + ly;
             std::fill(bn.begin(), bn.begin() + bw, 0.0f);
-            for (int j = 0; j < ks; ++j) {
+            const int jmin = std::max(0, y + kh - hh + 1);
+            const int jmax = std::min(ks - 1, y + kh);
+            for (int j = jmin; j <= jmax; ++j) {
               const int sy = y + kh - j;
-              if (sy < 0 || sy >= hh) continue;
               const float c = kyn[j];
               const float* srow = src + static_cast<std::size_t>(sy) * w + bx;
 #pragma omp simd

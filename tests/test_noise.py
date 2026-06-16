@@ -106,6 +106,38 @@ def test_decorrelate_spatially_varying_matches_constant_interior():
     np.testing.assert_allclose(block_out[c, c], single[c, c], atol=0.15)
 
 
+def test_decorrelate_kernel_cache_matches_exact():
+    # The default decorrelate caches |Khat|^2 on a coarse cell lattice (one kernel
+    # FFT per cell) instead of recomputing it per block. Under a deliberately
+    # strong kernel gradient the cached (auto) path must still track the exact
+    # per-block path (kernel_cell_blocks=1) to a small fraction of the signal.
+    n, beta, n_max = 384, 2.0, 1
+    rng = np.random.default_rng(7)
+    knots = delta.grid_knots(0.0, 0.0, n - 1.0, n - 1.0, 3, 3)
+    k = knots.shape[0]
+    _, kernels = delta.gauss_hermite_kernels(beta, n_max)
+    ncomp = kernels.shape[0]
+
+    # Constant a_0 = 1 plus a strong linear ramp on a_1 across the frame, so the
+    # matching kernel varies appreciably between coarse cells.
+    theta = np.zeros((ncomp + 1) * k)
+    theta[k - 3] = 1.0  # a_0 intercept
+    theta[2 * k - 2] = 0.6  # a_1 x-slope (affine x term)
+
+    diff = _correlated_difference(n, kernels[0], 1.0, 1.0, rng).astype(np.float32)
+    var_s = np.full((n, n), 1.0, np.float32)
+    var_r = np.full((n, n), 1.0, np.float32)
+
+    auto = delta.decorrelate(diff, knots, theta, beta, n_max, var_s, var_r, block=64)
+    exact = delta.decorrelate(
+        diff, knots, theta, beta, n_max, var_s, var_r, block=64, kernel_cell_blocks=1
+    )
+
+    c = slice(48, n - 48)
+    rel_rms = np.sqrt(np.mean((auto[c, c] - exact[c, c]) ** 2)) / np.std(exact[c, c])
+    assert rel_rms < 0.02
+
+
 def test_matched_filter_unit_variance_noise():
     n = 200
     rng = np.random.default_rng(3)

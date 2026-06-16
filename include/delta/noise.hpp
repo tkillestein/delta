@@ -47,10 +47,18 @@ ImageF decorrelation_kernel_image(const std::vector<float>& filter, int n);
 // thin-plate model) and the local noise from the (per-pixel) variance maps;
 // blocks are blended with a Hann window. `block` is the FFT block side; the
 // stride is block/2.
+//
+// The matching kernel varies on the knot length-scale (>> the block stride), so
+// |Khat|^2 -- the only kernel-derived input to the filter -- is cached on a coarse
+// lattice of `kernel_cell_blocks` x `kernel_cell_blocks` blocks (one kernel FFT per
+// cell instead of per block; the per-block noise levels and the two data FFTs stay
+// exact). `kernel_cell_blocks <= 0` auto-selects the cell size from the knot
+// spacing; `1` recomputes the kernel per block (exact, used for validation).
 ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
                    const Eigen::Ref<const Eigen::VectorXd>& theta,
                    const GaussHermiteBasis& basis, const ImageF& var_science,
-                   const ImageF& var_reference, int block);
+                   const ImageF& var_reference, int block,
+                   int kernel_cell_blocks = 0);
 
 // Match-filtered score image: the normalised correlation of `image` with the
 // point-source profile `psf` (side `psf_size`), giving a per-pixel S/N map.

@@ -577,7 +577,7 @@ nb::ndarray<nb::numpy, float> decorrelate(
     InArray<float> difference, const Eigen::MatrixXd& knots,
     const Eigen::VectorXd& theta, double beta, int n_max,
     InArray<float> var_science, InArray<float> var_reference, int block,
-    int radius) {
+    int radius, int kernel_cell_blocks) {
   const std::size_t h = difference.shape(0);
   const std::size_t w = difference.shape(1);
   delta::ImageF diff(w, h);
@@ -592,8 +592,8 @@ nb::ndarray<nb::numpy, float> decorrelate(
   const delta::ThinPlateBasis spatial(knots);
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
-  delta::ImageF out =
-      delta::decorrelate(diff, spatial, theta, basis, vs, vr, block);
+  delta::ImageF out = delta::decorrelate(diff, spatial, theta, basis, vs, vr,
+                                         block, kernel_cell_blocks);
   return to_numpy<float>(std::move(out.pixels()), {h, w});
 }
 
@@ -714,7 +714,7 @@ NB_MODULE(_core, m) {
         "Real-space decorrelation kernel (centred, n x n) for QA.");
   m.def("decorrelate", &decorrelate, "difference"_a, "knots"_a, "theta"_a,
         "beta"_a, "n_max"_a, "var_science"_a, "var_reference"_a, "block"_a = 256,
-        "radius"_a = 0,
+        "radius"_a = 0, "kernel_cell_blocks"_a = 0,
         "Spatially-varying noise decorrelation via apodized FFT blocks.");
   m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "variance"_a,
         "Match-filtered score image (per-pixel S/N map). variance must be a "

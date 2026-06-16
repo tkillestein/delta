@@ -285,6 +285,7 @@ def decorrelate(
     var_reference: NDArray[np.float32],
     block: int = ...,
     radius: int = ...,
+    kernel_cell_blocks: int = ...,
 ) -> NDArray[np.float32]:
     """Spatially-varying noise decorrelation via apodized FFT blocks."""
 

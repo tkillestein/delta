@@ -150,8 +150,9 @@ namespace {
 // spatial solution: K = sum_n a_n(cx,cy) phi_n, returned as a ksize^2 footprint.
 std::vector<float> local_kernel(const ThinPlateBasis& spatial,
                                 const Eigen::Ref<const Eigen::VectorXd>& theta,
-                                const GaussHermiteBasis& basis, double cx,
-                                double cy) {
+                                const GaussHermiteBasis& basis,
+                                const std::vector<std::vector<float>>& phi,
+                                double cx, double cy) {
   const int nc = basis.component_count();
   const int k = spatial.n_basis();
   const Eigen::MatrixXd c = Eigen::Map<const Eigen::MatrixXd>(theta.data(), k,
@@ -164,9 +165,9 @@ std::vector<float> local_kernel(const ThinPlateBasis& spatial,
   const int ks = basis.ksize();
   std::vector<float> kernel(static_cast<std::size_t>(ks) * ks, 0.0f);
   for (int n = 0; n < nc; ++n) {
-    const std::vector<float> phi = basis.kernel2d(n);
     const float an = static_cast<float>(a(0, n));
-    for (std::size_t i = 0; i < kernel.size(); ++i) kernel[i] += an * phi[i];
+    const float* p = phi[n].data();
+    for (std::size_t i = 0; i < kernel.size(); ++i) kernel[i] += an * p[i];
   }
   return kernel;
 }
@@ -182,11 +183,19 @@ std::vector<float> local_kernel(const ThinPlateBasis& spatial,
 // and the sentinel both bias high).
 double block_variance(const ImageF& var, int bx, int by, int block, int w,
                       int h) {
+  // The block noise level is a single robust scalar over thousands of pixels;
+  // a regular subsample of the block estimates the same median to far better
+  // than the decorrelation filter cares about, at a fraction of the gather +
+  // nth_element cost (this runs twice per overlap-add block). Step so large
+  // blocks draw ~64 samples per axis (~4k total -- ample for a median that is
+  // immune to a minority of fill/sentinel pixels) while small blocks stay
+  // exact.
+  const int step = std::max(1, block / 64);
   std::vector<float> vals;
-  vals.reserve(static_cast<std::size_t>(block) * block);
-  for (int y = by; y < by + block; ++y) {
+  vals.reserve(static_cast<std::size_t>(block / step + 1) * (block / step + 1));
+  for (int y = by; y < by + block; y += step) {
     if (y < 0 || y >= h) continue;
-    for (int x = bx; x < bx + block; ++x) {
+    for (int x = bx; x < bx + block; x += step) {
       if (x < 0 || x >= w) continue;
       const float v = var.data()[static_cast<std::size_t>(y) * w + x];
       if (std::isfinite(v) && v > 0.0f) vals.push_back(v);
@@ -203,7 +212,8 @@ double block_variance(const ImageF& var, int bx, int by, int block, int w,
 ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
                    const Eigen::Ref<const Eigen::VectorXd>& theta,
                    const GaussHermiteBasis& basis, const ImageF& var_science,
-                   const ImageF& var_reference, int block) {
+                   const ImageF& var_reference, int block,
+                   int kernel_cell_blocks) {
   const int w = static_cast<int>(difference.width());
   const int h = static_cast<int>(difference.height());
   if (block < 8 || (block & (block - 1)) != 0)
@@ -227,6 +237,13 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   const std::vector<int> oxs = origins(w, block, stride);
   const std::vector<int> oys = origins(h, block, stride);
 
+  // Component footprints, built once and shared across every block's local-kernel
+  // reconstruction (they are frame-invariant; rebuilding all nc per block churned
+  // ~nc allocations per block over the thousands of overlap-add blocks).
+  const int nc = basis.component_count();
+  std::vector<std::vector<float>> phi(nc);
+  for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
+
   // Flatten the block grid so the (independent, FFT-heavy) blocks distribute
   // over threads. Each thread builds its own FFTW plans/buffers once -- planning
   // is not thread-safe (guarded) and was previously redone for every block via
@@ -241,10 +258,76 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   // (origins[L] - origins[L-3] >= 2*stride = block). So same-colour blocks never
   // touch the same pixel and blend lock-free; a barrier between colours keeps
   // cross-colour writes from racing.
-  std::vector<std::vector<std::pair<int, int>>> color_blocks(9);
-  for (std::size_t iy = 0; iy < oys.size(); ++iy)
-    for (std::size_t ix = 0; ix < oxs.size(); ++ix)
-      color_blocks[(ix % 3) * 3 + (iy % 3)].emplace_back(oxs[ix], oys[iy]);
+  // --- coarse kernel-power cache -------------------------------------------------
+  // |Khat(k)|^2 and sum K^2 (the only kernel-derived inputs to the filter) depend
+  // solely on the matching kernel K = sum_n a_n(x,y) phi_n, which varies on the knot
+  // length-scale -- far slower than the block stride. Cache them per coarse cell of
+  // kgroup x kgroup blocks (one kernel FFT per cell) and reuse across the cell's
+  // blocks: this drops the per-block kernel FFT (1 of the 3 FFTs/block) while the two
+  // data FFTs and the per-block noise levels vs, vr stay exact. K is frozen on the
+  // cell lattice -- the same block-effective approximation as variance propagation.
+  const int nox = static_cast<int>(oxs.size());
+  const int noy = static_cast<int>(oys.size());
+  int kgroup = kernel_cell_blocks;
+  if (kgroup <= 0) {
+    // Auto: aim for ~kKernelCellSamplesPerKnot cells per knot interval. The kernel's
+    // spatial variation is band-limited to the knot scale, so a few samples per knot
+    // resolve it; this is much coarser than the field interpolation lattice because
+    // it only freezes the (smooth) kernel, not the per-block noise.
+    constexpr int kKernelCellSamplesPerKnot = 4;
+    const double spacing = spatial.min_knot_spacing();
+    kgroup = 1;
+    if (spacing > 0.0 && stride > 0) {
+      const double cell_px = spacing / kKernelCellSamplesPerKnot;
+      kgroup = std::max(1, static_cast<int>(std::lround(cell_px / stride)));
+    }
+  }
+  const int ncellx = (nox + kgroup - 1) / kgroup;
+  const int ncelly = (noy + kgroup - 1) / kgroup;
+  const int ncell = ncellx * ncelly;
+
+  const int fnc = block / 2 + 1;
+  const std::size_t nspec = static_cast<std::size_t>(block) * fnc;
+
+  // Per-cell cached |Khat|^2 (nspec each) and sum K^2, evaluated at the cell's
+  // central block. Built up front (one FFT per cell) over the thread team.
+  std::vector<double> cell_power(static_cast<std::size_t>(ncell) * nspec);
+  std::vector<double> cell_sumk2(ncell);
+#pragma omp parallel
+  {
+    Fft2d* fftp = nullptr;
+#pragma omp critical(delta_fftw_plan)
+    { fftp = new Fft2d(block); }
+    Fft2d& fft = *fftp;
+#pragma omp for schedule(dynamic)
+    for (int ci = 0; ci < ncell; ++ci) {
+      const int cix = ci % ncellx, ciy = ci / ncellx;
+      const int repx = std::min(cix * kgroup + kgroup / 2, nox - 1);
+      const int repy = std::min(ciy * kgroup + kgroup / 2, noy - 1);
+      const double cx = std::clamp(oxs[repx] + block / 2.0, 0.0, w - 1.0);
+      const double cy = std::clamp(oys[repy] + block / 2.0, 0.0, h - 1.0);
+      const std::vector<float> kern =
+          local_kernel(spatial, theta, basis, phi, cx, cy);
+      const std::vector<double> power = kernel_power(kern, ks, block, fft);
+      std::copy(power.begin(), power.end(),
+                cell_power.begin() + static_cast<std::size_t>(ci) * nspec);
+      double sumk2 = 0.0;
+      for (float v : kern) sumk2 += static_cast<double>(v) * v;
+      cell_sumk2[ci] = sumk2;
+    }
+#pragma omp critical(delta_fftw_plan)
+    { delete fftp; }
+  }
+
+  struct BlockJob {
+    int bx, by, cell;
+  };
+  std::vector<std::vector<BlockJob>> color_blocks(9);
+  for (int iy = 0; iy < noy; ++iy)
+    for (int ix = 0; ix < nox; ++ix) {
+      const int cell = (iy / kgroup) * ncellx + (ix / kgroup);
+      color_blocks[(ix % 3) * 3 + (iy % 3)].push_back({oxs[ix], oys[iy], cell});
+    }
 
   const std::size_t nn = static_cast<std::size_t>(block) * block;
   const float inv_n2 = 1.0f / static_cast<float>(nn);
@@ -272,7 +355,6 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
 #pragma omp critical(delta_fftw_plan)
     { fftp = new Fft2d(block); }
     Fft2d& fft = *fftp;
-    const std::size_t nspec = static_cast<std::size_t>(block) * fft.nc;
     std::vector<float> buf(nn);
     std::vector<float> filter(nspec);
 
@@ -281,7 +363,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
     for (const auto& blocks : color_blocks) {
 #pragma omp for schedule(dynamic)
       for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
-        const int bx = blocks[bi].first, by = blocks[bi].second;
+        const int bx = blocks[bi].bx, by = blocks[bi].by;
 
         // Reflect-pad the block region into a local buffer.
         for (int iy = 0; iy < block; ++iy) {
@@ -299,19 +381,16 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
           }
         }
 
-        const double cx = std::clamp(bx + block / 2.0, 0.0, w - 1.0);
-        const double cy = std::clamp(by + block / 2.0, 0.0, h - 1.0);
-        const std::vector<float> kern =
-            local_kernel(spatial, theta, basis, cx, cy);
         const double vs = block_variance(var_science, bx, by, block, w, h);
         const double vr = block_variance(var_reference, bx, by, block, w, h);
 
-        // Decorrelation filter from |Khat|^2 (kernel_power reuses the thread's
-        // FFT buffers, so it must run before block data is loaded into fft.real).
-        const std::vector<double> power = kernel_power(kern, ks, block, fft);
-        double sumk2 = 0.0;
-        for (float v : kern) sumk2 += static_cast<double>(v) * v;
-        const double cnum = std::sqrt(std::max(vs + vr * sumk2, 0.0));
+        // Decorrelation filter from the cell's cached |Khat|^2 and sum K^2; only the
+        // per-block noise levels vs, vr enter here, so the (slowly varying) kernel
+        // power is shared across the cell without an FFT per block.
+        const double* power =
+            cell_power.data() + static_cast<std::size_t>(blocks[bi].cell) * nspec;
+        const double cnum =
+            std::sqrt(std::max(vs + vr * cell_sumk2[blocks[bi].cell], 0.0));
         for (std::size_t i = 0; i < nspec; ++i) {
           const double denom = vs + vr * power[i];
           filter[i] =
@@ -400,7 +479,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
 #pragma omp parallel
   {
     std::vector<float> win(static_cast<std::size_t>(ibw) * ibw);
-    std::vector<float> acc(static_cast<std::size_t>(bsz) * bsz);
+    std::vector<float> accrow(bsz);
 #pragma omp for schedule(dynamic)
     for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
       const int bx = blocks[bi].first, by = blocks[bi].second;
@@ -426,32 +505,35 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
         }
       }
 
-      // Tap-outer correlation on the cache-resident window.
-      std::fill(acc.begin(), acc.begin() + static_cast<std::size_t>(bh) * bw,
-                0.0f);
-      for (int ly = 0; ly < ks; ++ly) {
-        const float* prow = psf.data() + static_cast<std::size_t>(ly) * ks;
-        for (int lx = 0; lx < ks; ++lx) {
-          const float p = prow[lx];
-          if (p == 0.0f) continue;
-          for (int oy = 0; oy < bh; ++oy) {
-            const float* src =
-                win.data() + static_cast<std::size_t>(oy + ly) * ibw + lx;
-            float* dst = acc.data() + static_cast<std::size_t>(oy) * bw;
+      // Output-row-outer correlation on the cache-resident window. The earlier
+      // tap-outer order swept the *whole tile* once per (ly,lx) tap, so `acc`
+      // (bh*bw) and `win` together overran L1 and `win` thrashed across the ks^2
+      // taps. Here a single output row's accumulator (`accrow`, bw floats) stays
+      // L1/register-resident while all ks^2 taps reduce into it, and each tap
+      // reads only the ks haloed `win` rows above this output row (reused across
+      // the lx shifts). Each output pixel still sums the taps in the same (ly,lx)
+      // order, so the result is bit-identical. The per-row normalise is folded in
+      // so `acc` is never re-streamed.
+      for (int oy = 0; oy < bh; ++oy) {
+        std::fill(accrow.begin(), accrow.begin() + bw, 0.0f);
+        for (int ly = 0; ly < ks; ++ly) {
+          const float* prow = psf.data() + static_cast<std::size_t>(ly) * ks;
+          const float* wrow =
+              win.data() + static_cast<std::size_t>(oy + ly) * ibw;
+          for (int lx = 0; lx < ks; ++lx) {
+            const float p = prow[lx];
+            if (p == 0.0f) continue;
+            const float* src = wrow + lx;
 #pragma omp simd
-            for (int ox = 0; ox < bw; ++ox) dst[ox] += p * src[ox];
+            for (int ox = 0; ox < bw; ++ox) accrow[ox] += p * src[ox];
           }
         }
-      }
-
-      // Per-pixel normalise and scatter: score(x) = conv(x) / sqrt(var(x) * sumpsf2).
-      for (int oy = 0; oy < bh; ++oy) {
+        // Per-pixel normalise + scatter: score = conv / sqrt(var * sumpsf2).
         float* orow = out.data() + static_cast<std::size_t>(by + oy) * w + bx;
-        const float* arow = acc.data() + static_cast<std::size_t>(oy) * bw;
         const float* vrow = var + static_cast<std::size_t>(by + oy) * w + bx;
         for (int ox = 0; ox < bw; ++ox) {
           const float v = vrow[ox];
-          orow[ox] = v > 0.0f ? arow[ox] / std::sqrt(v * sumpsf2) : 0.0f;
+          orow[ox] = v > 0.0f ? accrow[ox] / std::sqrt(v * sumpsf2) : 0.0f;
         }
       }
     }

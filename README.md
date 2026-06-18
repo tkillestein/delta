@@ -1,5 +1,10 @@
 # delta
 
+[![CI](https://github.com/tkillestein/delta/actions/workflows/ci.yml/badge.svg)](https://github.com/tkillestein/delta/actions/workflows/ci.yml)
+[![docs](https://github.com/tkillestein/delta/actions/workflows/docs.yml/badge.svg)](https://tkilleste.in/delta)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+
 A high-performance astronomical difference-imaging engine — a modern,
 statistically-principled reformulation of the Alard & Lupton (1998) PSF-matching
 algorithm, intended as a replacement for HOTPANTS.
@@ -22,7 +27,7 @@ Python bindings.
   match-filtered S/N score image.
 - **Modern engineering**: multicore + SIMD, NumPy/astropy interop.
 
-Full documentation is published at **<https://tkillestein.github.io/delta/>** (usage
+Full documentation is published at **<https://tkilleste.in/delta>** (usage
 guide, API reference, CLI, and the design spec). See [`docs/SPEC.md`](docs/SPEC.md) for
 the design and roadmap and [`docs/usage.md`](docs/usage.md) for the user guide.
 

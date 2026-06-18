@@ -11,6 +11,9 @@ nanobind bindings) provides the user-facing API. `docs/SPEC.md` is the authorita
 design document — section numbers (e.g. "SPEC §3.6") are referenced throughout the
 code and are the best place to understand intent.
 
+The user-facing docs (usage guide, API reference, CLI, rendered spec) are published at
+**<https://tkilleste.in/delta>**, built from `docs/` by `.github/workflows/docs.yml`.
+
 ## Build & dev commands
 
 The toolchain is `uv` + `ruff` + `ty`; the C++ extension is built by scikit-build-core

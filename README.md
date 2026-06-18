@@ -9,8 +9,8 @@ A high-performance astronomical difference-imaging engine — a modern,
 statistically-principled reformulation of the Alard & Lupton (1998) PSF-matching
 algorithm, intended as a replacement for HOTPANTS.
 
-High-performance C++ core with zero-copy [nanobind](https://nanobind.readthedocs.io)
-Python bindings.
+A C++20 core does the numerics; a thin Python layer (zero-copy
+[nanobind](https://nanobind.readthedocs.io) bindings) provides the user-facing API.
 
 ## Key ideas
 
@@ -33,11 +33,12 @@ Python bindings.
 
 Full documentation is published at **<https://tkilleste.in/delta>** (usage
 guide, API reference, CLI, and the design spec). See [`docs/SPEC.md`](docs/SPEC.md) for
-the design and roadmap and [`docs/usage.md`](docs/usage.md) for the user guide.
+the design and [`docs/usage.md`](docs/usage.md) for the user guide.
 
-> **Status:** end-to-end pipeline working (kernel solve → spatially-varying
+> **Status:** stable (v1.0). The full pipeline — kernel solve → spatially-varying
 > subtraction → variance/mask propagation → noise decorrelation → match-filtered
-> score), with astropy interop. APIs may still change.
+> score — works end to end, with astropy interop and a CLI. The public API follows
+> [semantic versioning](https://semver.org).
 
 ## Quickstart
 
@@ -85,10 +86,10 @@ library is needed. The Python dev stack uses [uv](https://docs.astral.sh/uv/),
 [ruff](https://docs.astral.sh/ruff/), and [ty](https://github.com/astral-sh/ty).
 
 ```sh
-uv sync          # create the venv, build the C++ core, install dev tools
-uv run pytest    # run the smoke tests
+uv sync           # create the venv, build the C++ core, install dev tools
+uv run pytest     # run the test suite
 uv run ruff check # lint
-uv run ty check  # type-check
+uv run ty check   # type-check
 ```
 
 ### Documentation

@@ -8,9 +8,10 @@ A C++20 core does the numerics; a thin Python layer (zero-copy
 [nanobind](https://nanobind.readthedocs.io) bindings) provides the user-facing API.
 
 !!! note "Status"
-    The end-to-end pipeline works (kernel solve → spatially-varying subtraction →
-    variance/mask propagation → noise decorrelation → match-filtered score), with
-    astropy interop. APIs may still change.
+    Stable (v1.0). The end-to-end pipeline works (kernel solve → spatially-varying
+    subtraction → variance/mask propagation → noise decorrelation → match-filtered
+    score), with astropy interop and a CLI. The public API follows semantic
+    versioning.
 
 ## Key ideas
 

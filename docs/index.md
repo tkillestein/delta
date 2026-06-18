@@ -14,9 +14,10 @@ A C++20 core does the numerics; a thin Python layer (zero-copy
 
 ## Key ideas
 
-- **Cartesian Gauss-Hermite kernel basis** — the same function space as classic
-  Alard & Lupton, but near-orthogonal, so the matching solve is far better
-  conditioned and needs far less tuning.
+- **Cartesian Gauss-Hermite (shapelet) kernel basis** (Refregier 2003) — the 2-D
+  Gauss-Hermite functions are orthogonal under the L² inner product, so the matching
+  solve is far better conditioned than the classic Gaussian×polynomial basis (a known
+  pitfall; Becker et al. 2012) and needs far less tuning.
 - **Continuous, adaptive spatial variation** via low-rank thin-plate regression
   splines, with the smoothing parameter chosen automatically by cross-validation.
   One global field — no subregion seams or PSF discontinuities.
@@ -35,7 +36,7 @@ $$[K \otimes R](x,y) = \sum_n a_n(x,y)\, B_n(x,y), \qquad B_n = \varphi_n \otime
 where `B_n` is precomputed once per basis component and `a_n(x, y)` is a thin-plate
 spline field. This gives one *global*, exactly-continuous spatially-varying fit (no
 tiling, no subregion seams) and makes the solve linear in the coefficients. See the
-[design spec](spec.md) (§3.2) for the full derivation.
+[design spec](design.md) (§3.2) for the full derivation.
 
 ## Quickstart
 
@@ -60,7 +61,8 @@ smoothing parameter is chosen automatically — no per-field tuning. Continue to
 ## Installation
 
 `delta` builds a C++ extension, so it needs a C++20 compiler, CMake ≥ 3.18, and
-CFITSIO, Eigen, and FFTW (`fftw3f`) available via `pkg-config`. The Python dev
+CFITSIO and Eigen (≥ 3.4) available via `pkg-config`. The FFT is vendored
+(header-only PocketFFT), so no system FFT library is needed. The Python dev
 stack uses [uv](https://docs.astral.sh/uv/).
 
 ```sh

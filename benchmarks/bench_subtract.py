@@ -182,7 +182,7 @@ def run_once(
         score=score,
     )
     if warmup:
-        # First-touch allocation, FFTW plan caches: run once and discard.
+        # First-touch allocation, FFT workspace warmup: run once and discard.
         delta.subtract(sci, ref, **kwargs)
 
     wall = float("inf")

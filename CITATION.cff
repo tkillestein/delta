@@ -1,0 +1,81 @@
+cff-version: 1.2.0
+message: "If you use delta in your research, please cite it as below."
+title: "delta: a penalized-spline reformulation of Alard & Lupton difference imaging"
+abstract: >-
+  delta is a high-performance astronomical difference-imaging engine that recasts
+  the Alard & Lupton (1998) PSF-matching algorithm as a single global, penalized
+  generalized-least-squares spline fit in a near-orthogonal Cartesian Gauss-Hermite
+  (shapelet) kernel basis, with automatic GCV smoothing and first-class variance and
+  mask propagation.
+type: software
+authors:
+  - given-names: Tom
+    family-names: Killestein
+    email: tom.killestein@gmail.com
+license: MIT
+repository-code: "https://github.com/tkillestein/delta"
+url: "https://tkilleste.in/delta"
+version: 0.0.1
+keywords:
+  - astronomy
+  - difference imaging
+  - image subtraction
+  - transient detection
+  - PSF matching
+references:
+  - type: article
+    authors:
+      - family-names: Alard
+        given-names: C.
+      - family-names: Lupton
+        given-names: R. H.
+    title: "A Method for Optimal Image Subtraction"
+    journal: "The Astrophysical Journal"
+    volume: 503
+    start: 325
+    year: 1998
+    doi: 10.1086/305984
+  - type: article
+    authors:
+      - family-names: Becker
+        given-names: A. C.
+    title: "Regularization Techniques for PSF-Matching Kernels. I. Choice of Kernel Basis"
+    journal: "Monthly Notices of the Royal Astronomical Society"
+    volume: 425
+    start: 1341
+    year: 2012
+    doi: 10.1111/j.1365-2966.2012.21542.x
+  - type: article
+    authors:
+      - family-names: Refregier
+        given-names: A.
+    title: "Shapelets - I. A method for image analysis"
+    journal: "Monthly Notices of the Royal Astronomical Society"
+    volume: 338
+    start: 35
+    year: 2003
+    doi: 10.1046/j.1365-8711.2003.05901.x
+  - type: article
+    authors:
+      - family-names: Zackay
+        given-names: B.
+      - family-names: Ofek
+        given-names: E. O.
+      - family-names: Gal-Yam
+        given-names: A.
+    title: "Proper Image Subtraction - Optimal Transient Detection, Photometry, and Hypothesis Testing"
+    journal: "The Astrophysical Journal"
+    volume: 830
+    start: 27
+    year: 2016
+    doi: 10.3847/0004-637X/830/1/27
+  - type: article
+    authors:
+      - family-names: Wood
+        given-names: S. N.
+    title: "Thin plate regression splines"
+    journal: "Journal of the Royal Statistical Society: Series B"
+    volume: 65
+    start: 95
+    year: 2003
+    doi: 10.1111/1467-9868.00374

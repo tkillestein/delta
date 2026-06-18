@@ -29,6 +29,13 @@ using namespace nb::literals;
 
 namespace {
 
+// Dimension contract: the C++ core indexes pixels with std::size_t, but image
+// *axis extents* (width/height, kernel/psf side) are carried as `int` throughout
+// the convolution / variance / FFT loops. Each axis must therefore fit in `int`
+// (< 2^31 ~ 2.1e9 px per side). That bounds a single image axis well above any
+// realistic detector/mosaic dimension; total pixel counts beyond 2^31 are fine
+// (they use std::size_t). Callers handing in a single axis near INT_MAX are out of
+// contract and would narrow on the static_cast<int>(shape(...)) below.
 template <typename T>
 using InArray =
     nb::ndarray<const T, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
@@ -128,7 +135,8 @@ nb::dict read_fits(const std::string& path) {
 
 void write_fits(const std::string& path, InArray<float> data,
                 std::optional<InArray<float>> variance,
-                std::optional<InArray<std::uint8_t>> mask) {
+                std::optional<InArray<std::uint8_t>> mask,
+                bool overwrite) {
   const std::size_t h = data.shape(0);
   const std::size_t w = data.shape(1);
 
@@ -149,7 +157,7 @@ void write_fits(const std::string& path, InArray<float> data,
     std::copy(mask->data(), mask->data() + h * w, image.mask().begin());
   }
 
-  delta::io::write_image(path, image);
+  delta::io::write_image(path, image, overwrite);
 }
 
 // ---- basis / convolve ------------------------------------------------------
@@ -632,7 +640,9 @@ NB_MODULE(_core, m) {
         "Read a FITS file into {'data', 'variance', 'mask'} NumPy arrays.");
   m.def("write_fits", &write_fits, "path"_a, "data"_a,
         "variance"_a = nb::none(), "mask"_a = nb::none(),
-        "Write data plus optional variance/mask layers to a FITS file.");
+        "overwrite"_a = false,
+        "Write data plus optional variance/mask layers to a FITS file. Raises if "
+        "the file exists unless overwrite=True.");
 
   m.def("gauss_hermite_basis1d", &gauss_hermite_basis1d, "beta"_a, "n_max"_a,
         "radius"_a = 0,

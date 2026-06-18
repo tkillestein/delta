@@ -90,5 +90,5 @@ nav:
       - Inputs: api/inputs.md
       - Validation: api/validation.md
       - Core (low-level): api/core.md
-  - Design (SPEC): spec.md
+  - Design (SPEC): design.md
   - Performance: performance.md

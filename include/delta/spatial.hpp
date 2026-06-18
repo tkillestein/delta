@@ -4,7 +4,8 @@
 
 namespace delta {
 
-// Low-rank thin-plate regression spline (SPEC §3.3).
+// Low-rank thin-plate regression spline (SPEC §3.3; Wahba 1990, Spline Models for
+// Observational Data; low-rank form: Wood 2003, JRSS-B 65, 95).
 //
 // Models a smooth 2-D field over k knots as
 //

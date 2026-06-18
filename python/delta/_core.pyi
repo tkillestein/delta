@@ -1,7 +1,7 @@
 """Type stubs for the compiled ``delta._core`` extension.
 
-Hand-written for the M0 scaffold; once the API grows these can be generated from
-nanobind (``nanobind_add_stub``).
+Hand-maintained to match ``src/bindings.cpp``; keep in sync when bindings change.
+(These could alternatively be generated with nanobind's ``nanobind_add_stub``.)
 """
 
 from typing import TypedDict
@@ -96,8 +96,12 @@ def write_fits(
     data: NDArray[np.float32],
     variance: NDArray[np.float32] | None = ...,
     mask: NDArray[np.uint8] | None = ...,
+    overwrite: bool = ...,
 ) -> None:
-    """Write data plus optional variance/mask layers to a FITS file."""
+    """Write data plus optional variance/mask layers to a FITS file.
+
+    Raises if the file exists unless ``overwrite=True``.
+    """
 
 def gauss_hermite_basis1d(beta: float, n_max: int, radius: int = ...) -> NDArray[np.float64]:
     """1-D sampled Gauss-Hermite basis functions, shape (n_max+1, ksize)."""

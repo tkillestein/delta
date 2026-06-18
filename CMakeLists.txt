@@ -16,13 +16,18 @@ endif()
 # Architecture tuning
 #   The convolution / variance / score inner loops are written to auto-vectorise;
 #   the default x86-64 baseline only guarantees SSE2, leaving AVX/AVX2/AVX-512
-#   on the table. DELTA_NATIVE (default ON) builds for the host's full ISA, which
-#   is the right choice for a from-source `uv sync` install and typically a 2-4x
-#   speedup on the separable/dense kernels. Turn it OFF for a portable wheel.
+#   on the table. DELTA_NATIVE builds for the host's full ISA, typically a 2-4x
+#   speedup on the separable/dense kernels.
+#
+#   It defaults OFF so the produced binary is portable: a `-march=native` build
+#   made on one host and run on a different (older, or differently-featured) CPU
+#   SIGILLs. Turn it ON for a from-source install you will only ever run on the
+#   build host (e.g. a local `uv sync`); leave it OFF for any redistributable
+#   wheel or shared-cluster build.
 #   We deliberately do NOT enable -ffast-math: the pipeline relies on IEEE NaN/inf
 #   semantics (std::isfinite masking), which fast-math would break.
 # ---------------------------------------------------------------------------
-option(DELTA_NATIVE "Tune the compiled core for the host CPU (-march=native)" ON)
+option(DELTA_NATIVE "Tune the compiled core for the host CPU (-march=native); non-portable" OFF)
 
 # ---------------------------------------------------------------------------
 # Python + nanobind
@@ -38,13 +43,14 @@ find_package(nanobind CONFIG REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Core numeric / IO dependencies
-#   Eigen, CFITSIO and FFTW are resolved via pkg-config (robust across versions).
-#   FFTW is wired now but only exercised from a later milestone (M7).
+#   Eigen and CFITSIO are resolved via pkg-config (robust across versions). The
+#   FFT used by the noise-decorrelation pass is the vendored header-only PocketFFT
+#   (extern/pocketfft, BSD-3) -- no external/system FFT dependency, and no GPL link
+#   (PocketFFT is the same FFT NumPy/SciPy ship).
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(EIGEN REQUIRED IMPORTED_TARGET eigen3)
+pkg_check_modules(EIGEN REQUIRED IMPORTED_TARGET eigen3>=3.4)
 pkg_check_modules(CFITSIO REQUIRED IMPORTED_TARGET cfitsio)
-pkg_check_modules(FFTWF REQUIRED IMPORTED_TARGET fftw3f)
 find_package(OpenMP)
 
 # ---------------------------------------------------------------------------
@@ -63,8 +69,10 @@ nanobind_add_module(_core
   src/noise.cpp
   src/timing.cpp
 )
-target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO PkgConfig::FFTWF)
+target_include_directories(_core PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/pocketfft)
+target_link_libraries(_core PRIVATE PkgConfig::EIGEN PkgConfig::CFITSIO)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(_core PRIVATE OpenMP::OpenMP_CXX)
 endif()

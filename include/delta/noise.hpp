@@ -11,6 +11,8 @@
 namespace delta {
 
 // Noise decorrelation (whitening) and the match-filtered score image (SPEC §3.4).
+// The whitening filter below follows the proper-subtraction construction of
+// Zackay, Ofek & Gal-Yam 2016 ("ZOGY", ApJ 830, 27).
 //
 // The matching convolution K (x) R correlates the difference-image noise, so a
 // naive threshold on the difference is statistically invalid. With white science

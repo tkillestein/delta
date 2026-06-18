@@ -11,9 +11,10 @@ nanobind Python bindings.
 
 Difference imaging — subtracting a reference/template image from a science image to
 reveal transient and variable sources — is foundational to time-domain astronomy.
-The dominant open tool, HOTPANTS (an implementation of Alard & Lupton 1998), is
-effective but dated: a non-orthogonal Gaussian×polynomial kernel basis that is
-poorly conditioned and requires hand-tuning of σ's and polynomial degrees; global
+The dominant open tool, HOTPANTS (an implementation of Alard & Lupton 1998; Becker
+2015), is effective but dated: a non-orthogonal sum-of-Gaussians × polynomial kernel
+basis whose conditioning is a known pitfall (Becker et al. 2012) and which requires
+hand-tuning of σ's and polynomial degrees; global
 polynomial spatial variation that oscillates and can't adapt to localized PSF
 structure; correlated noise in the output difference that breaks naive detection
 statistics; and a single-threaded C codebase that does not exploit modern hardware.
@@ -22,17 +23,20 @@ statistics; and a single-threaded C codebase that does not exploit modern hardwa
 image's PSF to the other, then subtract — but recasts it as a **penalized
 generalized least-squares (spline) fit**:
 
-- **Orthogonal kernel basis.** Cartesian Gauss-Hermite (shapelet) functions replace
-  the ad-hoc Gaussian×polynomial basis — same function space, dramatically better
-  conditioning, one scale parameter β + max order `n_max` instead of a basket of
-  knobs.
+- **Near-orthogonal kernel basis.** Cartesian Gauss-Hermite (shapelet) functions
+  (Refregier 2003) replace the ad-hoc Gaussian×polynomial basis. They are orthogonal
+  under the L² inner product (they are eigenstates of the 2-D quantum harmonic
+  oscillator), spanning a function space comparable to a single A&L Gaussian
+  component but far better conditioned (Becker et al. 2012), with one scale parameter
+  β + max order `n_max` instead of a basket of knobs.
 - **Adaptive, continuous spatial variation.** Each kernel coefficient is a 2-D field
-  modeled by a **low-rank thin-plate regression spline**, with the smoothing
-  parameter λ chosen automatically by **generalized cross-validation (GCV)** — no
-  manual polynomial-degree tuning, no subregion seams.
+  modeled by a **low-rank thin-plate regression spline** (Wahba 1990; Wood 2003),
+  with the smoothing parameter λ chosen automatically by **generalized
+  cross-validation (GCV)** (Golub, Heath & Wahba 1979) — no manual polynomial-degree
+  tuning, no subregion seams.
 - **Valid detection statistics.** Optional difference-image **noise decorrelation**
-  (whitening) and a **match-filtered S/N score image** for direct transient
-  detection — features HOTPANTS lacks.
+  (whitening, following Zackay, Ofek & Gal-Yam 2016, "ZOGY") and a **match-filtered
+  S/N score image** for direct transient detection — features HOTPANTS lacks.
 - **Modern engineering.** Multicore + SIMD C++ core, zero-copy NumPy/astropy Python
   API.
 
@@ -133,8 +137,9 @@ minimize  ‖W^½ (d − X θ)‖²  +  λ θᵀ P θ
 - **Decorrelation (optional):** the convolution correlates difference-image noise.
   Apply a whitening (decorrelation) kernel à la ZOGY so noise is ~uncorrelated —
   required for valid thresholding. Spatially-varying → **apodized overlapping FFT
-  blocks** (FFTW); the noise field varies slowly so blending is seamless to float
-  precision.
+  blocks** (vendored PocketFFT); the noise field varies on the knot length-scale,
+  which is much coarser than the block stride, so the Hann overlap-add blending
+  between adjacent blocks introduces no visible seam.
 - **Score image (optional):** PSF-matched filter of the decorrelated difference →
   per-pixel S/N map for direct detection/thresholding.
 
@@ -188,7 +193,7 @@ Namespace `delta::`. Modules:
   search.
 - **`subtract`** — full-frame model evaluation, difference, variance propagation.
 - **`detect`** — stamp source detection & selection, FWHM/direction estimation.
-- **`noise`** — decorrelation kernel + apodized block FFT (FFTW), match-filter score.
+- **`noise`** — decorrelation kernel + apodized block FFT (PocketFFT), match-filter score.
 - **`pipeline`** — orchestration: end-to-end `subtract(science, reference, options)`.
 
 Key data structures: `Image<T>`, `Stamp`, `KernelBasis`, `SpatialModel`,
@@ -206,16 +211,17 @@ Key data structures: `Image<T>`, `Stamp`, `KernelBasis`, `SpatialModel`,
 - **Memory:** stream large frames; pre-allocate the n_basis `B_n` buffers once; avoid
   per-stamp allocation churn (arena/pool). Target single-pass over the frame for the
   subtraction stage.
-- **FFTW** plans cached/reused across blocks; real-to-complex transforms.
+- **FFT** (PocketFFT): one workspace per thread, reused across blocks; real-to-complex transforms.
 
 ---
 
 ## 6. Dependencies & Build
 
 - **CFITSIO** — FITS I/O.
-- **Eigen** — dense/sparse linear algebra for the penalized GLS (header-only).
-- **FFTW** — added for the decorrelation + score post-filter stage (consequence of
-  selecting those products). Matching convolution itself needs no FFT.
+- **Eigen** (≥ 3.4) — dense/sparse linear algebra for the penalized GLS (header-only).
+- **PocketFFT** (vendored, header-only, BSD-3) — used by the decorrelation + score
+  post-filter stage. Matching convolution itself needs no FFT, and there is no
+  external/system FFT (or GPL) dependency.
 - **OpenMP/TBB** — threading.
 - **nanobind** — Python bindings.
 - **Build:** CMake; **scikit-build-core** for the Python wheel. CI builds + tests on
@@ -310,7 +316,7 @@ delta/
 - **M5** `subtract`: full-frame continuous spatially-varying subtraction + variance
   propagation.
 - **M6** Jointly-fit background/photometric term; kernel-sum flux scale reporting.
-- **M7** `noise`: decorrelation (apodized block FFTW) + match-filtered score image.
+- **M7** `noise`: decorrelation (apodized block FFT, PocketFFT) + match-filtered score image.
 - **M8** nanobind Python API + astropy interop + packaging.
 - **M9** HOTPANTS validation harness, injection-recovery suite, benchmarks, docs.
 
@@ -338,4 +344,21 @@ registration/resampling; difference-image source measurement.
    and photometric scatter, at lower runtime, with no hand-tuning of basis knobs.
 5. **Benchmark** the full pipeline meets the survey-cadence latency target on the
    reference frame size and scales with thread count.
-```
+
+---
+
+## 14. References
+
+- Alard, C. & Lupton, R. H. (1998), *A Method for Optimal Image Subtraction*, ApJ **503**, 325.
+- Alard, C. (2000), *Image subtraction using a space-varying kernel*, A&AS **144**, 363.
+- Becker, A. C. et al. (2012), *Regularization Techniques for PSF-Matching Kernels — I. Choice of Kernel Basis*, MNRAS **425**, 1341.
+- Becker, A. C. (2015), *HOTPANTS: High Order Transform of PSF ANd Template Subtraction*, ascl:1504.004.
+- Bramich, D. M. (2008), *A new algorithm for difference image analysis*, MNRAS **386**, L77.
+- Bramich, D. M. et al. (2016), *Difference image analysis: automatic kernel design using information criteria*, MNRAS **457**, 542.
+- Golub, G. H., Heath, M. & Wahba, G. (1979), *Generalized Cross-Validation as a Method for Choosing a Good Ridge Parameter*, Technometrics **21**, 215.
+- Hu, L. et al. (2022), *Image Subtraction in Fourier Space (SFFT)*, ApJ **936**, 157.
+- Miller, J. P., Pennypacker, C. R. & White, G. L. (2008), *Optimal Image Subtraction Method*, PASP **120**, 449.
+- Refregier, A. (2003), *Shapelets — I. A method for image analysis*, MNRAS **338**, 35.
+- Wahba, G. (1990), *Spline Models for Observational Data*, SIAM.
+- Wood, S. N. (2003), *Thin plate regression splines*, J. R. Stat. Soc. B **65**, 95.
+- Zackay, B., Ofek, E. O. & Gal-Yam, A. (2016), *Proper Image Subtraction (ZOGY)*, ApJ **830**, 27.

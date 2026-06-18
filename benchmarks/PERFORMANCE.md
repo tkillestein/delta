@@ -124,8 +124,8 @@ Same 14-core host, 4096×4096 (16.8 Mpix), 419 stars, warm min-of-5 (`--reps 5`)
 |      14 |     2.43 |   1.95x |        14% |
 
 Scaling is far from ideal: it climbs to ~2.1× by 8 threads, then *regresses* at 14 as
-the extra cores contend for the bus (and oversubscribe alongside the FFTW/Eigen thread
-teams). The cap is **memory bandwidth, not a serial section**: at this frame size the
+the extra cores contend for the bus (and oversubscribe alongside the Eigen thread
+team). The cap is **memory bandwidth, not a serial section**: at this frame size the
 full-frame convolution/subtract passes (SPEC §5: *threaded over rows/tiles purely for
 parallelism*) are bandwidth-bound, so beyond ~4–8 threads extra cores contend for the
 same bus rather than adding throughput. The headline lever is therefore **per-core
@@ -272,7 +272,7 @@ coarsening its stride would speed it further but changes the fill value, so it i
 7 to preserve bit-identity.
 
 ### `noise decorrelation` — ~25% (now the tallest stage) (`src/noise.cpp`)
-Apodised FFT blocks (FFTW, per-thread reused plans, threaded over blocks). The FFT is
+Apodised FFT blocks (vendored PocketFFT, one workspace per thread, threaded over blocks). The FFT is
 genuine (the ZOGY decorrelation filter is non-compact in Fourier space), so it stays.
 Wins so far: the overlap-add *blend* was de-serialised via a 9-colour lock-free scheme
 and the Hann window precomputed (#28); then a **per-cell kernel-power cache** — `|K̂|²`

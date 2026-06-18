@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs of this workflow on the same ref. Keep this at the
+# workflow level (not per-job): a job-level group keyed on matrix.os makes the
+# matrix legs share one group and cancel each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     strategy:
@@ -16,9 +23,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    concurrency:
-      group: ci-${{ github.ref }}-${{ matrix.os }}
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 

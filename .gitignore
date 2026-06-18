@@ -24,6 +24,9 @@ __pycache__/
 # Host-specific benchmark history (see benchmarks/PERFORMANCE.md)
 /benchmarks/results/
 
+# Documentation site build
+/site/
+
 # Editors / OS
 .vscode/
 .idea/

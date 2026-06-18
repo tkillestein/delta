@@ -22,8 +22,9 @@ Python bindings.
   match-filtered S/N score image.
 - **Modern engineering**: multicore + SIMD, NumPy/astropy interop.
 
-See [`docs/SPEC.md`](docs/SPEC.md) for the full design and roadmap, and
-[`docs/USAGE.md`](docs/USAGE.md) for the user guide.
+Full documentation is published at **<https://tkillestein.github.io/delta/>** (usage
+guide, API reference, CLI, and the design spec). See [`docs/SPEC.md`](docs/SPEC.md) for
+the design and roadmap and [`docs/usage.md`](docs/usage.md) for the user guide.
 
 > **Status:** end-to-end pipeline working (kernel solve → spatially-varying
 > subtraction → variance/mask propagation → noise decorrelation → match-filtered
@@ -45,8 +46,8 @@ result.write("diff.fits")
 ```
 
 The convolution direction is auto-selected from the measured seeing and the
-smoothing parameter is chosen by GCV — no per-field tuning. See
-[`docs/USAGE.md`](docs/USAGE.md).
+smoothing parameter is chosen automatically — no per-field tuning. See the
+[usage guide](docs/usage.md).
 
 ## Command line
 
@@ -79,6 +80,20 @@ uv run pytest    # run the smoke tests
 uv run ruff check # lint
 uv run ty check  # type-check
 ```
+
+### Documentation
+
+The docs site is built with [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/)
+and [mkdocstrings](https://mkdocstrings.github.io/) (API reference generated from the
+source docstrings). Build or preview it locally:
+
+```sh
+uv run --group docs mkdocs serve    # live preview at http://127.0.0.1:8000
+uv run --group docs mkdocs build    # static build into site/
+```
+
+A GitHub Actions workflow (`.github/workflows/docs.yml`) builds and deploys to GitHub
+Pages on push to `main`.
 
 ### Git hooks
 

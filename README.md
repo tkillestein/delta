@@ -12,6 +12,9 @@ algorithm, intended as a replacement for HOTPANTS.
 A C++20 core does the numerics; a thin Python layer (zero-copy
 [nanobind](https://nanobind.readthedocs.io) bindings) provides the user-facing API.
 
+> Developed with [Claude Code](https://code.claude.com/docs/en/overview), validated by human, 
+> tested rigorously against real data and existing packages.
+
 ## Key ideas
 
 - **Cartesian Gauss-Hermite (shapelet) kernel basis** ([Refregier 2003][refregier])
@@ -35,10 +38,7 @@ Full documentation is published at **<https://tkilleste.in/delta>** (usage
 guide, API reference, CLI, and the design spec). See [`docs/SPEC.md`](docs/SPEC.md) for
 the design and [`docs/usage.md`](docs/usage.md) for the user guide.
 
-> **Status:** stable (v1.0). The full pipeline — kernel solve → spatially-varying
-> subtraction → variance/mask propagation → noise decorrelation → match-filtered
-> score — works end to end, with astropy interop and a CLI. The public API follows
-> [semantic versioning](https://semver.org).
+The public API follows [semantic versioning](https://semver.org).
 
 ## Quickstart
 

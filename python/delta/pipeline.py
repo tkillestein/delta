@@ -17,7 +17,8 @@ from ._inputs import as_layers, synth_variance
 from ._log import log_timing, logger
 from .solution import KernelSolution
 
-_FWHM_TO_SIGMA = 1.0 / 2.35482
+# 1 / (2*sqrt(2 ln 2)); matches kFwhmPerSigma in src/detect.cpp.
+_FWHM_TO_SIGMA = 1.0 / 2.354820045030949
 
 
 def _log_core_timings(timing: dict | None) -> None:
@@ -141,7 +142,8 @@ class Subtractor:
         self.beta = beta
         self.n_knots = n_knots
         # Kernel footprint half-width; 0 auto-sizes from beta/n_max. Larger values
-        # capture more of the matching-kernel wings (HOTPANTS uses -r ~13).
+        # capture more of the matching-kernel wings (comparable to HOTPANTS' -r,
+        # its convolution-kernel half-width).
         self.radius = radius
         self.stamp_radius = stamp_radius
         self.threshold_sigma = threshold_sigma

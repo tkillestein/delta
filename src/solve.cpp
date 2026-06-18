@@ -72,6 +72,14 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
   // (P = (nc+1)k can be ~700) and Eigen does not reliably thread it here, so we
   // accumulate over row chunks and reduce; each chunk uses a symmetric rankUpdate
   // (lower triangle only). Each thread holds a private P x P partial.
+  // Note: the per-thread P x P partial below is allocated *inside* the parallel
+  // region. A C++ exception (e.g. Eigen std::bad_alloc on a very large P) must not
+  // escape an `omp parallel` body -- that is undefined behavior / std::terminate.
+  // The dominant allocation is this fixed-size P x P partial; P = (nc+1)k is known
+  // before the region and the same allocation is made serially as `m_acc` just
+  // above, so an out-of-memory condition is hit (and throws cleanly) here in serial
+  // first. If P ever becomes caller-controlled enough to risk per-thread OOM, add
+  // an explicit capacity check before this region.
   Eigen::MatrixXd m_acc = Eigen::MatrixXd::Zero(p, p);
   Eigen::VectorXd rhs_acc = Eigen::VectorXd::Zero(p);
   constexpr int kChunk = 2048;

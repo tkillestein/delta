@@ -5,7 +5,8 @@
 
 namespace delta {
 
-// Cartesian Gauss-Hermite (shapelet) kernel basis (SPEC §3.1).
+// Cartesian Gauss-Hermite (shapelet) kernel basis (SPEC §3.1; Refregier 2003,
+// MNRAS 338, 35).
 //
 // The 2-D basis functions are separable:  phi_{nx,ny}(x,y) = g_nx(x) g_ny(y),
 // where the 1-D function of order n and scale beta is

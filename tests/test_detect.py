@@ -110,3 +110,27 @@ def test_select_stamps_from_catalog():
     assert len(sel["x"]) == len(positions)
     assert sel["direction"] == "reference"
     assert sel["median_fwhm_science"] > sel["median_fwhm_reference"]
+
+
+def test_select_stamps_median_finite_with_blank_catalog_positions():
+    # A catalog can name on-frame, unmasked positions with no usable flux, where
+    # estimate_fwhm returns NaN. The FWHM median must stay finite (driven by the
+    # real sources) rather than being poisoned by NaNs through nth_element.
+    img_sci = np.full((200, 200), 100.0, dtype=np.float32)
+    img_ref = np.full((200, 200), 100.0, dtype=np.float32)
+    real = [(70, 70), (130, 110)]
+    for x0, y0 in real:
+        add_star(img_sci, x0, y0, sigma=3.0, flux=peak_flux(500.0, 3.0))
+        add_star(img_ref, x0, y0, sigma=1.5, flux=peak_flux(500.0, 1.5))
+
+    # Mix the two real stars with several flat (source-free) catalog positions.
+    blanks = [(40, 160), (160, 40), (100, 30)]
+    cat = real + blanks
+    cx = np.array([p[0] for p in cat], dtype=np.int32)
+    cy = np.array([p[1] for p in cat], dtype=np.int32)
+    sel = delta.select_stamps(img_sci, img_ref, catalog_x=cx, catalog_y=cy, stamp_radius=16)
+
+    assert np.isfinite(sel["median_fwhm_science"])
+    assert np.isfinite(sel["median_fwhm_reference"])
+    assert sel["median_fwhm_science"] > sel["median_fwhm_reference"]
+    assert sel["direction"] == "reference"

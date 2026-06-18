@@ -10,7 +10,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-FWHM_TO_SIGMA = 1.0 / 2.35482
+# 1 / (2*sqrt(2 ln 2)); matches kFwhmPerSigma in src/detect.cpp.
+FWHM_TO_SIGMA = 1.0 / 2.354820045030949
 
 
 def gaussian_psf(

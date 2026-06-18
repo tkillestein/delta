@@ -4,13 +4,23 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "delta"
-version = "0.0.1"
+version = "1.0.0"
 description = "High-performance astronomical difference imaging (modern Alard & Lupton)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Tom Killestein", email = "thomas.killestein@gmail.com" }]
 dependencies = ["numpy>=1.23", "loguru>=0.7"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
 
 [project.optional-dependencies]
 astropy = ["astropy>=5"]

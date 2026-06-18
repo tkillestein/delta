@@ -12,6 +12,13 @@ constexpr double kFwhmPerSigma = 2.354820045030949;  // 2*sqrt(2 ln 2)
 bool is_finite(float v) { return std::isfinite(v); }
 
 double median_of(std::vector<float>& v) {
+  // Drop non-finite samples first: estimate_fwhm() returns NaN on degenerate
+  // stamps (e.g. catalog positions with no usable flux), and nth_element over a
+  // range containing NaN is order-undefined -- it can return a NaN median, which
+  // then poisons direction selection and the default-beta heuristic downstream.
+  v.erase(std::remove_if(v.begin(), v.end(),
+                         [](float x) { return !is_finite(x); }),
+          v.end());
   if (v.empty()) return 0.0;
   const std::size_t mid = v.size() / 2;
   std::nth_element(v.begin(), v.begin() + mid, v.end());
@@ -19,6 +26,13 @@ double median_of(std::vector<float>& v) {
 }
 
 double median_of(std::vector<double> v) {
+  // Drop non-finite samples first (see the float overload above): the per-stamp
+  // FWHM vectors can contain NaN from degenerate stamps, and nth_element over a
+  // range with NaN is order-undefined and can return a NaN median that then drives
+  // direction selection and the default-beta heuristic.
+  v.erase(std::remove_if(v.begin(), v.end(),
+                         [](double x) { return !std::isfinite(x); }),
+          v.end());
   if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
   const std::size_t mid = v.size() / 2;
   std::nth_element(v.begin(), v.begin() + mid, v.end());

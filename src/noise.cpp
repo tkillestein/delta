@@ -1,10 +1,13 @@
 #include "delta/noise.hpp"
 
-#include <fftw3.h>
+#include <pocketfft_hdronly.h>
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
+#include <cstddef>
 #include <stdexcept>
+#include <vector>
 
 namespace delta {
 
@@ -12,38 +15,54 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// RAII for FFTW single-precision buffers and plans (one block's worth).
+// Single-precision real<->complex 2-D FFT workspace for one n x n block, backed
+// by the vendored header-only PocketFFT (BSD-3; the same FFT used by NumPy/SciPy).
+// PocketFFT is planless and fully re-entrant, so unlike FFTW these objects can be
+// constructed per thread with no global planner lock. The complex spectrum is the
+// half-spectrum {n, n/2+1} in row-major order -- identical layout to FFTW's
+// r2c_2d, so all downstream indexing is unchanged. Transforms are left unnormalised
+// (fct = 1) to match FFTW; callers divide the inverse by n^2 as before.
 struct Fft2d {
   int n;
   int nc;  // n/2 + 1 complex columns
-  float* real;
-  fftwf_complex* freq;
-  fftwf_plan fwd;
-  fftwf_plan inv;
+  std::vector<float> real;                 // n * n, row-major
+  std::vector<std::complex<float>> freq;   // n * nc, row-major half-spectrum
 
   explicit Fft2d(int n_)
       : n(n_),
         nc(n_ / 2 + 1),
-        real(fftwf_alloc_real(static_cast<std::size_t>(n_) * n_)),
-        freq(fftwf_alloc_complex(static_cast<std::size_t>(n_) * (n_ / 2 + 1))) {
-    fwd = fftwf_plan_dft_r2c_2d(n, n, real, freq, FFTW_ESTIMATE);
-    inv = fftwf_plan_dft_c2r_2d(n, n, freq, real, FFTW_ESTIMATE);
+        real(static_cast<std::size_t>(n_) * n_),
+        freq(static_cast<std::size_t>(n_) * (n_ / 2 + 1)) {}
+
+  void forward() {
+    const pocketfft::shape_t shape{static_cast<std::size_t>(n),
+                                   static_cast<std::size_t>(n)};
+    pocketfft::r2c(shape, real_strides(), freq_strides(), pocketfft::shape_t{0, 1},
+                   /*forward=*/true, real.data(), freq.data(), 1.0f);
   }
-  ~Fft2d() {
-    fftwf_destroy_plan(fwd);
-    fftwf_destroy_plan(inv);
-    fftwf_free(real);
-    fftwf_free(freq);
+  void inverse() {
+    const pocketfft::shape_t shape{static_cast<std::size_t>(n),
+                                   static_cast<std::size_t>(n)};
+    pocketfft::c2r(shape, freq_strides(), real_strides(), pocketfft::shape_t{0, 1},
+                   /*forward=*/false, freq.data(), real.data(), 1.0f);
   }
-  Fft2d(const Fft2d&) = delete;
-  Fft2d& operator=(const Fft2d&) = delete;
+
+ private:
+  pocketfft::stride_t real_strides() const {
+    return {static_cast<std::ptrdiff_t>(n) * static_cast<std::ptrdiff_t>(sizeof(float)),
+            static_cast<std::ptrdiff_t>(sizeof(float))};
+  }
+  pocketfft::stride_t freq_strides() const {
+    return {static_cast<std::ptrdiff_t>(nc) *
+                static_cast<std::ptrdiff_t>(sizeof(std::complex<float>)),
+            static_cast<std::ptrdiff_t>(sizeof(std::complex<float>))};
+  }
 };
 
 // |Khat(k)|^2 over the half-spectrum, for a kernel embedded zero-phase in n x n.
 std::vector<double> kernel_power(const std::vector<float>& kernel, int ksize,
                                  int n, Fft2d& fft) {
-  const std::size_t nn = static_cast<std::size_t>(n) * n;
-  std::fill(fft.real, fft.real + nn, 0.0f);
+  std::fill(fft.real.begin(), fft.real.end(), 0.0f);
   const int r = ksize / 2;
   for (int ky = 0; ky < ksize; ++ky) {
     const int gy = ((ky - r) % n + n) % n;  // zero-phase wrap
@@ -53,10 +72,10 @@ std::vector<double> kernel_power(const std::vector<float>& kernel, int ksize,
           kernel[static_cast<std::size_t>(ky) * ksize + kx];
     }
   }
-  fftwf_execute(fft.fwd);
+  fft.forward();
   std::vector<double> power(static_cast<std::size_t>(n) * fft.nc);
   for (std::size_t i = 0; i < power.size(); ++i) {
-    const double re = fft.freq[i][0], im = fft.freq[i][1];
+    const double re = fft.freq[i].real(), im = fft.freq[i].imag();
     power[i] = re * re + im * im;
   }
   return power;
@@ -102,16 +121,13 @@ ImageF apply_filter_fft(const ImageF& block, const std::vector<float>& filter,
     throw std::runtime_error("apply_filter_fft: block must be n x n");
   Fft2d fft(n);
   const std::size_t nn = static_cast<std::size_t>(n) * n;
-  std::copy(block.data(), block.data() + nn, fft.real);
-  fftwf_execute(fft.fwd);
+  std::copy(block.data(), block.data() + nn, fft.real.begin());
+  fft.forward();
   const std::size_t nspec = static_cast<std::size_t>(n) * fft.nc;
   if (filter.size() != nspec)
     throw std::runtime_error("apply_filter_fft: filter size mismatch");
-  for (std::size_t i = 0; i < nspec; ++i) {
-    fft.freq[i][0] *= filter[i];
-    fft.freq[i][1] *= filter[i];
-  }
-  fftwf_execute(fft.inv);
+  for (std::size_t i = 0; i < nspec; ++i) fft.freq[i] *= filter[i];
+  fft.inverse();
   ImageF out(n, n);
   const float inv_n2 = 1.0f / static_cast<float>(nn);
   for (std::size_t i = 0; i < nn; ++i) out.data()[i] = fft.real[i] * inv_n2;
@@ -123,11 +139,9 @@ ImageF decorrelation_kernel_image(const std::vector<float>& filter, int n) {
   const std::size_t nspec = static_cast<std::size_t>(n) * fft.nc;
   if (filter.size() != nspec)
     throw std::runtime_error("decorrelation_kernel_image: filter size mismatch");
-  for (std::size_t i = 0; i < nspec; ++i) {
-    fft.freq[i][0] = filter[i];
-    fft.freq[i][1] = 0.0f;
-  }
-  fftwf_execute(fft.inv);
+  for (std::size_t i = 0; i < nspec; ++i)
+    fft.freq[i] = std::complex<float>(filter[i], 0.0f);
+  fft.inverse();
   const std::size_t nn = static_cast<std::size_t>(n) * n;
   const float inv_n2 = 1.0f / static_cast<float>(nn);
   // fft-shift so the (zero-phase) kernel is centred.
@@ -245,9 +259,10 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
 
   // Flatten the block grid so the (independent, FFT-heavy) blocks distribute
-  // over threads. Each thread builds its own FFTW plans/buffers once -- planning
-  // is not thread-safe (guarded) and was previously redone for every block via
-  // the per-call decorrelation_filter / apply_filter_fft helpers.
+  // over threads. Each thread owns one Fft2d workspace for the whole pass
+  // (PocketFFT is planless and re-entrant, so no planner lock is needed); the
+  // per-call decorrelation_filter / apply_filter_fft helpers previously rebuilt
+  // a workspace for every block.
   //
   // The Hann overlap-add writes into the shared `acc`, and adjacent blocks'
   // 50%-overlapping footprints touch the same pixels, so a naive blend has to be
@@ -295,10 +310,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   std::vector<double> cell_sumk2(ncell);
 #pragma omp parallel
   {
-    Fft2d* fftp = nullptr;
-#pragma omp critical(delta_fftw_plan)
-    { fftp = new Fft2d(block); }
-    Fft2d& fft = *fftp;
+    Fft2d fft(block);
 #pragma omp for schedule(dynamic)
     for (int ci = 0; ci < ncell; ++ci) {
       const int cix = ci % ncellx, ciy = ci / ncellx;
@@ -315,8 +327,6 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       for (float v : kern) sumk2 += static_cast<double>(v) * v;
       cell_sumk2[ci] = sumk2;
     }
-#pragma omp critical(delta_fftw_plan)
-    { delete fftp; }
   }
 
   struct BlockJob {
@@ -351,10 +361,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
 
 #pragma omp parallel
   {
-    Fft2d* fftp = nullptr;
-#pragma omp critical(delta_fftw_plan)
-    { fftp = new Fft2d(block); }
-    Fft2d& fft = *fftp;
+    Fft2d fft(block);
     std::vector<float> buf(nn);
     std::vector<float> filter(nspec);
 
@@ -398,13 +405,10 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
         }
 
         // Apply the filter to this block.
-        std::copy(buf.begin(), buf.end(), fft.real);
-        fftwf_execute(fft.fwd);
-        for (std::size_t i = 0; i < nspec; ++i) {
-          fft.freq[i][0] *= filter[i];
-          fft.freq[i][1] *= filter[i];
-        }
-        fftwf_execute(fft.inv);
+        std::copy(buf.begin(), buf.end(), fft.real.begin());
+        fft.forward();
+        for (std::size_t i = 0; i < nspec; ++i) fft.freq[i] *= filter[i];
+        fft.inverse();
 
         // Hann-weighted overlap-add into the shared accumulator. The weight is
         // the precomputed separable window; wsum is handled analytically (see
@@ -414,7 +418,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
           const int y = by + iy;
           if (y < 0 || y >= h) continue;
           const double wy = hwin[iy] * inv_n2;
-          const float* frow = fft.real + static_cast<std::size_t>(iy) * block;
+          const float* frow = fft.real.data() + static_cast<std::size_t>(iy) * block;
           double* arow = acc.data() + static_cast<std::size_t>(y) * w;
           for (int ix = 0; ix < block; ++ix) {
             const int x = bx + ix;
@@ -424,9 +428,6 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
         }
       }
     }
-
-#pragma omp critical(delta_fftw_plan)
-    { delete fftp; }
   }
 
   ImageF out(w, h);

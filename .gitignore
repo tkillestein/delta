@@ -32,3 +32,6 @@ __pycache__/
 .idea/
 .DS_Store
 compile_commands.json
+
+# Local agent / assistant settings
+.claude/

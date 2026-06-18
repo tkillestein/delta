@@ -39,8 +39,9 @@ after nanobind's default `-Os` (last `-O` wins) because `-Os` disables the
 vectorisation the convolution/variance/score hot loops depend on. Set
 `-DDELTA_NATIVE=OFF` for a portable (non-host-tuned) wheel.
 
-System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen, CFITSIO, FFTW
-(`fftw3f`). OpenMP is used if found.
+System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen (≥ 3.4), CFITSIO.
+The FFT is vendored (header-only PocketFFT, `extern/pocketfft`, BSD-3) — no system FFT
+library is required. OpenMP is used if found.
 
 Enable the pre-commit hook once per clone (`git config core.hooksPath .githooks`); it
 runs ruff fix/format + `ty check` on staged Python and gates the commit.
@@ -66,8 +67,8 @@ orchestrated by the Python package in `python/delta/`.
   `K=Σaₙφₙ` at the tile centre, square it, and convolve `Var(R)` directly — exact for a
   spatially-constant kernel, a per-tile piecewise-constant approximation otherwise, and far
   cheaper than the `nc(nc+1)/2` separable products the exact expansion needs.
-- `noise` — ZOGY-style decorrelation (apodized FFT blocks, FFTW; threaded over blocks with
-  per-thread reused plans) + match-filter score.
+- `noise` — ZOGY-style decorrelation (apodized FFT blocks, vendored PocketFFT; threaded over blocks,
+  one planless FFT workspace per thread) + match-filter score.
 - `fit` — ties stamps + basis + spatial together into the kernel solve.
 
 **Python layer** (`python/delta/`):

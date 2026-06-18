@@ -9,8 +9,11 @@ copyleft; in particular `delta` has **no GPL dependency**.
 ### PocketFFT — `extern/pocketfft/pocketfft_hdronly.h`
 
 Header-only FFT used by the noise-decorrelation stage (`src/noise.cpp`). BSD-3-Clause.
-Upstream: <https://github.com/mreineck/pocketfft>. The full license is retained at the
-top of the vendored header and is reproduced here as required for binary redistribution:
+Upstream: <https://github.com/mreineck/pocketfft> (branch `cpp`), pinned at commit
+`862d90670232e3389e4fd29f820948ef7a048c92`. See `extern/pocketfft/README.md` for the
+exact provenance (commit, SHA-256) and the update procedure. The full license is
+retained at the top of the vendored header and is reproduced here as required for
+binary redistribution:
 
 ```
 Copyright (C) 2010-2024 Max-Planck-Society

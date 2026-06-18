@@ -1,0 +1,1 @@
+--8<-- "benchmarks/PERFORMANCE.md"

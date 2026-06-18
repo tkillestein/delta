@@ -94,6 +94,54 @@ def test_subtract_writes_products(fits_pair, tmp_path):
     assert loaded.direction == "reference"
 
 
+def test_apply_reuses_saved_solution(fits_pair, tmp_path):
+    sci, ref = fits_pair
+    sol = tmp_path / "sol.npz"
+    # Fit once, saving the solution.
+    fit = runner.invoke(
+        app,
+        [
+            "subtract",
+            str(sci),
+            str(ref),
+            "-o",
+            str(tmp_path / "d1.fits"),
+            "--gain",
+            "1.5",
+            "--n-knots",
+            "4",
+            "--stamp-radius",
+            "12",
+            "--save-solution",
+            str(sol),
+        ],
+    )
+    assert fit.exit_code == 0, fit.stdout
+
+    # Apply the saved solution without re-fitting.
+    out = tmp_path / "d2.fits"
+    result = runner.invoke(
+        app,
+        ["apply", str(sol), str(sci), str(ref), "-o", str(out), "--gain", "1.5"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert out.exists()
+
+    diff = delta.read_fits(str(out))["data"]
+    assert diff.shape == (200, 200)
+    # The transient survives as a positive peak.
+    assert diff[140 - 8 : 140 + 9, 60 - 8 : 60 + 9].max() > 5 * np.std(diff)
+
+
+def test_apply_missing_solution(fits_pair, tmp_path):
+    sci, ref = fits_pair
+    result = runner.invoke(
+        app,
+        ["apply", str(tmp_path / "nope.npz"), str(sci), str(ref), "-o", str(tmp_path / "d.fits")],
+    )
+    assert result.exit_code == 2
+
+
 def test_subtract_refuses_overwrite(fits_pair, tmp_path):
     sci, ref = fits_pair
     out = tmp_path / "diff.fits"

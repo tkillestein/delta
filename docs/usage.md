@@ -103,6 +103,16 @@ solution = delta.KernelSolution.load("kernel.npz")
 solution.photometric_scale()      # per-pixel flux-scale field Σ_n a_n S_n
 ```
 
+A saved solution can be **applied** to a new pair without re-fitting — useful for
+subtracting a stack of frames against one reference with a fixed kernel model, or for
+reproducing a previous run. The convolution direction, basis and coefficients all come
+from the solution, and the inputs must match its `shape`:
+
+```python
+result = sub.apply(solution, science2, reference, gain=1.5)   # no re-fit
+result = delta.apply(solution, science2, reference, gain=1.5) # one-shot wrapper
+```
+
 See [`KernelSolution`][delta.KernelSolution] for the serialized fit result and its
 diagnostics.
 

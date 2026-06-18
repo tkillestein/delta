@@ -95,6 +95,39 @@ difference is moved to an extension.
     `cv_folds`, `spatial_scale`, `radius`) are available only through the
     [Python API][delta.Subtractor].
 
+## `delta apply`
+
+Apply a saved kernel solution (`.npz`, from `delta subtract --save-solution` or
+[`KernelSolution.save`][delta.KernelSolution]) to a new science/reference pair and
+subtract — without re-fitting. The convolution direction, basis and coefficients all
+come from the solution; the inputs must match its frame shape.
+
+```sh
+delta apply SOLUTION SCIENCE REFERENCE -o OUTPUT [OPTIONS]
+```
+
+```sh
+delta subtract sci1.fits ref.fits -o diff1.fits --save-solution kernel.npz --gain 1.5
+delta apply kernel.npz sci2.fits ref.fits -o diff2.fits --gain 1.5
+```
+
+**Arguments**
+
+| argument | meaning |
+|---|---|
+| `SOLUTION` | saved kernel solution (`.npz`) from a previous fit |
+| `SCIENCE` | science image FITS path |
+| `REFERENCE` | reference (template) image FITS path |
+
+**Options**
+
+The noise-model (`--science-var`, `--reference-var`, `--gain`, `--read-noise`),
+post-processing (`--decorrelate`, `--score`, `--block`), and output
+(`-o/--output`, `--overwrite`, `--compress`, `-v`, `-q`) options match
+[`delta subtract`](#delta-subtract). The kernel/spatial model is fixed by the
+solution, so only `--saturation` (output mask level) and `--stamp-radius` (score
+PSF half-size) remain from that group.
+
 ## `delta info`
 
 Report the data/variance/mask layers and basic statistics of a FITS file.

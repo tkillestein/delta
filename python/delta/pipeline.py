@@ -20,6 +20,31 @@ from .solution import KernelSolution
 # 1 / (2*sqrt(2 ln 2)); matches kFwhmPerSigma in src/detect.cpp.
 _FWHM_TO_SIGMA = 1.0 / 2.354820045030949
 
+# Keyword names that configure a `Subtractor` (vs. per-call image inputs); used by
+# the `subtract` / `apply` convenience wrappers to split **kwargs.
+_CONFIG_KEYS = frozenset(
+    {
+        "n_max",
+        "beta",
+        "n_knots",
+        "radius",
+        "stamp_radius",
+        "threshold_sigma",
+        "max_stamps",
+        "saturation",
+        "bright_mask",
+        "lambda_grid",
+        "clip_sigma",
+        "clip_iterations",
+        "min_stamps",
+        "cv_folds",
+        "spatial_scale",
+        "decorrelate",
+        "score",
+        "block",
+    }
+)
+
 
 def _log_core_timings(timing: dict | None) -> None:
     """Emit the C++ core's opt-in sub-stage timers (set ``DELTA_TIMING``).
@@ -336,64 +361,59 @@ class Subtractor:
         layers = (target, conv, tvar, cvar, tmask, cmask, sign, stamp_x, stamp_y)
         return solution, layers
 
-    # -- public API ----------------------------------------------------------
-
-    def fit(
+    def _coerce_apply_layers(
         self,
+        solution,
         science,
         reference,
         *,
-        science_var=None,
-        reference_var=None,
-        science_mask=None,
-        reference_mask=None,
-        gain=None,
-        read_noise=0.0,
-        catalog=None,
-        direction=None,
-    ) -> KernelSolution:
-        """Select stamps and fit the kernel/background, returning the solution."""
-        solution, _ = self._fit(
-            science,
-            reference,
-            science_var=science_var,
-            reference_var=reference_var,
-            science_mask=science_mask,
-            reference_mask=reference_mask,
-            gain=gain,
-            read_noise=read_noise,
-            catalog=catalog,
-            direction=direction,
-        )
-        return solution
+        science_var,
+        reference_var,
+        science_mask,
+        reference_mask,
+        gain,
+        read_noise,
+    ):
+        """Build the apply-path ``layers`` tuple from a frozen ``solution``.
 
-    def subtract(
-        self,
-        science,
-        reference,
-        *,
-        science_var=None,
-        reference_var=None,
-        science_mask=None,
-        reference_mask=None,
-        gain=None,
-        read_noise=0.0,
-        catalog=None,
-        direction=None,
-    ) -> DiffResult:
-        """Fit and produce the difference (and optional decorrelation/score)."""
-        solution, layers = self._fit(
-            science,
-            reference,
-            science_var=science_var,
-            reference_var=reference_var,
-            science_mask=science_mask,
-            reference_mask=reference_mask,
-            gain=gain,
-            read_noise=read_noise,
-            catalog=catalog,
-            direction=direction,
-        )
+        Mirrors the input coercion and direction/sign assignment in :meth:`_fit`,
+        but takes the convolution direction from ``solution`` instead of selecting
+        stamps. ``stamp_x``/``stamp_y`` come from the solution's accepted stamps
+        (used only for matched-filter PSF estimation).
+        """
+        sci, svar, smask = as_layers(science, science_var, science_mask)
+        ref, rvar, rmask = as_layers(reference, reference_var, reference_mask)
+        if sci.shape != ref.shape:
+            raise ValueError("science and reference must share a shape")
+        if sci.shape != solution.shape:
+            raise ValueError(
+                f"solution shape {solution.shape} does not match input frame shape {sci.shape}"
+            )
+        if svar is None and gain is not None:
+            svar = synth_variance(sci, gain, read_noise)
+        if rvar is None and gain is not None:
+            rvar = synth_variance(ref, gain, read_noise)
+
+        # Same convention as `_fit`: direction == "science" convolves science to
+        # match reference (the target) and flips the difference sign so transients
+        # stay positive; otherwise reference is convolved to match science.
+        if solution.direction == "science":
+            target, tvar, tmask = ref, rvar, rmask
+            conv, cvar, cmask = sci, svar, smask
+            sign = -1.0
+        else:
+            target, tvar, tmask = sci, svar, smask
+            conv, cvar, cmask = ref, rvar, rmask
+            sign = 1.0
+
+        stamp_x = solution.stamp_x
+        stamp_y = solution.stamp_y
+        return (target, conv, tvar, cvar, tmask, cmask, sign, stamp_x, stamp_y)
+
+    def _subtract(self, solution, layers) -> DiffResult:
+        """Run the full-frame subtraction (+ optional decorrelate/score) for a
+        given ``solution`` and coerced ``layers``. Shared by :meth:`subtract`
+        (fit-then-apply) and :meth:`apply` (frozen solution)."""
         target, conv, tvar, cvar, tmask, cmask, sign, stamp_x, stamp_y = layers
 
         # Output bright-core mask threshold: the lowest positive of the
@@ -463,6 +483,11 @@ class Subtractor:
         score = None
         if self.score:
             with log_timing("matched-filter score"):
+                if stamp_x is None or np.asarray(stamp_x).size == 0:
+                    raise ValueError(
+                        "score requested but the solution carries no stamp positions "
+                        "for PSF estimation"
+                    )
                 psf_radius = min(self.stamp_radius, 8)
                 psf = _estimate_psf(target, stamp_x, stamp_y, psf_radius)
                 if variance is not None:
@@ -481,6 +506,100 @@ class Subtractor:
             solution=solution,
         )
 
+    # -- public API ----------------------------------------------------------
+
+    def fit(
+        self,
+        science,
+        reference,
+        *,
+        science_var=None,
+        reference_var=None,
+        science_mask=None,
+        reference_mask=None,
+        gain=None,
+        read_noise=0.0,
+        catalog=None,
+        direction=None,
+    ) -> KernelSolution:
+        """Select stamps and fit the kernel/background, returning the solution."""
+        solution, _ = self._fit(
+            science,
+            reference,
+            science_var=science_var,
+            reference_var=reference_var,
+            science_mask=science_mask,
+            reference_mask=reference_mask,
+            gain=gain,
+            read_noise=read_noise,
+            catalog=catalog,
+            direction=direction,
+        )
+        return solution
+
+    def subtract(
+        self,
+        science,
+        reference,
+        *,
+        science_var=None,
+        reference_var=None,
+        science_mask=None,
+        reference_mask=None,
+        gain=None,
+        read_noise=0.0,
+        catalog=None,
+        direction=None,
+    ) -> DiffResult:
+        """Fit and produce the difference (and optional decorrelation/score)."""
+        solution, layers = self._fit(
+            science,
+            reference,
+            science_var=science_var,
+            reference_var=reference_var,
+            science_mask=science_mask,
+            reference_mask=reference_mask,
+            gain=gain,
+            read_noise=read_noise,
+            catalog=catalog,
+            direction=direction,
+        )
+        return self._subtract(solution, layers)
+
+    def apply(
+        self,
+        solution: KernelSolution,
+        science,
+        reference,
+        *,
+        science_var=None,
+        reference_var=None,
+        science_mask=None,
+        reference_mask=None,
+        gain=None,
+        read_noise=0.0,
+    ) -> DiffResult:
+        """Apply a frozen ``solution`` to a new pair without re-fitting.
+
+        Runs only the full-frame subtraction (+ optional decorrelation/score)
+        using the supplied :class:`KernelSolution` — the convolution direction,
+        kernel basis, knots and coefficients all come from ``solution``. The
+        inputs must match ``solution.shape``. Use this to reuse one fit across a
+        stack of frames, or to re-apply a saved solution for QA/reproducibility.
+        """
+        layers = self._coerce_apply_layers(
+            solution,
+            science,
+            reference,
+            science_var=science_var,
+            reference_var=reference_var,
+            science_mask=science_mask,
+            reference_mask=reference_mask,
+            gain=gain,
+            read_noise=read_noise,
+        )
+        return self._subtract(solution, layers)
+
 
 def subtract(science, reference, **kwargs) -> DiffResult:
     """Convenience wrapper: configure a :class:`Subtractor` and run it once.
@@ -493,26 +612,22 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
     ``gain``, ``read_noise``, ``catalog``, ``direction``).
     """
-    config_keys = {
-        "n_max",
-        "beta",
-        "n_knots",
-        "radius",
-        "stamp_radius",
-        "threshold_sigma",
-        "max_stamps",
-        "saturation",
-        "bright_mask",
-        "lambda_grid",
-        "clip_sigma",
-        "clip_iterations",
-        "min_stamps",
-        "cv_folds",
-        "spatial_scale",
-        "decorrelate",
-        "score",
-        "block",
-    }
-    config = {k: v for k, v in kwargs.items() if k in config_keys}
-    call = {k: v for k, v in kwargs.items() if k not in config_keys}
+    config = {k: v for k, v in kwargs.items() if k in _CONFIG_KEYS}
+    call = {k: v for k, v in kwargs.items() if k not in _CONFIG_KEYS}
     return Subtractor(**config).subtract(science, reference, **call)
+
+
+def apply(solution: KernelSolution, science, reference, **kwargs) -> DiffResult:
+    """Convenience wrapper: apply a frozen ``solution`` without re-fitting.
+
+    Configuration keywords (a subset of those accepted by :func:`subtract`:
+    ``saturation``, ``bright_mask``, ``stamp_radius``, ``decorrelate``, ``score``,
+    ``block`` — the fit-only knobs are ignored) are split from the per-call inputs
+    (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
+    ``gain``, ``read_noise``). The convolution direction, kernel basis, knots and
+    coefficients all come from ``solution``; the inputs must match
+    ``solution.shape``. See :meth:`Subtractor.apply`.
+    """
+    config = {k: v for k, v in kwargs.items() if k in _CONFIG_KEYS}
+    call = {k: v for k, v in kwargs.items() if k not in _CONFIG_KEYS}
+    return Subtractor(**config).apply(solution, science, reference, **call)

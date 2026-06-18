@@ -36,7 +36,7 @@ from ._core import (
 )
 from ._core import subtract as subtract_model
 from ._inputs import as_layers, synth_variance
-from .pipeline import DiffResult, Subtractor, subtract
+from .pipeline import DiffResult, Subtractor, apply, subtract
 from .solution import KernelSolution
 
 __all__ = [
@@ -44,6 +44,7 @@ __all__ = [
     "KernelSolution",
     "Subtractor",
     "__version__",
+    "apply",
     "as_layers",
     "basis_convolve",
     "decorrelate",

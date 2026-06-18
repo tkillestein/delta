@@ -133,6 +133,44 @@ def test_solution_save_load_roundtrip(tmp_path):
     np.testing.assert_allclose(loaded.photometric_scale(), sol.photometric_scale(), rtol=1e-6)
 
 
+def test_apply_matches_subtract():
+    # A frozen solution applied to the same pair reproduces the fit-then-subtract
+    # difference exactly (same C++ subtract call, no re-fit).
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    sub = delta.Subtractor(n_knots=4, stamp_radius=12)
+    res = sub.subtract(sci, ref, gain=1.5)
+    applied = sub.apply(res.solution, sci, ref, gain=1.5)
+
+    np.testing.assert_array_equal(applied.difference, res.difference)
+    assert applied.solution is res.solution
+
+
+def test_apply_reuses_solution_across_frames(tmp_path):
+    # Fit on one pair, save, reload, and apply to a fresh science frame sharing
+    # the reference. The static field is removed and the new transient survives.
+    ref, sci, amp_t = _pair(sig_ref=1.6, sig_sci=2.4)
+    sol = delta.Subtractor(n_knots=4, stamp_radius=12).fit(sci, ref, gain=1.5)
+
+    path = str(tmp_path / "sol.npz")
+    sol.save(path)
+    loaded = delta.KernelSolution.load(path)
+
+    ref2, sci2, amp_t2 = _pair(sig_ref=1.6, sig_sci=2.4, transient_xy=(160, 40), seed=7)
+    res = delta.apply(loaded, sci2, ref2, gain=1.5)
+
+    assert res.solution.direction == "reference"
+    assert np.abs(_window_max(res.difference, (80, 80))) < 0.25 * amp_t2
+    assert _window_max(res.difference, (160, 40)) > 0.4 * amp_t2
+
+
+def test_apply_shape_mismatch_errors():
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    sol = delta.Subtractor(n_knots=4, stamp_radius=12).fit(sci, ref, gain=1.5)
+    small = sci[:100, :100].copy()
+    with pytest.raises(ValueError, match="solution shape"):
+        delta.apply(sol, small, small, gain=1.5)
+
+
 def test_write_fits_products(tmp_path):
     fits = pytest.importorskip("astropy.io.fits")
     ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)

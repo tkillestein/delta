@@ -6,6 +6,8 @@ score. See the [usage guide](../usage.md) for the per-knob tuning notes.
 
 ::: delta.subtract
 
+::: delta.apply
+
 ::: delta.Subtractor
 
 ::: delta.DiffResult

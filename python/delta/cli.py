@@ -39,6 +39,7 @@ except ImportError as exc:  # pragma: no cover - exercised via the entry point
 from . import __version__
 from ._log import configure_logging, logger
 from .pipeline import Subtractor
+from .solution import KernelSolution
 
 if TYPE_CHECKING:
     from ._core import FitsLayers
@@ -278,6 +279,121 @@ def _write_output(result, output: Path, overwrite: bool, *, compress: bool = Tru
         if result.score is not None:
             logger.warning("astropy not installed; score image and provenance header dropped")
         _core.write_fits(str(output), result.difference, result.variance, result.mask)
+
+
+@app.command()
+def apply(
+    solution: Annotated[
+        Path, typer.Argument(help="Saved kernel solution (.npz) from a previous fit.")
+    ],
+    science: Annotated[Path, typer.Argument(help="Science image FITS path.")],
+    reference: Annotated[Path, typer.Argument(help="Reference (template) image FITS path.")],
+    output: Annotated[
+        Path,
+        typer.Option("-o", "--output", help="Output multi-extension FITS path for the difference."),
+    ],
+    # -- noise model -------------------------------------------------------
+    science_var: Annotated[
+        Path | None, typer.Option("--science-var", help="FITS variance map for science.")
+    ] = None,
+    reference_var: Annotated[
+        Path | None, typer.Option("--reference-var", help="FITS variance map for reference.")
+    ] = None,
+    gain: Annotated[
+        float | None,
+        typer.Option("--gain", help="Detector gain (e-/ADU); synthesises variance if no map."),
+    ] = None,
+    read_noise: Annotated[
+        float, typer.Option("--read-noise", help="Read noise (ADU) for synthesised variance.")
+    ] = 0.0,
+    # -- output model (kernel/spatial knobs come from the solution) --------
+    saturation: Annotated[
+        float, typer.Option("--saturation", help="Output saturation mask level (0=off).")
+    ] = 0.0,
+    stamp_radius: Annotated[
+        int, typer.Option("--stamp-radius", min=1, help="Stamp half-size (px) for the score PSF.")
+    ] = 15,
+    # -- post-processing ---------------------------------------------------
+    decorrelate: Annotated[
+        bool, typer.Option("--decorrelate/--no-decorrelate", help="ZOGY-style noise decorrelation.")
+    ] = False,
+    score: Annotated[
+        bool, typer.Option("--score/--no-score", help="Emit a matched-filter S/N score image.")
+    ] = False,
+    block: Annotated[
+        int, typer.Option("--block", min=32, help="FFT block size for decorrelation.")
+    ] = 256,
+    # -- output / feedback -------------------------------------------------
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Overwrite the output if it exists.")
+    ] = False,
+    compress: Annotated[
+        bool,
+        typer.Option(
+            "--compress/--no-compress",
+            help="Tile-compress (RICE) the output layers; difference moves to an extension.",
+        ),
+    ] = True,
+    verbose: Annotated[
+        int, typer.Option("-v", "--verbose", count=True, help="Increase log verbosity (-v=debug).")
+    ] = 0,
+    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Only warnings and errors.")] = False,
+) -> None:
+    """Apply a saved kernel solution to a new pair and subtract — no re-fitting."""
+    configure_logging(-1 if quiet else verbose)
+
+    if output.exists() and not overwrite:
+        _console.print(f"[red]error:[/] output exists (use --overwrite): {output}")
+        raise typer.Exit(code=2)
+    if not solution.exists():
+        _console.print(f"[red]error:[/] solution file not found: {solution}")
+        raise typer.Exit(code=2)
+    try:
+        sol = KernelSolution.load(str(solution))
+    except Exception as exc:  # noqa: BLE001 - surface any load failure cleanly
+        _console.print(f"[red]error:[/] failed to load solution ({solution}): {exc}")
+        raise typer.Exit(code=2) from exc
+
+    sci = _read_layer(science, "science")
+    ref = _read_layer(reference, "reference")
+    svar = _read_layer(science_var, "science variance")["data"] if science_var else sci["variance"]
+    rvar = (
+        _read_layer(reference_var, "reference variance")["data"]
+        if reference_var
+        else ref["variance"]
+    )
+
+    sub = Subtractor(
+        stamp_radius=stamp_radius,
+        saturation=saturation,
+        decorrelate=decorrelate,
+        score=score,
+        block=block,
+    )
+
+    start = time.perf_counter()
+    try:
+        result = sub.apply(
+            sol,
+            sci["data"],
+            ref["data"],
+            science_var=svar,
+            reference_var=rvar,
+            science_mask=sci["mask"],
+            reference_mask=ref["mask"],
+            gain=gain,
+            read_noise=read_noise,
+        )
+    except ValueError as exc:
+        _console.print(f"[red]error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    elapsed = time.perf_counter() - start
+
+    _write_output(result, output, overwrite, compress=compress)
+
+    if not quiet:
+        _console.print(_summary_table(result, elapsed))
+    _console.print(f"[green]wrote[/] {output}")
 
 
 @app.command()

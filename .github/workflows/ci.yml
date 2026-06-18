@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    concurrency:
+      group: ci-${{ github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # System deps for the C++ core: Eigen, CFITSIO and FFTW (fftw3f) are
+      # resolved via pkg-config (see CMakeLists.txt); OpenMP is optional.
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libeigen3-dev libcfitsio-dev libfftw3-dev
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config eigen cfitsio fftw libomp
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Builds the C++ `_core` extension and installs dev deps.
+      - name: Build + install
+        run: uv sync
+
+      - name: Lint (ruff)
+        run: uv run ruff check
+
+      - name: Format check (ruff)
+        run: uv run ruff format --check
+
+      - name: Type check (ty)
+        run: uv run ty check
+
+      # Exclude the `slow` large-frame marker (see large-frame integration test).
+      - name: Test (pytest)
+        run: uv run pytest -m "not slow"

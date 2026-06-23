@@ -123,6 +123,8 @@ def _summary_table(result, elapsed: float) -> Table:
     table.add_row("RSS", f"{sol.rss:.4g}")
     table.add_row("difference rms", f"{float(np.std(result.difference)):.4g}")
     table.add_row("variance", "yes" if result.variance is not None else "no")
+    if result.variance_scale is not None:
+        table.add_row("variance rescale", f"{result.variance_scale:.4f} (chi2 -> 1)")
     table.add_row("score", "yes" if result.score is not None else "no")
     table.add_row("wall time", f"{elapsed:.3f}s")
     return table
@@ -189,6 +191,13 @@ def subtract(
     block: Annotated[
         int, typer.Option("--block", min=32, help="FFT block size for decorrelation.")
     ] = 256,
+    rescale_variance: Annotated[
+        bool,
+        typer.Option(
+            "--rescale-variance/--no-rescale-variance",
+            help="Rescale variance by a scalar to force the diff-image reduced chi2 to 1.",
+        ),
+    ] = False,
     # -- output / feedback -------------------------------------------------
     save_solution: Annotated[
         Path | None,
@@ -237,6 +246,7 @@ def subtract(
         decorrelate=decorrelate,
         score=score,
         block=block,
+        rescale_variance=rescale_variance,
     )
 
     start = time.perf_counter()
@@ -323,6 +333,13 @@ def apply(
     block: Annotated[
         int, typer.Option("--block", min=32, help="FFT block size for decorrelation.")
     ] = 256,
+    rescale_variance: Annotated[
+        bool,
+        typer.Option(
+            "--rescale-variance/--no-rescale-variance",
+            help="Rescale variance by a scalar to force the diff-image reduced chi2 to 1.",
+        ),
+    ] = False,
     # -- output / feedback -------------------------------------------------
     overwrite: Annotated[
         bool, typer.Option("--overwrite", help="Overwrite the output if it exists.")
@@ -369,6 +386,7 @@ def apply(
         decorrelate=decorrelate,
         score=score,
         block=block,
+        rescale_variance=rescale_variance,
     )
 
     start = time.perf_counter()

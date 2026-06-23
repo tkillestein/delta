@@ -6,7 +6,7 @@ PSF-matching algorithm. See ``docs/SPEC.md`` for the design.
 
 from __future__ import annotations
 
-from . import validation
+from . import catalog, validation
 from ._core import (
     __version__,
     basis_convolve,
@@ -47,6 +47,7 @@ __all__ = [
     "apply",
     "as_layers",
     "basis_convolve",
+    "catalog",
     "decorrelate",
     "decorrelate_block",
     "decorrelation_kernel",

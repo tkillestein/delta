@@ -116,6 +116,38 @@ result = delta.apply(solution, science2, reference, gain=1.5) # one-shot wrapper
 See [`KernelSolution`][delta.KernelSolution] for the serialized fit result and its
 diagnostics.
 
+## Provenance headers
+
+[`DiffResult.write`][delta.DiffResult.write] embeds enough header metadata to
+reproduce a run, independent of any side-channel notes. The cards come from four
+sources, merged in this order (later overrides earlier on key clashes):
+
+1. **Fit** — [`KernelSolution.header_cards`][delta.KernelSolution.header_cards]:
+   `DLTBETA`, `DLTNMAX`, `DLTNKNOT`, `DLTLAM`, `DLTGCV`, `DLTEDOF`, `DLTCHI2`,
+   `DLTNSTU`, `DLTNSTR`, `DLTCONV` — the basis/spatial parameters and fit
+   diagnostics baked into the solution itself.
+2. **Config** — [`Subtractor.config_cards`][delta.Subtractor.config_cards]:
+   `DLTSRAD`, `DLTTHSIG`, `DLTMAXST`, `DLTSAT`, `DLTBMASK`, `DLTCLPSG`,
+   `DLTCLPIT`, `DLTMINST`, `DLTCVF`, `DLTSSCL`, `DLTDECOR`, `DLTSCORE`,
+   `DLTBLK` — the `Subtractor` knobs not already captured by the fit.
+3. **Environment** — `delta._provenance.environment_cards()`: `DLTVERS`
+   (delta version), `DLTGITC` (short git commit of the running checkout, or
+   `"unknown"` outside one), `DLTPYVER`, `DLTHOST`, `DLTUSER`, `DLTPLAT`,
+   `DLTDATE` (UTC timestamp).
+4. **Runtime** — `DLTELAP`, the fit + subtract wall time in seconds
+   (`DiffResult.elapsed`, set by `Subtractor.subtract`/`apply`).
+
+`DiffResult.write(..., extra_cards=...)` adds a fifth layer for context the
+pipeline has no way to know on its own — the `delta` CLI uses this to record
+`DLTSCI`/`DLTREF` (input paths), `DLTSVARF`/`DLTRVARF`/`DLTCAT` (variance/catalog
+paths, if given), `DLTGAIN`/`DLTRN`, `DLTDREQ` (requested `--direction`),
+`DLTSOLF` (solution path, for `delta apply`), and `DLTCMD` (the exact command
+line). Library callers can pass the same keyword to record their own context
+(e.g. input filenames, a pipeline run ID).
+
+`DiffResult.header_cards()` returns the merged dict (sources 1–4) without
+writing a file, if you want the cards for something other than FITS.
+
 ## Validation and benchmarks
 
 - [`delta.validation`][delta.validation] provides synthetic injection/recovery

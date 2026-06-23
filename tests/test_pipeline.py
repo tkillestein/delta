@@ -196,3 +196,28 @@ def test_write_fits_products(tmp_path):
         assert hdul[0].header["DLTCONV"] == "reference"
         assert "VARIANCE" in hdul
         np.testing.assert_allclose(hdul[0].data, res.difference, rtol=1e-6)
+
+
+def test_write_fits_provenance(tmp_path):
+    fits = pytest.importorskip("astropy.io.fits")
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    res = delta.subtract(sci, ref, gain=1.5, n_knots=3, stamp_radius=12)
+
+    assert res.elapsed > 0.0
+    assert res.config["DLTSRAD"] == 12
+
+    path = str(tmp_path / "diff.fits")
+    extra: dict[str, object] = {"DLTSCI": "sci.fits", "DLTCMD": "delta subtract sci.fits ref.fits"}
+    res.write(path, extra_cards=extra)
+    header = fits.getheader(path)
+    # Fit provenance (KernelSolution.header_cards).
+    assert header["DLTCONV"] == "reference"
+    # Config provenance (Subtractor.config_cards), not duplicated from the fit.
+    assert header["DLTSRAD"] == 12
+    # Environment provenance (delta._provenance.environment_cards).
+    assert header["DLTVERS"] == delta.__version__
+    assert "DLTHOST" in header
+    assert header["DLTELAP"] > 0.0
+    # Caller-supplied extra_cards, e.g. input paths / invocation, from the CLI.
+    assert header["DLTSCI"] == "sci.fits"
+    assert "delta subtract" in header["DLTCMD"]

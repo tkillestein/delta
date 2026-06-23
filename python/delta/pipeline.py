@@ -7,7 +7,8 @@ subtract, and optionally decorrelate the noise and build a match-filtered score.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +16,7 @@ from numpy.typing import NDArray
 from . import _core
 from ._inputs import as_layers, synth_variance
 from ._log import log_timing, logger
+from ._provenance import environment_cards
 from .solution import KernelSolution
 
 # 1 / (2*sqrt(2 ln 2)); matches kFwhmPerSigma in src/detect.cpp.
@@ -69,8 +71,35 @@ class DiffResult:
     mask: NDArray[np.uint8] | None
     score: NDArray[np.float32] | None
     solution: KernelSolution
+    # Reproducibility metadata, set by Subtractor.subtract()/apply(): the
+    # configuration knobs that aren't already baked into `solution` (see
+    # Subtractor.config_cards), and the fit+subtract wall time in seconds.
+    config: dict[str, object] = field(default_factory=dict)
+    elapsed: float = float("nan")
 
-    def write(self, path: str, overwrite: bool = False, *, compress: bool = True) -> None:
+    def header_cards(self) -> dict[str, object]:
+        """Full provenance card set: fit + config + environment + runtime.
+
+        Combines :meth:`KernelSolution.header_cards`, the producing
+        ``Subtractor``'s :meth:`~Subtractor.config_cards`, and
+        :func:`delta._provenance.environment_cards`, enough on its own to
+        reproduce this run (modulo the input pixel data itself).
+        """
+        return {
+            **self.solution.header_cards(),
+            **self.config,
+            **environment_cards(),
+            "DLTELAP": self.elapsed,
+        }
+
+    def write(
+        self,
+        path: str,
+        overwrite: bool = False,
+        *,
+        compress: bool = True,
+        extra_cards: dict[str, object] | None = None,
+    ) -> None:
         """Write products to a multi-extension FITS with provenance (needs astropy).
 
         With ``compress`` (the default) each image layer is stored as a tile-
@@ -79,10 +108,16 @@ class DiffResult:
         cannot itself be compressed, so the provenance header lives in a
         dataless primary and the difference moves to a ``DIFFERENCE`` extension.
         Pass ``compress=False`` for the plain layout (difference in the primary).
+
+        ``extra_cards`` adds/overrides header cards on top of
+        :meth:`header_cards` — e.g. input file paths or the invoking command
+        line, which this method has no way to know on its own.
         """
         from astropy.io import fits  # optional dependency
 
-        cards = self.solution.header_cards()
+        cards = self.header_cards()
+        if extra_cards:
+            cards.update(extra_cards)
         layers = [("VARIANCE", self.variance), ("MASK", self.mask), ("SCORE", self.score)]
         hdus: list[fits.hdu.base._BaseHDU]
         if compress:
@@ -197,6 +232,24 @@ class Subtractor:
         self.decorrelate = decorrelate
         self.score = score
         self.block = block
+
+    def config_cards(self) -> dict[str, object]:
+        """Reproducibility cards for knobs not already in KernelSolution.header_cards()."""
+        return {
+            "DLTSRAD": self.stamp_radius,
+            "DLTTHSIG": self.threshold_sigma,
+            "DLTMAXST": self.max_stamps,
+            "DLTSAT": self.saturation,
+            "DLTBMASK": self.bright_mask,
+            "DLTCLPSG": self.clip_sigma,
+            "DLTCLPIT": self.clip_iterations,
+            "DLTMINST": self.min_stamps,
+            "DLTCVF": self.cv_folds,
+            "DLTSSCL": self.spatial_scale if self.spatial_scale is not None else 0.0,
+            "DLTDECOR": self.decorrelate,
+            "DLTSCORE": self.score,
+            "DLTBLK": self.block,
+        }
 
     # -- internals -----------------------------------------------------------
 
@@ -552,6 +605,7 @@ class Subtractor:
         direction=None,
     ) -> DiffResult:
         """Fit and produce the difference (and optional decorrelation/score)."""
+        start = time.perf_counter()
         solution, layers = self._fit(
             science,
             reference,
@@ -564,7 +618,10 @@ class Subtractor:
             catalog=catalog,
             direction=direction,
         )
-        return self._subtract(solution, layers)
+        result = self._subtract(solution, layers)
+        result.config = self.config_cards()
+        result.elapsed = time.perf_counter() - start
+        return result
 
     def apply(
         self,
@@ -587,6 +644,7 @@ class Subtractor:
         inputs must match ``solution.shape``. Use this to reuse one fit across a
         stack of frames, or to re-apply a saved solution for QA/reproducibility.
         """
+        start = time.perf_counter()
         layers = self._coerce_apply_layers(
             solution,
             science,
@@ -598,7 +656,10 @@ class Subtractor:
             gain=gain,
             read_noise=read_noise,
         )
-        return self._subtract(solution, layers)
+        result = self._subtract(solution, layers)
+        result.config = self.config_cards()
+        result.elapsed = time.perf_counter() - start
+        return result
 
 
 def subtract(science, reference, **kwargs) -> DiffResult:

@@ -75,13 +75,22 @@ orchestrated by the Python package in `python/delta/`.
 - `pipeline.py` — `Subtractor` class and `subtract()` convenience wrapper. This is the
   orchestration brain: coerces inputs, selects stamps, picks convolution direction and
   `beta`, calls `_core.fit_kernel` / `_core.subtract`, optional decorrelate + score.
+  `Subtractor.config_cards()` and `DiffResult.{config,elapsed,header_cards,write}` are
+  the config/runtime half of FITS provenance (see below).
 - `solution.py` — `KernelSolution` dataclass: the serializable (`.npz`) fit result
-  (basis params, knots, `theta`, GCV diagnostics) + FITS provenance header cards.
+  (basis params, knots, `theta`, GCV diagnostics) + `header_cards()` (the fit half of
+  FITS provenance).
+- `_provenance.py` — `environment_cards()`: the software/host half of FITS provenance
+  (delta version, git commit of the running checkout, Python version, hostname,
+  username, platform, UTC timestamp). Best-effort everywhere (e.g. `DLTGITC` is
+  `"unknown"` outside a git checkout) since most installs aren't a source checkout.
 - `_inputs.py` — input coercion (`as_layers`, `synth_variance`); numpy/astropy interop.
 - `validation.py` — QA/validation helpers.
-- `cli.py` — standalone `delta` CLI (Typer + Rich, `cli` extra): `subtract` and
-  `info` commands over the pipeline. Entry point `delta.cli:run`
-  (`[project.scripts]`). Errors/tables print to stderr via Rich.
+- `cli.py` — standalone `delta` CLI (Typer + Rich, `cli` extra): `subtract`, `apply`,
+  and `info` commands over the pipeline. Entry point `delta.cli:run`
+  (`[project.scripts]`). Errors/tables print to stderr via Rich. `_input_cards()`
+  supplies the `extra_cards` layer of provenance `pipeline.py` has no way to know on
+  its own: input/solution file paths, noise-model knobs, and the invoked command line.
 - `_log.py` — loguru logging plumbing. The library logs through loguru's global
   `logger` and is silent by default (`logger.disable("delta")`); the CLI calls
   `configure_logging(verbosity)` to add a stderr sink and `enable` the namespace.
@@ -110,6 +119,13 @@ solve linear in `θ = {c_nm, b_m}`. `theta` is ordered `[c_0 | … | c_{nc-1} | 
 - **Bindings**: results cross to Python as zero-copy NumPy arrays (`to_numpy` moves a
   `std::vector` into a capsule-owned ndarray). C++ functions return `nb::dict`s that the
   Python layer unpacks.
+- **FITS provenance** (SPEC §8): `DiffResult.write()` merges four card layers — fit
+  (`KernelSolution.header_cards`), config (`Subtractor.config_cards`), environment
+  (`_provenance.environment_cards`), and runtime (`DiffResult.elapsed`) — plus an
+  optional `extra_cards` layer for caller-supplied context (the CLI uses it for input
+  paths and the invoked command line). All keys are `DLT`-prefixed and ≤8 chars
+  (plain FITS keywords, no `HIERARCH`); see `docs/usage.md` "Provenance headers" for
+  the full card reference.
 
 ## Tests & benchmarks
 

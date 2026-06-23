@@ -263,8 +263,11 @@ Object-oriented path (`delta.Subtractor`) for reusing a solution / batch runs.
 - Output **mask** (grown bad/saturated/edge pixels) and serializable
   **kernel/background solution** available for QA/reuse (not headline products but
   produced internally).
-- FITS output with provenance in headers (basis params, β, n_max, knots, λ, GCV
-  score, photometric scale, convolution direction).
+- FITS output with provenance in headers: fit params (basis β/n_max, knots, λ, GCV
+  score, convolution direction), `Subtractor` configuration (stamp/clipping/CV
+  knobs), software/host environment (version, git commit, hostname, user, platform,
+  UTC timestamp), and run timing — enough to reproduce a run without external notes.
+  See `docs/usage.md` "Provenance headers" for the full card reference.
 
 ---
 

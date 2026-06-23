@@ -128,6 +128,13 @@ post-processing (`--decorrelate`, `--score`, `--block`), and output
 solution, so only `--saturation` (output mask level) and `--stamp-radius` (score
 PSF half-size) remain from that group.
 
+## Provenance
+
+Every FITS product written by `delta subtract` / `delta apply` (and
+[`DiffResult.write`][delta.DiffResult.write] in the Python API) carries a full
+provenance header — see [Provenance headers](usage.md#provenance-headers) for the
+complete card reference.
+
 ## `delta info`
 
 Report the data/variance/mask layers and basic statistics of a FITS file.

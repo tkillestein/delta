@@ -44,8 +44,37 @@ _CONFIG_KEYS = frozenset(
         "decorrelate",
         "score",
         "block",
+        "rescale_variance",
     }
 )
+
+# Median of a chi-square_1 (squared standard normal) distribution. Used to turn a
+# robust median(z^2) into a reduced-chi2-equivalent scale factor without the
+# mean's sensitivity to high-|z| outliers (genuine transients).
+_MEDIAN_CHI2_1 = 0.4549364231195724
+
+
+def _variance_rescale_factor(
+    difference: NDArray[np.float32],
+    variance: NDArray[np.float32],
+    mask: NDArray[np.uint8] | None,
+) -> float:
+    """Scalar by which to multiply ``variance`` so the diff-image reduced chi2 -> 1.
+
+    ``median(difference^2 / variance) / median(chi2_1)`` is the median-based
+    analogue of a reduced chi2: under a correctly-scaled Gaussian noise model
+    ``z = difference / sqrt(variance)`` is standard normal, so ``z^2`` has
+    median 0.4549. Using the median rather than the mean keeps real transients
+    (which are deliberately high-|z| outliers, not noise) from inflating the
+    correction.
+    """
+    good = (variance > 0) & np.isfinite(difference) & np.isfinite(variance)
+    if mask is not None:
+        good &= mask == 0
+    if not np.any(good):
+        return 1.0
+    z2 = difference[good].astype(np.float64) ** 2 / variance[good].astype(np.float64)
+    return float(np.median(z2) / _MEDIAN_CHI2_1)
 
 
 def _log_core_timings(timing: dict | None) -> None:
@@ -76,6 +105,9 @@ class DiffResult:
     # Subtractor.config_cards), and the fit+subtract wall time in seconds.
     config: dict[str, object] = field(default_factory=dict)
     elapsed: float = float("nan")
+    # Scalar applied to `variance` (post-subtraction) to force the diff-image
+    # reduced chi2 to 1; None when `rescale_variance` was not requested.
+    variance_scale: float | None = None
 
     def header_cards(self) -> dict[str, object]:
         """Full provenance card set: fit + config + environment + runtime.
@@ -116,6 +148,8 @@ class DiffResult:
         from astropy.io import fits  # optional dependency
 
         cards = self.header_cards()
+        if self.variance_scale is not None:
+            cards["DLTVSCL"] = self.variance_scale
         if extra_cards:
             cards.update(extra_cards)
         layers = [("VARIANCE", self.variance), ("MASK", self.mask), ("SCORE", self.score)]
@@ -197,6 +231,7 @@ class Subtractor:
         decorrelate: bool = False,
         score: bool = False,
         block: int = 256,
+        rescale_variance: bool = False,
     ) -> None:
         self.n_max = n_max
         self.beta = beta
@@ -232,6 +267,11 @@ class Subtractor:
         self.decorrelate = decorrelate
         self.score = score
         self.block = block
+        # Forces the diff-image reduced chi2 to 1 by rescaling `variance` with a
+        # single robust scalar (SPEC §3.4) -- a post-hoc correction for noise
+        # models (gain/read-noise, or propagated science/reference variance)
+        # that under- or over-estimate the true pixel noise.
+        self.rescale_variance = rescale_variance
 
     def config_cards(self) -> dict[str, object]:
         """Reproducibility cards for knobs not already in KernelSolution.header_cards()."""
@@ -501,6 +541,16 @@ class Subtractor:
             np.negative(difference, out=difference)
         variance = diff["variance"]
         mask = diff["mask"]
+        variance_scale = None
+        if self.rescale_variance and variance is not None:
+            variance_scale = _variance_rescale_factor(difference, variance, mask)
+            variance = variance * variance_scale
+            logger.info(
+                "variance rescaled by {:.4f} to force diff-image reduced chi2=1",
+                variance_scale,
+            )
+        elif self.rescale_variance:
+            logger.warning("variance rescale requested but no variance available; skipping")
         # rms / masked-fraction are log-only and span the full frame (np.std over
         # 64 Mpix is ~0.4s); evaluate them lazily so the silent-by-default library
         # never pays for a message no sink will emit.
@@ -557,6 +607,7 @@ class Subtractor:
             mask=mask,
             score=score,
             solution=solution,
+            variance_scale=variance_scale,
         )
 
     # -- public API ----------------------------------------------------------
@@ -668,8 +719,8 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     Configuration keywords (``n_max``, ``beta``, ``n_knots``, ``stamp_radius``,
     ``threshold_sigma``, ``max_stamps``, ``saturation``, ``bright_mask``,
     ``lambda_grid``, ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
-    ``spatial_scale``, ``decorrelate``, ``score``, ``block``) are split from
-    the per-call inputs
+    ``spatial_scale``, ``decorrelate``, ``score``, ``block``, ``rescale_variance``)
+    are split from the per-call inputs
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
     ``gain``, ``read_noise``, ``catalog``, ``direction``).
     """

@@ -142,6 +142,13 @@ minimize  ‖W^½ (d − X θ)‖²  +  λ θᵀ P θ
   between adjacent blocks introduces no visible seam.
 - **Score image (optional):** PSF-matched filter of the decorrelated difference →
   per-pixel S/N map for direct detection/thresholding.
+- **Variance rescale (optional):** noise models (synthesized gain/read-noise, or
+  propagated input variance maps) are frequently mis-scaled relative to the true
+  pixel noise. A single scalar factor, chosen so the diff-image reduced chi-squared
+  (`median(D²/Var(D))` over good pixels, normalized by the median of a chi-square_1
+  distribution so genuine transients don't bias the estimate) equals 1, is applied
+  to `Var(D)` post-hoc. Off by default; the factor is reported and recorded in the
+  output provenance (`DLTVSCL`) when requested.
 
 ### 3.5 Stamps & convolution direction
 

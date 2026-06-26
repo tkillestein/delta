@@ -89,6 +89,7 @@ nav:
       - Kernel solution: api/solution.md
       - Inputs: api/inputs.md
       - Validation: api/validation.md
+      - Source catalog: api/catalog.md
       - Core (low-level): api/core.md
   - Design (SPEC): design.md
   - Performance: performance.md

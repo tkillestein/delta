@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "delta/basis.hpp"
+#include "delta/catalog.hpp"
 #include "delta/convolve.hpp"
 #include "delta/detect.hpp"
 #include "delta/fit.hpp"
@@ -45,17 +46,22 @@ using InArray1D =
     nb::ndarray<const T, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 // Build an ImageF from a 2-D float array and an optional bad-pixel mask.
+//
+// Uses ImageF's range constructor (one allocate+copy pass) rather than
+// `ImageF(w,h)` followed by a fill: the latter's zero-initialisation is
+// wasted work the caller immediately overwrites, and at survey-cadence sizes
+// (8000x6000, ~48M px) that redundant pass was measured (DELTA_TIMING) to
+// cost a third of build_catalog's total. Likewise `mask().assign(...)`
+// (single pass) instead of `allocate_mask()` (zero-init) + a fill.
 delta::ImageF make_image(InArray<float> data,
                          std::optional<InArray<std::uint8_t>> mask) {
   const std::size_t h = data.shape(0);
   const std::size_t w = data.shape(1);
-  delta::ImageF img(w, h);
-  std::copy(data.data(), data.data() + h * w, img.pixels().begin());
+  delta::ImageF img(w, h, data.data());
   if (mask) {
     if (mask->shape(0) != h || mask->shape(1) != w)
       throw std::runtime_error("mask shape does not match data");
-    img.allocate_mask();
-    std::copy(mask->data(), mask->data() + h * w, img.mask().begin());
+    img.mask().assign(mask->data(), mask->data() + h * w);
   }
   return img;
 }
@@ -305,6 +311,108 @@ nb::dict select_stamps(InArray<float> science, InArray<float> reference,
   out["median_fwhm_science"] = sel.median_fwhm_science;
   out["median_fwhm_reference"] = sel.median_fwhm_reference;
   out["direction"] = delta::to_string(sel.direction);
+  return out;
+}
+
+// Drain the opt-in C++ sub-stage timers (DELTA_TIMING) into a {label: seconds}
+// dict, or None when timing is disabled (so callers can branch cheaply).
+// Forward-declared here, defined below (used by both `build_catalog` and
+// `subtract`).
+nb::object timing_dict();
+
+// ---- catalog (connected-component source catalog from the score image) ---
+
+delta::CatalogParams make_catalog_params(double threshold_sigma,
+                                         double threshold_sigma_dipole,
+                                         double expected_fwhm,
+                                         double fwhm_tolerance_lo,
+                                         double fwhm_tolerance_hi,
+                                         int aperture_radius,
+                                         bool exclude_bad_pixels) {
+  delta::CatalogParams p;
+  p.threshold_sigma = threshold_sigma;
+  p.threshold_sigma_dipole = threshold_sigma_dipole;
+  p.expected_fwhm = expected_fwhm;
+  p.fwhm_tolerance_lo = fwhm_tolerance_lo;
+  p.fwhm_tolerance_hi = fwhm_tolerance_hi;
+  p.aperture_radius = aperture_radius;
+  p.exclude_bad_pixels = exclude_bad_pixels;
+  return p;
+}
+
+// Connected-component source catalog from a match-filtered score image
+// (SPEC §3.7) -> column arrays.
+nb::dict build_catalog(InArray<float> score, InArray<float> difference,
+                       std::optional<InArray<std::uint8_t>> mask,
+                       double threshold_sigma, double threshold_sigma_dipole,
+                       double expected_fwhm, double fwhm_tolerance_lo,
+                       double fwhm_tolerance_hi, int aperture_radius,
+                       bool exclude_bad_pixels, bool return_negative) {
+  if (difference.shape(0) != score.shape(0) ||
+      difference.shape(1) != score.shape(1)) {
+    throw std::runtime_error("build_catalog: difference shape must match score");
+  }
+  delta::timing::clear();
+  delta::ImageF score_img, diff_img;
+  {
+    DELTA_TIME("catalog: marshal input");
+    score_img = make_image(score, mask);
+    diff_img = delta::ImageF(difference.shape(1), difference.shape(0), difference.data());
+  }
+
+  const delta::CatalogParams p = make_catalog_params(
+      threshold_sigma, threshold_sigma_dipole, expected_fwhm,
+      fwhm_tolerance_lo, fwhm_tolerance_hi, aperture_radius, exclude_bad_pixels);
+  const std::vector<delta::CatalogEntry> entries =
+      delta::build_catalog(score_img, diff_img, p, return_negative);
+
+  const std::size_t n = entries.size();
+  std::vector<double> x, y, peak_snr, flux, expected_n_pix, fwhm_ratio;
+  std::vector<std::int32_t> peak_x, peak_y, n_pix;
+  std::vector<std::uint8_t> mask_flags, fwhm_consistent, is_dipole, quality;
+  {
+    DELTA_TIME("catalog: marshal output");
+    x.reserve(n); y.reserve(n); peak_x.reserve(n); peak_y.reserve(n);
+    peak_snr.reserve(n); n_pix.reserve(n); flux.reserve(n);
+    expected_n_pix.reserve(n); fwhm_ratio.reserve(n);
+    mask_flags.reserve(n); fwhm_consistent.reserve(n); is_dipole.reserve(n);
+    quality.reserve(n);
+    for (const delta::CatalogEntry& e : entries) {
+      x.push_back(e.x);
+      y.push_back(e.y);
+      peak_x.push_back(e.peak_x);
+      peak_y.push_back(e.peak_y);
+      peak_snr.push_back(e.peak_snr);
+      n_pix.push_back(e.n_pix);
+      flux.push_back(e.flux);
+      expected_n_pix.push_back(e.expected_n_pix);
+      fwhm_ratio.push_back(e.fwhm_ratio);
+      mask_flags.push_back(e.mask_flags);
+      fwhm_consistent.push_back(e.fwhm_consistent ? 1 : 0);
+      is_dipole.push_back(e.is_dipole ? 1 : 0);
+      quality.push_back(e.quality);
+    }
+  }
+
+  // Drained after every DELTA_TIME scope above has destructed (each timer
+  // records on scope exit), so this captures the full breakdown.
+  nb::object timing = timing_dict();
+
+  nb::dict out;
+  out["x"] = to_numpy<double>(std::move(x), {n});
+  out["y"] = to_numpy<double>(std::move(y), {n});
+  out["peak_x"] = to_numpy<std::int32_t>(std::move(peak_x), {n});
+  out["peak_y"] = to_numpy<std::int32_t>(std::move(peak_y), {n});
+  out["peak_snr"] = to_numpy<double>(std::move(peak_snr), {n});
+  out["n_pix"] = to_numpy<std::int32_t>(std::move(n_pix), {n});
+  out["flux"] = to_numpy<double>(std::move(flux), {n});
+  out["expected_n_pix"] = to_numpy<double>(std::move(expected_n_pix), {n});
+  out["fwhm_ratio"] = to_numpy<double>(std::move(fwhm_ratio), {n});
+  out["fwhm_consistent"] = to_numpy<std::uint8_t>(std::move(fwhm_consistent), {n});
+  out["mask_flags"] = to_numpy<std::uint8_t>(std::move(mask_flags), {n});
+  out["is_dipole"] = to_numpy<std::uint8_t>(std::move(is_dipole), {n});
+  out["quality"] = to_numpy<std::uint8_t>(std::move(quality), {n});
+  out["timing"] = timing;
   return out;
 }
 
@@ -668,6 +776,16 @@ NB_MODULE(_core, m) {
         "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
         "Select matched stamps across both images and the convolution "
         "direction.");
+  m.def("build_catalog", &build_catalog, "score"_a, "difference"_a,
+        "mask"_a = nb::none(), "threshold_sigma"_a = 5.0,
+        "threshold_sigma_dipole"_a = 3.0, "expected_fwhm"_a = 3.5,
+        "fwhm_tolerance_lo"_a = 0.3, "fwhm_tolerance_hi"_a = 3.0,
+        "aperture_radius"_a = 0, "exclude_bad_pixels"_a = true,
+        "return_negative"_a = false,
+        "Connected-component source catalog from a match-filtered score "
+        "image (SPEC §3.7): 8-connected positive/negative blobs, "
+        "FWHM-consistency filter, dipole flagging, mask-flag aggregation, "
+        "aperture flux on `difference`.");
 
   m.def("grid_knots", &delta::grid_knots, "x0"_a, "y0"_a, "x1"_a, "y1"_a,
         "nx"_a, "ny"_a, "Regular nx*ny grid of knots over [x0,x1]x[y0,y1].");

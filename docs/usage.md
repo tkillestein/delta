@@ -20,10 +20,18 @@ result.difference   # PSF-matched difference (transients positive)
 result.variance     # propagated per-pixel variance
 result.mask         # grown bad/edge mask
 result.score        # match-filtered S/N map (when score=True)
+result.source_catalog  # candidate catalog from the score image (auto-built when score=True)
 result.solution     # serializable KernelSolution (QA / reuse)
 
 result.write("diff.fits")        # multi-extension FITS with provenance (needs astropy)
 ```
+
+`source_catalog` is a connected-component candidate catalog built from `score`
+(position, peak S/N, pixel count, aperture flux, an FWHM-consistency flag, and
+a dipole/bad-subtraction flag — see [`delta.catalog`][delta.catalog]). It's
+built automatically whenever `score=True`; pass `source_catalog=False` to skip
+it, or call `result.build_catalog(...)` to rebuild with custom thresholds.
+`write()` includes it as a `CATALOG` table extension when present.
 
 `delta.subtract` auto-detects PSF-matching stamps, measures the seeing in both
 frames, and convolves the sharper image to match the broader one — the convolution
@@ -129,7 +137,7 @@ sources, merged in this order (later overrides earlier on key clashes):
 2. **Config** — [`Subtractor.config_cards`][delta.Subtractor.config_cards]:
    `DLTSRAD`, `DLTTHSIG`, `DLTMAXST`, `DLTSAT`, `DLTBMASK`, `DLTCLPSG`,
    `DLTCLPIT`, `DLTMINST`, `DLTCVF`, `DLTSSCL`, `DLTDECOR`, `DLTSCORE`,
-   `DLTBLK` — the `Subtractor` knobs not already captured by the fit.
+   `DLTSCAT`, `DLTBLK` — the `Subtractor` knobs not already captured by the fit.
 3. **Environment** — `delta._provenance.environment_cards()`: `DLTVERS`
    (delta version), `DLTGITC` (short git commit of the running checkout, or
    `"unknown"` outside one), `DLTPYVER`, `DLTHOST`, `DLTUSER`, `DLTPLAT`,

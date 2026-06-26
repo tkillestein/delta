@@ -43,6 +43,7 @@ _CONFIG_KEYS = frozenset(
         "spatial_scale",
         "decorrelate",
         "score",
+        "source_catalog",
         "block",
         "rescale_variance",
     }
@@ -100,6 +101,17 @@ class DiffResult:
     mask: NDArray[np.uint8] | None
     score: NDArray[np.float32] | None
     solution: KernelSolution
+    # The PSF stamp built for the match filter (None unless `score=True`);
+    # carried so `build_catalog()` can derive the expected FWHM without
+    # recomputing `_estimate_psf` from raw images, which `DiffResult` no
+    # longer has.
+    psf: NDArray[np.float32] | None = None
+    # Source catalog from the score image (SPEC §3.7), auto-built by default
+    # whenever `score=True` (toggle: `Subtractor(source_catalog=False)`). A
+    # structured NumPy array (`delta.catalog.CATALOG_DTYPE`), or None when
+    # `score` or `source_catalog` was off. Use `build_catalog()` to rebuild
+    # with custom thresholds without re-running `subtract()`.
+    source_catalog: NDArray | None = None
     # Reproducibility metadata, set by Subtractor.subtract()/apply(): the
     # configuration knobs that aren't already baked into `solution` (see
     # Subtractor.config_cards), and the fit+subtract wall time in seconds.
@@ -166,7 +178,49 @@ class DiffResult:
                 primary.header[key] = value
             hdus = [primary]
             hdus += [fits.ImageHDU(a, name=n) for n, a in layers if a is not None]
+        if self.source_catalog is not None:
+            hdus.append(fits.BinTableHDU(self.source_catalog, name="CATALOG"))
         fits.HDUList(hdus).writeto(path, overwrite=overwrite)
+
+    def build_catalog(
+        self,
+        *,
+        threshold_sigma: float = 5.0,
+        threshold_sigma_dipole: float = 3.0,
+        fwhm_tolerance_lo: float = 0.3,
+        fwhm_tolerance_hi: float = 3.0,
+        aperture_radius: int = 0,
+        exclude_bad_pixels: bool = True,
+        as_table: bool = False,
+    ):
+        """Rebuild the source catalog from `self.score` with custom thresholds
+        (SPEC §3.7), instead of the defaults used to auto-populate
+        `self.source_catalog`.
+
+        The expected PSF FWHM is measured from `self.psf` (the stamp built for
+        the match filter); requires the originating ``subtract()`` /
+        ``Subtractor.subtract()`` call to have used ``score=True``.
+        """
+        if self.score is None or self.psf is None:
+            raise ValueError(
+                "build_catalog() requires a score image and PSF stamp; pass score=True "
+                "to subtract()"
+            )
+        from .catalog import build_catalog as _build_catalog
+
+        return _build_catalog(
+            self.score,
+            self.difference,
+            mask=self.mask,
+            psf=self.psf,
+            threshold_sigma=threshold_sigma,
+            threshold_sigma_dipole=threshold_sigma_dipole,
+            fwhm_tolerance_lo=fwhm_tolerance_lo,
+            fwhm_tolerance_hi=fwhm_tolerance_hi,
+            aperture_radius=aperture_radius,
+            exclude_bad_pixels=exclude_bad_pixels,
+            as_table=as_table,
+        )
 
 
 def _default_beta(fwhm_a: float, fwhm_b: float) -> float:
@@ -230,6 +284,7 @@ class Subtractor:
         spatial_scale: float | None = None,
         decorrelate: bool = False,
         score: bool = False,
+        source_catalog: bool = True,
         block: int = 256,
         rescale_variance: bool = False,
     ) -> None:
@@ -266,6 +321,10 @@ class Subtractor:
         self.spatial_scale = spatial_scale
         self.decorrelate = decorrelate
         self.score = score
+        # Source catalog from the score image (SPEC §3.7), built by default
+        # whenever `score` is also on; set False to skip (e.g. for callers
+        # who only want the score image itself, or care about latency).
+        self.source_catalog = source_catalog
         self.block = block
         # Forces the diff-image reduced chi2 to 1 by rescaling `variance` with a
         # single robust scalar (SPEC §3.4) -- a post-hoc correction for noise
@@ -288,6 +347,7 @@ class Subtractor:
             "DLTSSCL": self.spatial_scale if self.spatial_scale is not None else 0.0,
             "DLTDECOR": self.decorrelate,
             "DLTSCORE": self.score,
+            "DLTSCAT": self.source_catalog,
             "DLTBLK": self.block,
         }
 
@@ -584,6 +644,7 @@ class Subtractor:
                 logger.warning("decorrelation requested but no variance available; skipping")
 
         score = None
+        psf = None
         if self.score:
             with log_timing("matched-filter score"):
                 if stamp_x is None or np.asarray(stamp_x).size == 0:
@@ -601,12 +662,22 @@ class Subtractor:
                 score = _core.matched_filter(whitened, psf, score_var)
 
         out_diff = whitened if self.decorrelate else difference
+
+        source_catalog = None
+        if score is not None and self.source_catalog:
+            with log_timing("catalog"):
+                from .catalog import build_catalog as _build_catalog
+
+                source_catalog = _build_catalog(score, out_diff, mask=mask, psf=psf)
+
         return DiffResult(
             difference=out_diff,
             variance=variance,
             mask=mask,
             score=score,
             solution=solution,
+            psf=psf,
+            source_catalog=source_catalog,
             variance_scale=variance_scale,
         )
 

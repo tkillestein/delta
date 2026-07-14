@@ -56,18 +56,35 @@ ImageF decorrelation_kernel_image(const std::vector<float>& filter, int n);
 // cell instead of per block; the per-block noise levels and the two data FFTs stay
 // exact). `kernel_cell_blocks <= 0` auto-selects the cell size from the knot
 // spacing; `1` recomputes the kernel per block (exact, used for validation).
+//
+// The returned image carries a variance layer: the post-whitening noise level
+// σ_D² = v_S + v_R ΣK² per block, Hann-blended like the difference. Phi is
+// normalised so whitened pixels have this variance (not the pre-whitening
+// propagated Var(D) map); use it for pulls and the match-filtered score.
 ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
                    const Eigen::Ref<const Eigen::VectorXd>& theta,
                    const GaussHermiteBasis& basis, const ImageF& var_science,
                    const ImageF& var_reference, int block,
                    int kernel_cell_blocks = 0);
 
+// Apply the ZOGY decorrelation filter Phi(k) to a centred PSF stamp so the
+// result is the effective point-source profile in a whitened difference.
+// Embeds `psf` zero-phase in an `n` x `n` FFT (n >= psf_size; typically the
+// decorrelate block size), multiplies by Phi from the matching kernel + local
+// noise, and returns the central psf_size x psf_size crop (renormalised to
+// unit sum when possible). Used by the score path when decorrelate=True.
+std::vector<float> whiten_psf(const std::vector<float>& psf, int psf_size,
+                              const std::vector<float>& kernel, int ksize,
+                              double var_science, double var_reference, int n);
+
 // Match-filtered score image: the normalised correlation of `image` with the
 // point-source profile `psf` (side `psf_size`), giving a per-pixel S/N map.
 // `variance` is a same-shape image of per-pixel noise variance (e.g. the
-// propagated difference-image variance). Each output pixel is normalised by
-// sqrt(var(x,y) * sum(psf^2)), so source-free noise is a unit Gaussian even
-// under spatially-varying noise. Pixels with zero or negative variance yield 0.
+// post-whitening variance from decorrelate(), or the propagated difference
+// variance when scoring an un-whitened difference). Each output pixel is
+// normalised by sqrt(var(x,y) * sum(psf^2)), so source-free noise is a unit
+// Gaussian even under spatially-varying noise. Pixels with zero or negative
+// variance yield 0.
 ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
                       int psf_size, const ImageF& variance);
 

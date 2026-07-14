@@ -5,6 +5,7 @@
 #include <nanobind/stl/string.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -689,11 +690,13 @@ nb::ndarray<nb::numpy, float> decorrelation_kernel(InArray<float> kernel,
 }
 
 // Spatially-varying decorrelation of a difference image (apodized FFT blocks).
-nb::ndarray<nb::numpy, float> decorrelate(
-    InArray<float> difference, const Eigen::MatrixXd& knots,
-    const Eigen::VectorXd& theta, double beta, int n_max,
-    InArray<float> var_science, InArray<float> var_reference, int block,
-    int radius, int kernel_cell_blocks) {
+// Returns {'difference', 'variance'} where variance is the post-whitening noise
+// level (σ_D² = v_S + v_R ΣK² per block, Hann-blended) — use it for pulls and
+// the match-filtered score of the whitened difference.
+nb::dict decorrelate(InArray<float> difference, const Eigen::MatrixXd& knots,
+                     const Eigen::VectorXd& theta, double beta, int n_max,
+                     InArray<float> var_science, InArray<float> var_reference,
+                     int block, int radius, int kernel_cell_blocks) {
   const std::size_t h = difference.shape(0);
   const std::size_t w = difference.shape(1);
   delta::ImageF diff(w, h);
@@ -710,7 +713,96 @@ nb::ndarray<nb::numpy, float> decorrelate(
                                        resolve_radius(beta, n_max, radius));
   delta::ImageF out = delta::decorrelate(diff, spatial, theta, basis, vs, vr,
                                          block, kernel_cell_blocks);
-  return to_numpy<float>(std::move(out.pixels()), {h, w});
+  nb::dict result;
+  result["difference"] = to_numpy<float>(std::move(out.pixels()), {h, w});
+  result["variance"] = to_numpy<float>(std::move(out.variance()), {h, w});
+  return result;
+}
+
+// Whiten a PSF stamp with the ZOGY decorrelation filter at a representative
+// location (frame centre by default), for match-filtering a whitened difference.
+nb::ndarray<nb::numpy, float> whiten_score_psf(
+    InArray<float> psf, const Eigen::MatrixXd& knots,
+    const Eigen::VectorXd& theta, double beta, int n_max,
+    InArray<float> var_science, InArray<float> var_reference, int block,
+    int radius) {
+  const int ps = static_cast<int>(psf.shape(0));
+  if (psf.shape(1) != static_cast<std::size_t>(ps))
+    throw std::runtime_error("whiten_score_psf: psf must be square");
+  if (block < ps)
+    throw std::runtime_error("whiten_score_psf: block must be >= psf side");
+
+  const std::size_t h = var_science.shape(0);
+  const std::size_t w = var_science.shape(1);
+  if (var_reference.shape(0) != h || var_reference.shape(1) != w)
+    throw std::runtime_error("whiten_score_psf: variance shapes disagree");
+
+  const delta::ThinPlateBasis spatial(knots);
+  const delta::GaussHermiteBasis basis(beta, n_max,
+                                       resolve_radius(beta, n_max, radius));
+  const int nc = basis.component_count();
+  std::vector<std::vector<float>> phi(nc);
+  for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
+
+  // Matching kernel + robust noise at the frame centre (knot-scale fields;
+  // a single representative Phi is enough for the compact score PSF).
+  const double cx = 0.5 * static_cast<double>(w - 1);
+  const double cy = 0.5 * static_cast<double>(h - 1);
+  const int k = spatial.n_basis();
+  const Eigen::MatrixXd c =
+      Eigen::Map<const Eigen::MatrixXd>(theta.data(), k, nc + 1);
+  Eigen::MatrixXd point(1, 2);
+  point(0, 0) = cx;
+  point(0, 1) = cy;
+  const Eigen::MatrixXd a = spatial.design(point) * c;
+  const int ks = basis.ksize();
+  std::vector<float> kernel(static_cast<std::size_t>(ks) * ks, 0.0f);
+  for (int n = 0; n < nc; ++n) {
+    const float an = static_cast<float>(a(0, n));
+    const float* p = phi[n].data();
+    for (std::size_t i = 0; i < kernel.size(); ++i) kernel[i] += an * p[i];
+  }
+
+  delta::ImageF vs_img(w, h), vr_img(w, h);
+  std::copy(var_science.data(), var_science.data() + h * w,
+            vs_img.pixels().begin());
+  std::copy(var_reference.data(), var_reference.data() + h * w,
+            vr_img.pixels().begin());
+  // Reuse the same robust block-median estimator as decorrelate (via a local
+  // window centred on the frame). Fall back to a 1-pixel sample if the frame
+  // is smaller than `block`.
+  const int bx = std::max(0, static_cast<int>(w) / 2 - block / 2);
+  const int by = std::max(0, static_cast<int>(h) / 2 - block / 2);
+  // Inline median of positive finite samples over the central block (mirrors
+  // noise.cpp::block_variance without exposing it).
+  auto block_var = [&](const delta::ImageF& var) {
+    const int step = std::max(1, block / 64);
+    std::vector<float> vals;
+    vals.reserve(static_cast<std::size_t>(block / step + 1) *
+                 (block / step + 1));
+    for (int y = by; y < by + block; y += step) {
+      if (y < 0 || y >= static_cast<int>(h)) continue;
+      for (int x = bx; x < bx + block; x += step) {
+        if (x < 0 || x >= static_cast<int>(w)) continue;
+        const float v =
+            var.data()[static_cast<std::size_t>(y) * w + x];
+        if (std::isfinite(v) && v > 0.0f) vals.push_back(v);
+      }
+    }
+    if (vals.empty()) return 0.0;
+    const std::size_t mid = vals.size() / 2;
+    std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+    return static_cast<double>(vals[mid]);
+  };
+  const double vs = block_var(vs_img);
+  const double vr = block_var(vr_img);
+
+  const std::vector<float> p(psf.data(), psf.data() + psf.size());
+  std::vector<float> out =
+      delta::whiten_psf(p, ps, kernel, ks, vs, vr, block);
+  return to_numpy<float>(std::move(out),
+                         {static_cast<std::size_t>(ps),
+                          static_cast<std::size_t>(ps)});
 }
 
 // Match-filtered score image (S/N map). `variance` is a same-shape per-pixel
@@ -843,7 +935,14 @@ NB_MODULE(_core, m) {
   m.def("decorrelate", &decorrelate, "difference"_a, "knots"_a, "theta"_a,
         "beta"_a, "n_max"_a, "var_science"_a, "var_reference"_a, "block"_a = 256,
         "radius"_a = 0, "kernel_cell_blocks"_a = 0,
-        "Spatially-varying noise decorrelation via apodized FFT blocks.");
+        "Spatially-varying noise decorrelation via apodized FFT blocks. "
+        "Returns {'difference', 'variance'} where variance is the "
+        "post-whitening noise level for pulls and the match-filtered score.");
+  m.def("whiten_score_psf", &whiten_score_psf, "psf"_a, "knots"_a, "theta"_a,
+        "beta"_a, "n_max"_a, "var_science"_a, "var_reference"_a, "block"_a,
+        "radius"_a = 0,
+        "Apply the ZOGY decorrelation filter to a PSF stamp (frame-centre "
+        "kernel/noise) for match-filtering a whitened difference.");
   m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "variance"_a,
         "Match-filtered score image (per-pixel S/N map). variance must be a "
         "same-shape float32 image of per-pixel noise variance.");

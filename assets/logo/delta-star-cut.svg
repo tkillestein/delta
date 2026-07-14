@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100" role="img" aria-label="delta star-cut logo">
+  <defs>
+    <linearGradient id="starcut" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#starcut)" fill-rule="evenodd"
+    d="M50 12 L88 86 L12 86 Z
+       M50 42 L54 58 L70 62 L54 66 L50 82 L46 66 L30 62 L46 58 Z"/>
+</svg>

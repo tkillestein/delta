@@ -34,10 +34,12 @@ rebuild on source changes** — uv keys reinstall on the package version (unchan
 so it reports "Checked N packages" and silently runs the stale binary. Python-only
 changes do not need a rebuild.
 
-The core is built `-O3 -march=native` (see `CMakeLists.txt`); the `-O3` is re-asserted
-after nanobind's default `-Os` (last `-O` wins) because `-Os` disables the
-vectorisation the convolution/variance/score hot loops depend on. Set
-`-DDELTA_NATIVE=OFF` for a portable (non-host-tuned) wheel.
+The core is built `-O3` (see `CMakeLists.txt`); the `-O3` is re-asserted after nanobind's
+default `-Os` (last `-O` wins) because `-Os` disables the vectorisation the
+convolution/variance/score hot loops depend on. Host-CPU tuning (`-march=native`) is
+opt-in via `-DDELTA_NATIVE=ON` — it defaults **OFF**, so a plain `uv sync` yields a
+portable binary; the native build is typically 2-4x faster on the hot kernels but SIGILLs
+if run on a different (older/differently-featured) CPU.
 
 System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen (≥ 3.4), CFITSIO.
 The FFT is vendored (header-only PocketFFT, `extern/pocketfft`, BSD-3) — no system FFT
@@ -70,18 +72,28 @@ orchestrated by the Python package in `python/delta/`.
 - `noise` — ZOGY-style decorrelation (apodized FFT blocks, vendored PocketFFT; threaded over blocks,
   one planless FFT workspace per thread) + match-filter score.
 - `fit` — ties stamps + basis + spatial together into the kernel solve.
+- `timing` — utility (not a SPEC module): opt-in, low-overhead sub-stage timers inside the
+  `fit_kernel` / `subtract` entry points, gated on the `DELTA_TIMING` env var (compiles to a
+  no-op when unset). Splits `B_n` precompute/convolve from the GLS solve and variance passes.
 
 **Python layer** (`python/delta/`):
-- `pipeline.py` — `Subtractor` class and `subtract()` convenience wrapper. This is the
-  orchestration brain: coerces inputs, selects stamps, picks convolution direction and
-  `beta`, calls `_core.fit_kernel` / `_core.subtract`, optional decorrelate + score.
+- `pipeline.py` — `Subtractor` class (`fit` / `subtract` / `apply`) plus `subtract()` and
+  `apply()` convenience wrappers. This is the orchestration brain: coerces inputs, selects
+  stamps, picks convolution direction and `beta`, calls `_core.fit_kernel` / `_core.subtract`,
+  optional decorrelate + score. `apply()` reuses a frozen `KernelSolution` — full-frame
+  subtraction only, no re-fit — to reuse one fit across a stack of frames or for
+  QA/reproducibility; inputs must match `solution.shape`.
 - `solution.py` — `KernelSolution` dataclass: the serializable (`.npz`) fit result
   (basis params, knots, `theta`, GCV diagnostics) + FITS provenance header cards.
+  `.save()` / `.load()` round-trip it; `Subtractor.apply` / `apply()` consume it to subtract
+  without re-fitting.
 - `_inputs.py` — input coercion (`as_layers`, `synth_variance`); numpy/astropy interop.
 - `validation.py` — QA/validation helpers.
-- `cli.py` — standalone `delta` CLI (Typer + Rich, `cli` extra): `subtract` and
-  `info` commands over the pipeline. Entry point `delta.cli:run`
-  (`[project.scripts]`). Errors/tables print to stderr via Rich.
+- `cli.py` — standalone `delta` CLI (Typer + Rich, `cli` extra): `subtract`, `apply`, and
+  `info` commands over the pipeline. `subtract` fits + subtracts (optionally `--save-solution`
+  to also write the `.npz`); `apply` re-applies a saved solution to a new pair without
+  re-fitting. Entry point `delta.cli:run` (`[project.scripts]`). Errors/tables print to
+  stderr via Rich.
 - `_log.py` — loguru logging plumbing. The library logs through loguru's global
   `logger` and is silent by default (`logger.disable("delta")`); the CLI calls
   `configure_logging(verbosity)` to add a stderr sink and `enable` the namespace.

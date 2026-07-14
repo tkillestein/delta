@@ -30,6 +30,15 @@ public:
   Image(std::size_t width, std::size_t height)
       : width_(width), height_(height), data_(width * height, T{}) {}
 
+  // Construct directly from a contiguous source range: one allocate+copy
+  // pass, unlike `Image(width, height)` followed by a separate fill, which
+  // wastes a full zero-initialisation pass over data the caller is about to
+  // overwrite anyway. Matters when marshalling an already-ready buffer
+  // across a language boundary (e.g. a NumPy array) on a large image, where
+  // the redundant pass is a measurable fraction of the call.
+  Image(std::size_t width, std::size_t height, const T* src)
+      : width_(width), height_(height), data_(src, src + width * height) {}
+
   std::size_t width() const { return width_; }
   std::size_t height() const { return height_; }
   std::size_t size() const { return width_ * height_; }

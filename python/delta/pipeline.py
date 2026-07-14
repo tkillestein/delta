@@ -7,7 +7,8 @@ subtract, and optionally decorrelate the noise and build a match-filtered score.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +16,7 @@ from numpy.typing import NDArray
 from . import _core
 from ._inputs import as_layers, synth_variance
 from ._log import log_timing, logger
+from ._provenance import environment_cards
 from .solution import KernelSolution
 
 # 1 / (2*sqrt(2 ln 2)); matches kFwhmPerSigma in src/detect.cpp.
@@ -41,9 +43,39 @@ _CONFIG_KEYS = frozenset(
         "spatial_scale",
         "decorrelate",
         "score",
+        "source_catalog",
         "block",
+        "rescale_variance",
     }
 )
+
+# Median of a chi-square_1 (squared standard normal) distribution. Used to turn a
+# robust median(z^2) into a reduced-chi2-equivalent scale factor without the
+# mean's sensitivity to high-|z| outliers (genuine transients).
+_MEDIAN_CHI2_1 = 0.4549364231195724
+
+
+def _variance_rescale_factor(
+    difference: NDArray[np.float32],
+    variance: NDArray[np.float32],
+    mask: NDArray[np.uint8] | None,
+) -> float:
+    """Scalar by which to multiply ``variance`` so the diff-image reduced chi2 -> 1.
+
+    ``median(difference^2 / variance) / median(chi2_1)`` is the median-based
+    analogue of a reduced chi2: under a correctly-scaled Gaussian noise model
+    ``z = difference / sqrt(variance)`` is standard normal, so ``z^2`` has
+    median 0.4549. Using the median rather than the mean keeps real transients
+    (which are deliberately high-|z| outliers, not noise) from inflating the
+    correction.
+    """
+    good = (variance > 0) & np.isfinite(difference) & np.isfinite(variance)
+    if mask is not None:
+        good &= mask == 0
+    if not np.any(good):
+        return 1.0
+    z2 = difference[good].astype(np.float64) ** 2 / variance[good].astype(np.float64)
+    return float(np.median(z2) / _MEDIAN_CHI2_1)
 
 
 def _log_core_timings(timing: dict | None) -> None:
@@ -64,13 +96,57 @@ def _log_core_timings(timing: dict | None) -> None:
 class DiffResult:
     """Products of a subtraction run."""
 
+    # Difference image (whitened when decorrelate=True) and its matching
+    # per-pixel variance: post-whitening σ_D² after decorrelate, else the
+    # propagated Var(D) = Var(S) + (K² ⊗ Var(R)).
     difference: NDArray[np.float32]
     variance: NDArray[np.float32] | None
     mask: NDArray[np.uint8] | None
     score: NDArray[np.float32] | None
     solution: KernelSolution
+    # The PSF stamp built for the match filter (None unless `score=True`);
+    # carried so `build_catalog()` can derive the expected FWHM without
+    # recomputing `_estimate_psf` from raw images, which `DiffResult` no
+    # longer has.
+    psf: NDArray[np.float32] | None = None
+    # Source catalog from the score image (SPEC §3.7), auto-built by default
+    # whenever `score=True` (toggle: `Subtractor(source_catalog=False)`). A
+    # structured NumPy array (`delta.catalog.CATALOG_DTYPE`), or None when
+    # `score` or `source_catalog` was off. Use `build_catalog()` to rebuild
+    # with custom thresholds without re-running `subtract()`.
+    source_catalog: NDArray | None = None
+    # Reproducibility metadata, set by Subtractor.subtract()/apply(): the
+    # configuration knobs that aren't already baked into `solution` (see
+    # Subtractor.config_cards), and the fit+subtract wall time in seconds.
+    config: dict[str, object] = field(default_factory=dict)
+    elapsed: float = float("nan")
+    # Scalar applied to `variance` (post-subtraction) to force the diff-image
+    # reduced chi2 to 1; None when `rescale_variance` was not requested.
+    variance_scale: float | None = None
 
-    def write(self, path: str, overwrite: bool = False, *, compress: bool = True) -> None:
+    def header_cards(self) -> dict[str, object]:
+        """Full provenance card set: fit + config + environment + runtime.
+
+        Combines :meth:`KernelSolution.header_cards`, the producing
+        ``Subtractor``'s :meth:`~Subtractor.config_cards`, and
+        :func:`delta._provenance.environment_cards`, enough on its own to
+        reproduce this run (modulo the input pixel data itself).
+        """
+        return {
+            **self.solution.header_cards(),
+            **self.config,
+            **environment_cards(),
+            "DLTELAP": self.elapsed,
+        }
+
+    def write(
+        self,
+        path: str,
+        overwrite: bool = False,
+        *,
+        compress: bool = True,
+        extra_cards: dict[str, object] | None = None,
+    ) -> None:
         """Write products to a multi-extension FITS with provenance (needs astropy).
 
         With ``compress`` (the default) each image layer is stored as a tile-
@@ -79,10 +155,18 @@ class DiffResult:
         cannot itself be compressed, so the provenance header lives in a
         dataless primary and the difference moves to a ``DIFFERENCE`` extension.
         Pass ``compress=False`` for the plain layout (difference in the primary).
+
+        ``extra_cards`` adds/overrides header cards on top of
+        :meth:`header_cards` — e.g. input file paths or the invoking command
+        line, which this method has no way to know on its own.
         """
         from astropy.io import fits  # optional dependency
 
-        cards = self.solution.header_cards()
+        cards = self.header_cards()
+        if self.variance_scale is not None:
+            cards["DLTVSCL"] = self.variance_scale
+        if extra_cards:
+            cards.update(extra_cards)
         layers = [("VARIANCE", self.variance), ("MASK", self.mask), ("SCORE", self.score)]
         hdus: list[fits.hdu.base._BaseHDU]
         if compress:
@@ -97,7 +181,49 @@ class DiffResult:
                 primary.header[key] = value
             hdus = [primary]
             hdus += [fits.ImageHDU(a, name=n) for n, a in layers if a is not None]
+        if self.source_catalog is not None:
+            hdus.append(fits.BinTableHDU(self.source_catalog, name="CATALOG"))
         fits.HDUList(hdus).writeto(path, overwrite=overwrite)
+
+    def build_catalog(
+        self,
+        *,
+        threshold_sigma: float = 5.0,
+        threshold_sigma_dipole: float = 3.0,
+        fwhm_tolerance_lo: float = 0.3,
+        fwhm_tolerance_hi: float = 3.0,
+        aperture_radius: int = 0,
+        exclude_bad_pixels: bool = True,
+        as_table: bool = False,
+    ):
+        """Rebuild the source catalog from `self.score` with custom thresholds
+        (SPEC §3.7), instead of the defaults used to auto-populate
+        `self.source_catalog`.
+
+        The expected PSF FWHM is measured from `self.psf` (the stamp built for
+        the match filter); requires the originating ``subtract()`` /
+        ``Subtractor.subtract()`` call to have used ``score=True``.
+        """
+        if self.score is None or self.psf is None:
+            raise ValueError(
+                "build_catalog() requires a score image and PSF stamp; pass score=True "
+                "to subtract()"
+            )
+        from .catalog import build_catalog as _build_catalog
+
+        return _build_catalog(
+            self.score,
+            self.difference,
+            mask=self.mask,
+            psf=self.psf,
+            threshold_sigma=threshold_sigma,
+            threshold_sigma_dipole=threshold_sigma_dipole,
+            fwhm_tolerance_lo=fwhm_tolerance_lo,
+            fwhm_tolerance_hi=fwhm_tolerance_hi,
+            aperture_radius=aperture_radius,
+            exclude_bad_pixels=exclude_bad_pixels,
+            as_table=as_table,
+        )
 
 
 def _default_beta(fwhm_a: float, fwhm_b: float) -> float:
@@ -161,7 +287,9 @@ class Subtractor:
         spatial_scale: float | None = None,
         decorrelate: bool = False,
         score: bool = False,
+        source_catalog: bool = True,
         block: int = 256,
+        rescale_variance: bool = False,
     ) -> None:
         self.n_max = n_max
         self.beta = beta
@@ -196,7 +324,35 @@ class Subtractor:
         self.spatial_scale = spatial_scale
         self.decorrelate = decorrelate
         self.score = score
+        # Source catalog from the score image (SPEC §3.7), built by default
+        # whenever `score` is also on; set False to skip (e.g. for callers
+        # who only want the score image itself, or care about latency).
+        self.source_catalog = source_catalog
         self.block = block
+        # Forces the diff-image reduced chi2 to 1 by rescaling `variance` with a
+        # single robust scalar (SPEC §3.4) -- a post-hoc correction for noise
+        # models (gain/read-noise, or propagated science/reference variance)
+        # that under- or over-estimate the true pixel noise.
+        self.rescale_variance = rescale_variance
+
+    def config_cards(self) -> dict[str, object]:
+        """Reproducibility cards for knobs not already in KernelSolution.header_cards()."""
+        return {
+            "DLTSRAD": self.stamp_radius,
+            "DLTTHSIG": self.threshold_sigma,
+            "DLTMAXST": self.max_stamps,
+            "DLTSAT": self.saturation,
+            "DLTBMASK": self.bright_mask,
+            "DLTCLPSG": self.clip_sigma,
+            "DLTCLPIT": self.clip_iterations,
+            "DLTMINST": self.min_stamps,
+            "DLTCVF": self.cv_folds,
+            "DLTSSCL": self.spatial_scale if self.spatial_scale is not None else 0.0,
+            "DLTDECOR": self.decorrelate,
+            "DLTSCORE": self.score,
+            "DLTSCAT": self.source_catalog,
+            "DLTBLK": self.block,
+        }
 
     # -- internals -----------------------------------------------------------
 
@@ -448,6 +604,16 @@ class Subtractor:
             np.negative(difference, out=difference)
         variance = diff["variance"]
         mask = diff["mask"]
+        variance_scale = None
+        if self.rescale_variance and variance is not None:
+            variance_scale = _variance_rescale_factor(difference, variance, mask)
+            variance = variance * variance_scale
+            logger.info(
+                "variance rescaled by {:.4f} to force diff-image reduced chi2=1",
+                variance_scale,
+            )
+        elif self.rescale_variance:
+            logger.warning("variance rescale requested but no variance available; skipping")
         # rms / masked-fraction are log-only and span the full frame (np.std over
         # 64 Mpix is ~0.4s); evaluate them lazily so the silent-by-default library
         # never pays for a message no sink will emit.
@@ -464,10 +630,11 @@ class Subtractor:
             )
 
         whitened = difference
+        white_var = None
         if self.decorrelate:
             if tvar is not None and cvar is not None:
                 with log_timing("noise decorrelation"):
-                    whitened = _core.decorrelate(
+                    dec = _core.decorrelate(
                         difference,
                         solution.knots,
                         solution.theta,
@@ -477,10 +644,18 @@ class Subtractor:
                         cvar,
                         block=self.block,
                     )
+                whitened = dec["difference"]
+                white_var = dec["variance"]
+                # Propagate any raw-Var(D) rescale onto the whitened noise level:
+                # vs/vr mis-scaling that forced variance_scale on Var(D) applies
+                # equally to σ_D² = vs + vr ΣK².
+                if variance_scale is not None:
+                    white_var = white_var * variance_scale
             else:
                 logger.warning("decorrelation requested but no variance available; skipping")
 
         score = None
+        psf = None
         if self.score:
             with log_timing("matched-filter score"):
                 if stamp_x is None or np.asarray(stamp_x).size == 0:
@@ -490,20 +665,50 @@ class Subtractor:
                     )
                 psf_radius = min(self.stamp_radius, 8)
                 psf = _estimate_psf(target, stamp_x, stamp_y, psf_radius)
-                if variance is not None:
+                if white_var is not None:
+                    # Whitened difference: normalise with post-whitening variance
+                    # and the Phi-filtered PSF (ZOGY score profile).
+                    score_var = np.asarray(white_var, dtype=np.float32)
+                    if tvar is not None and cvar is not None:
+                        psf = _core.whiten_score_psf(
+                            psf,
+                            solution.knots,
+                            solution.theta,
+                            solution.beta,
+                            solution.n_max,
+                            tvar,
+                            cvar,
+                            self.block,
+                            radius=solution.radius,
+                        )
+                elif variance is not None:
                     score_var = np.asarray(variance, dtype=np.float32)
                 else:
                     fallback = float(np.var(whitened))
                     score_var = np.full(whitened.shape, fallback, dtype=np.float32)
                 score = _core.matched_filter(whitened, psf, score_var)
 
-        out_diff = whitened if self.decorrelate else difference
+        out_diff = whitened
+        # When decorrelated, return the post-whitening variance so difference and
+        # variance describe the same product (pulls D/√V stay valid).
+        out_var = white_var if white_var is not None else variance
+
+        source_catalog = None
+        if score is not None and self.source_catalog:
+            with log_timing("catalog"):
+                from .catalog import build_catalog as _build_catalog
+
+                source_catalog = _build_catalog(score, out_diff, mask=mask, psf=psf)
+
         return DiffResult(
             difference=out_diff,
-            variance=variance,
+            variance=out_var,
             mask=mask,
             score=score,
             solution=solution,
+            psf=psf,
+            source_catalog=source_catalog,
+            variance_scale=variance_scale,
         )
 
     # -- public API ----------------------------------------------------------
@@ -552,6 +757,7 @@ class Subtractor:
         direction=None,
     ) -> DiffResult:
         """Fit and produce the difference (and optional decorrelation/score)."""
+        start = time.perf_counter()
         solution, layers = self._fit(
             science,
             reference,
@@ -564,7 +770,10 @@ class Subtractor:
             catalog=catalog,
             direction=direction,
         )
-        return self._subtract(solution, layers)
+        result = self._subtract(solution, layers)
+        result.config = self.config_cards()
+        result.elapsed = time.perf_counter() - start
+        return result
 
     def apply(
         self,
@@ -587,6 +796,7 @@ class Subtractor:
         inputs must match ``solution.shape``. Use this to reuse one fit across a
         stack of frames, or to re-apply a saved solution for QA/reproducibility.
         """
+        start = time.perf_counter()
         layers = self._coerce_apply_layers(
             solution,
             science,
@@ -598,7 +808,10 @@ class Subtractor:
             gain=gain,
             read_noise=read_noise,
         )
-        return self._subtract(solution, layers)
+        result = self._subtract(solution, layers)
+        result.config = self.config_cards()
+        result.elapsed = time.perf_counter() - start
+        return result
 
 
 def subtract(science, reference, **kwargs) -> DiffResult:
@@ -607,8 +820,8 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     Configuration keywords (``n_max``, ``beta``, ``n_knots``, ``stamp_radius``,
     ``threshold_sigma``, ``max_stamps``, ``saturation``, ``bright_mask``,
     ``lambda_grid``, ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
-    ``spatial_scale``, ``decorrelate``, ``score``, ``block``) are split from
-    the per-call inputs
+    ``spatial_scale``, ``decorrelate``, ``score``, ``block``, ``rescale_variance``)
+    are split from the per-call inputs
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
     ``gain``, ``read_noise``, ``catalog``, ``direction``).
     """

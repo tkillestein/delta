@@ -106,6 +106,45 @@ def test_decorrelate_and_score_paths_run(preview):
     assert 0.3 < corner.std() < 3.0
 
 
+def _robust_reduced_chi2(difference, variance, mask):
+    good = (variance > 0) & np.isfinite(difference) & np.isfinite(variance)
+    if mask is not None:
+        good &= mask == 0
+    z2 = difference[good].astype(np.float64) ** 2 / variance[good].astype(np.float64)
+    return np.median(z2) / 0.4549364231195724
+
+
+def test_rescale_variance_forces_reduced_chi2_to_one():
+    from delta._inputs import synth_variance
+
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.2)
+    # Fit with the correct gain (good kernel solve), but feed the subtraction a
+    # deliberately under-estimated variance map -> the un-rescaled diff-image
+    # reduced chi2 should sit well above 1.
+    gain = 1.5
+    bad_factor = 0.02
+    sci_var = synth_variance(sci, gain, 4.0) * bad_factor
+    ref_var = synth_variance(ref, gain, 4.0) * bad_factor
+
+    common = dict(science_var=sci_var, reference_var=ref_var, n_knots=3, stamp_radius=12)
+    baseline = delta.subtract(sci, ref, **common)
+    assert _robust_reduced_chi2(baseline.difference, baseline.variance, baseline.mask) > 1.5
+
+    res = delta.subtract(sci, ref, **common, rescale_variance=True)
+    assert res.variance_scale is not None and res.variance_scale > 1.0
+    assert res.variance is not None and baseline.variance is not None
+    np.testing.assert_allclose(res.variance, baseline.variance * res.variance_scale, rtol=1e-6)
+    assert _robust_reduced_chi2(res.difference, res.variance, res.mask) == pytest.approx(
+        1.0, abs=0.15
+    )
+
+
+def test_rescale_variance_off_by_default():
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.2)
+    res = delta.subtract(sci, ref, gain=1.5, n_knots=3, stamp_radius=12)
+    assert res.variance_scale is None
+
+
 def test_astropy_ccddata_matches_ndarray():
     ccddata = pytest.importorskip("astropy.nddata").CCDData
     ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
@@ -196,3 +235,28 @@ def test_write_fits_products(tmp_path):
         assert hdul[0].header["DLTCONV"] == "reference"
         assert "VARIANCE" in hdul
         np.testing.assert_allclose(hdul[0].data, res.difference, rtol=1e-6)
+
+
+def test_write_fits_provenance(tmp_path):
+    fits = pytest.importorskip("astropy.io.fits")
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    res = delta.subtract(sci, ref, gain=1.5, n_knots=3, stamp_radius=12)
+
+    assert res.elapsed > 0.0
+    assert res.config["DLTSRAD"] == 12
+
+    path = str(tmp_path / "diff.fits")
+    extra: dict[str, object] = {"DLTSCI": "sci.fits", "DLTCMD": "delta subtract sci.fits ref.fits"}
+    res.write(path, extra_cards=extra)
+    header = fits.getheader(path)
+    # Fit provenance (KernelSolution.header_cards).
+    assert header["DLTCONV"] == "reference"
+    # Config provenance (Subtractor.config_cards), not duplicated from the fit.
+    assert header["DLTSRAD"] == 12
+    # Environment provenance (delta._provenance.environment_cards).
+    assert header["DLTVERS"] == delta.__version__
+    assert "DLTHOST" in header
+    assert header["DLTELAP"] > 0.0
+    # Caller-supplied extra_cards, e.g. input paths / invocation, from the CLI.
+    assert header["DLTSCI"] == "sci.fits"
+    assert "delta subtract" in header["DLTCMD"]

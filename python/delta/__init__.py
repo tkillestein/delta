@@ -6,7 +6,7 @@ PSF-matching algorithm. See ``docs/SPEC.md`` for the design.
 
 from __future__ import annotations
 
-from . import validation
+from . import catalog, validation
 from ._core import (
     __version__,
     basis_convolve,
@@ -32,6 +32,7 @@ from ._core import (
     tps_fit,
     tps_penalty,
     weighted_mean,
+    whiten_score_psf,
     write_fits,
 )
 from ._core import subtract as subtract_model
@@ -47,6 +48,7 @@ __all__ = [
     "apply",
     "as_layers",
     "basis_convolve",
+    "catalog",
     "decorrelate",
     "decorrelate_block",
     "decorrelation_kernel",
@@ -73,5 +75,6 @@ __all__ = [
     "tps_penalty",
     "validation",
     "weighted_mean",
+    "whiten_score_psf",
     "write_fits",
 ]

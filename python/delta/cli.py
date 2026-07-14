@@ -100,6 +100,41 @@ def _read_layer(path: Path, what: str) -> FitsLayers:
         raise typer.Exit(code=2) from exc
 
 
+def _input_cards(
+    *,
+    science: Path,
+    reference: Path,
+    science_var: Path | None = None,
+    reference_var: Path | None = None,
+    catalog: Path | None = None,
+    gain: float | None = None,
+    read_noise: float = 0.0,
+    direction: Direction | None = None,
+    solution: Path | None = None,
+) -> dict[str, object]:
+    """Header cards for the inputs the pipeline itself has no way to know about:
+    file paths, the noise-model knobs, and the exact command line invoked."""
+    cards: dict[str, object] = {
+        "DLTSCI": str(science),
+        "DLTREF": str(reference),
+        "DLTRN": read_noise,
+        "DLTCMD": " ".join(sys.argv),
+    }
+    if direction is not None:
+        cards["DLTDREQ"] = direction.value
+    if science_var is not None:
+        cards["DLTSVARF"] = str(science_var)
+    if reference_var is not None:
+        cards["DLTRVARF"] = str(reference_var)
+    if catalog is not None:
+        cards["DLTCAT"] = str(catalog)
+    if gain is not None:
+        cards["DLTGAIN"] = gain
+    if solution is not None:
+        cards["DLTSOLF"] = str(solution)
+    return cards
+
+
 def _load_catalog(path: Path) -> np.ndarray:
     """Load an (N, 2) integer x/y stamp catalog from a whitespace text file."""
     cat = np.loadtxt(path, ndmin=2)
@@ -123,6 +158,8 @@ def _summary_table(result, elapsed: float) -> Table:
     table.add_row("RSS", f"{sol.rss:.4g}")
     table.add_row("difference rms", f"{float(np.std(result.difference)):.4g}")
     table.add_row("variance", "yes" if result.variance is not None else "no")
+    if result.variance_scale is not None:
+        table.add_row("variance rescale", f"{result.variance_scale:.4f} (chi2 -> 1)")
     table.add_row("score", "yes" if result.score is not None else "no")
     table.add_row("wall time", f"{elapsed:.3f}s")
     return table
@@ -189,6 +226,13 @@ def subtract(
     block: Annotated[
         int, typer.Option("--block", min=32, help="FFT block size for decorrelation.")
     ] = 256,
+    rescale_variance: Annotated[
+        bool,
+        typer.Option(
+            "--rescale-variance/--no-rescale-variance",
+            help="Rescale variance by a scalar to force the diff-image reduced chi2 to 1.",
+        ),
+    ] = False,
     # -- output / feedback -------------------------------------------------
     save_solution: Annotated[
         Path | None,
@@ -237,6 +281,7 @@ def subtract(
         decorrelate=decorrelate,
         score=score,
         block=block,
+        rescale_variance=rescale_variance,
     )
 
     start = time.perf_counter()
@@ -258,7 +303,17 @@ def subtract(
         raise typer.Exit(code=1) from exc
     elapsed = time.perf_counter() - start
 
-    _write_output(result, output, overwrite, compress=compress)
+    cards = _input_cards(
+        science=science,
+        reference=reference,
+        science_var=science_var,
+        reference_var=reference_var,
+        catalog=catalog,
+        gain=gain,
+        read_noise=read_noise,
+        direction=direction,
+    )
+    _write_output(result, output, overwrite, compress=compress, extra_cards=cards)
     if save_solution is not None:
         result.solution.save(str(save_solution))
         logger.info("wrote solution to {}", save_solution)
@@ -268,10 +323,17 @@ def subtract(
     _console.print(f"[green]wrote[/] {output}")
 
 
-def _write_output(result, output: Path, overwrite: bool, *, compress: bool = True) -> None:
+def _write_output(
+    result,
+    output: Path,
+    overwrite: bool,
+    *,
+    compress: bool = True,
+    extra_cards: dict[str, object] | None = None,
+) -> None:
     """Write the difference products, preferring astropy (provenance + score)."""
     try:
-        result.write(str(output), overwrite=overwrite, compress=compress)
+        result.write(str(output), overwrite=overwrite, compress=compress, extra_cards=extra_cards)
         logger.debug("wrote multi-extension FITS via astropy (compress={})", compress)
     except ImportError:
         from . import _core
@@ -323,6 +385,13 @@ def apply(
     block: Annotated[
         int, typer.Option("--block", min=32, help="FFT block size for decorrelation.")
     ] = 256,
+    rescale_variance: Annotated[
+        bool,
+        typer.Option(
+            "--rescale-variance/--no-rescale-variance",
+            help="Rescale variance by a scalar to force the diff-image reduced chi2 to 1.",
+        ),
+    ] = False,
     # -- output / feedback -------------------------------------------------
     overwrite: Annotated[
         bool, typer.Option("--overwrite", help="Overwrite the output if it exists.")
@@ -369,6 +438,7 @@ def apply(
         decorrelate=decorrelate,
         score=score,
         block=block,
+        rescale_variance=rescale_variance,
     )
 
     start = time.perf_counter()
@@ -389,7 +459,16 @@ def apply(
         raise typer.Exit(code=1) from exc
     elapsed = time.perf_counter() - start
 
-    _write_output(result, output, overwrite, compress=compress)
+    cards = _input_cards(
+        science=science,
+        reference=reference,
+        science_var=science_var,
+        reference_var=reference_var,
+        gain=gain,
+        read_noise=read_noise,
+        solution=solution,
+    )
+    _write_output(result, output, overwrite, compress=compress, extra_cards=cards)
 
     if not quiet:
         _console.print(_summary_table(result, elapsed))

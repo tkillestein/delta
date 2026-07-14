@@ -23,6 +23,21 @@ class DetectedStamps(TypedDict):
     snr: NDArray[np.float64]
     fwhm: NDArray[np.float64]
 
+class CatalogResult(TypedDict):
+    x: NDArray[np.float64]
+    y: NDArray[np.float64]
+    peak_x: NDArray[np.int32]
+    peak_y: NDArray[np.int32]
+    peak_snr: NDArray[np.float64]
+    n_pix: NDArray[np.int32]
+    flux: NDArray[np.float64]
+    expected_n_pix: NDArray[np.float64]
+    fwhm_ratio: NDArray[np.float64]
+    fwhm_consistent: NDArray[np.uint8]
+    mask_flags: NDArray[np.uint8]
+    is_dipole: NDArray[np.uint8]
+    quality: NDArray[np.uint8]
+
 GlsResult = TypedDict(
     "GlsResult",
     {
@@ -148,6 +163,21 @@ def select_stamps(
     border: int = ...,
 ) -> StampSelection:
     """Select matched stamps across both images and the convolution direction."""
+
+def build_catalog(
+    score: NDArray[np.float32],
+    difference: NDArray[np.float32],
+    mask: NDArray[np.uint8] | None = ...,
+    threshold_sigma: float = ...,
+    threshold_sigma_dipole: float = ...,
+    expected_fwhm: float = ...,
+    fwhm_tolerance_lo: float = ...,
+    fwhm_tolerance_hi: float = ...,
+    aperture_radius: int = ...,
+    exclude_bad_pixels: bool = ...,
+    return_negative: bool = ...,
+) -> CatalogResult:
+    """Connected-component source catalog from a match-filtered score image (SPEC §3.7)."""
 
 def grid_knots(x0: float, y0: float, x1: float, y1: float, nx: int, ny: int) -> NDArray[np.float64]:
     """Regular nx*ny grid of knots over [x0,x1]x[y0,y1], shape (nx*ny, 2)."""
@@ -290,8 +320,25 @@ def decorrelate(
     block: int = ...,
     radius: int = ...,
     kernel_cell_blocks: int = ...,
+) -> dict[str, NDArray[np.float32]]:
+    """Spatially-varying noise decorrelation via apodized FFT blocks.
+
+    Returns ``{'difference', 'variance'}`` where ``variance`` is the
+    post-whitening noise level (for pulls and the match-filtered score).
+    """
+
+def whiten_score_psf(
+    psf: NDArray[np.float32],
+    knots: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    beta: float,
+    n_max: int,
+    var_science: NDArray[np.float32],
+    var_reference: NDArray[np.float32],
+    block: int,
+    radius: int = ...,
 ) -> NDArray[np.float32]:
-    """Spatially-varying noise decorrelation via apodized FFT blocks."""
+    """Apply the ZOGY decorrelation filter to a PSF stamp for scoring."""
 
 def matched_filter(
     image: NDArray[np.float32],

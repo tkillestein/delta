@@ -60,10 +60,12 @@ large monolithic frames (primary target ~8000×6000 px) at survey cadence.
 - Auto-selected convolution direction (convolve the narrower-PSF image to match the
   broader one) from measured stamp FWHM.
 
-**Out of scope (for now; see §16 Future):**
+**Out of scope (for now; see §12 Future):**
 - WCS-based registration/resampling (inputs assumed pre-registered; WCSLIB not a
   dependency).
-- Source detection/measurement *on the difference* beyond producing the score image.
+- Catalog cross-matching against external reference catalogs, photometric
+  calibration to a standard system, and CLI exposure of catalog generation
+  (§3.7 covers in-process catalog generation itself; tracked separately).
 - GPU backends, ZOGY engine, common-PSF pre-matching, multi-chip global fields.
 
 ---
@@ -142,6 +144,13 @@ minimize  ‖W^½ (d − X θ)‖²  +  λ θᵀ P θ
   between adjacent blocks introduces no visible seam.
 - **Score image (optional):** PSF-matched filter of the decorrelated difference →
   per-pixel S/N map for direct detection/thresholding.
+- **Variance rescale (optional):** noise models (synthesized gain/read-noise, or
+  propagated input variance maps) are frequently mis-scaled relative to the true
+  pixel noise. A single scalar factor, chosen so the diff-image reduced chi-squared
+  (`median(D²/Var(D))` over good pixels, normalized by the median of a chi-square_1
+  distribution so genuine transients don't bias the estimate) equals 1, is applied
+  to `Var(D)` post-hoc. Off by default; the factor is reported and recorded in the
+  output provenance (`DLTVSCL`) when requested.
 
 ### 3.5 Stamps & convolution direction
 
@@ -175,6 +184,40 @@ both flow through the whole pipeline rather than being bolted on at the end.
   pixels), giving a per-pixel output variance/weight map consistent with the
   decorrelation and score stages.
 
+### 3.7 Catalog generation
+
+Connected-component labelling (8-connectivity, hand-rolled two-pass union-find —
+no SciPy dependency) of the match-filtered score image (§3.4) produces a candidate
+source/transient catalog. Positive blobs are seeded and grown at
+`score >= threshold_sigma`; negative blobs are independently labelled at
+`score <= -threshold_sigma_dipole` (a lower threshold) purely to detect dipoles —
+positive components that enclose or directly touch a negative component are
+flagged `is_dipole` (bad-subtraction / mis-registration evidence, not a transient).
+Masked pixels (§3.6) are excluded from seeding and growth entirely ("aggressive"
+bad-pixel rejection); each entry still reports the bitwise-OR of mask flags
+touched at its footprint's 8-connected boundary, so a clean candidate adjacent to
+a bad column remains visible to QA.
+
+Each candidate carries a flux-weighted centroid and integer peak position, peak
+S/N, pixel count, an edge-safe aperture flux on the difference image, and an
+**FWHM-consistency check**: the observed pixel count is compared against the
+count expected for a Gaussian PSF of the solution's measured FWHM (the median
+PSF stamp already built for the match filter, §3.4) at that entry's own peak S/N
+and seeding threshold, via `expected_n_pix = π·σ²·max(0, ln((peak_snr/threshold)²))`
+with `σ = FWHM / (2√(2 ln 2))`. Candidates far below this (single-pixel noise
+spikes) or far above it (blends, extended artifacts) are flagged inconsistent via
+a `quality` bitmask rather than dropped, leaving the cut to the caller. Returned
+as a NumPy structured array by default, or an `astropy.table.Table`
+(`as_table=True`, optional dependency) — see `delta.catalog.build_catalog`.
+
+Built automatically by default whenever `score=True` (toggle:
+`Subtractor(source_catalog=False)`/`subtract(..., source_catalog=False)`),
+stored on `DiffResult.source_catalog`, and written as a `CATALOG`
+`BinTableHDU` extension by `DiffResult.write()`. `DiffResult.build_catalog()`
+reruns the builder on demand with custom thresholds, independent of the
+default-on result. CLI exposure (`delta subtract --catalog-out`) is deferred
+to a follow-up issue.
+
 ---
 
 ## 4. Architecture (C++ core)
@@ -194,6 +237,7 @@ Namespace `delta::`. Modules:
 - **`subtract`** — full-frame model evaluation, difference, variance propagation.
 - **`detect`** — stamp source detection & selection, FWHM/direction estimation.
 - **`noise`** — decorrelation kernel + apodized block FFT (PocketFFT), match-filter score.
+- **`catalog`** — connected-component source catalog from the score image (§3.7).
 - **`pipeline`** — orchestration: end-to-end `subtract(science, reference, options)`.
 
 Key data structures: `Image<T>`, `Stamp`, `KernelBasis`, `SpatialModel`,
@@ -247,8 +291,10 @@ result = delta.subtract(
 )
 result.difference   # numpy
 result.variance
-result.score        # match-filtered S/N map
-result.kernel_solution  # serializable (save/load, QA)
+result.score             # match-filtered S/N map
+result.kernel_solution   # serializable (save/load, QA)
+result.source_catalog    # source catalog from the score image (§3.7), auto-built
+result.build_catalog()   # rebuild with custom thresholds
 ```
 
 Object-oriented path (`delta.Subtractor`) for reusing a solution / batch runs.
@@ -260,11 +306,18 @@ Object-oriented path (`delta.Subtractor`) for reusing a solution / batch runs.
 - **Difference image** + **propagated variance map** (always).
 - **Decorrelated difference** (whitened noise).
 - **Match-filtered score image** (S/N map for detection).
+- **Source catalog** (§3.7): connected-component candidate catalog built from
+  the score image, on by default whenever the score image is (toggle:
+  `source_catalog=False`); written as a `CATALOG` `BinTableHDU` by
+  `DiffResult.write()`.
 - Output **mask** (grown bad/saturated/edge pixels) and serializable
   **kernel/background solution** available for QA/reuse (not headline products but
   produced internally).
-- FITS output with provenance in headers (basis params, β, n_max, knots, λ, GCV
-  score, photometric scale, convolution direction).
+- FITS output with provenance in headers: fit params (basis β/n_max, knots, λ, GCV
+  score, convolution direction), `Subtractor` configuration (stamp/clipping/CV
+  knobs), software/host environment (version, git commit, hostname, user, platform,
+  UTC timestamp), and run timing — enough to reproduce a run without external notes.
+  See `docs/usage.md` "Provenance headers" for the full card reference.
 
 ---
 
@@ -327,7 +380,9 @@ delta/
 GPU backend (CUDA/SYCL); ZOGY Fourier engine as an alternative method; common-PSF
 pre-matching for seeing that crosses within a frame; REML and per-coefficient λ
 selectors; true multi-chip mosaic handling (per-detector fields with WCS); WCS-based
-registration/resampling; difference-image source measurement.
+registration/resampling; CLI exposure of catalog generation (§3.7 covers the
+Python API; catalog cross-matching/photometric calibration to external catalogs
+is also future work).
 
 ---
 

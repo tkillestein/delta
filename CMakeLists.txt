@@ -62,6 +62,7 @@ nanobind_add_module(_core
   src/basis.cpp
   src/convolve.cpp
   src/detect.cpp
+  src/catalog.cpp
   src/spatial.cpp
   src/solve.cpp
   src/subtract.cpp

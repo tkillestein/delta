@@ -1,4 +1,7 @@
-# delta
+<h1 style="text-align:center;margin:.4rem 0 1rem">
+  <img src="assets/wordmark-light.svg#only-light" alt="delta" width="300">
+  <img src="assets/wordmark-dark.svg#only-dark" alt="delta" width="300">
+</h1>
 
 A high-performance astronomical difference-imaging engine — a modern,
 statistically-principled reformulation of the Alard & Lupton (1998) PSF-matching
@@ -7,8 +10,11 @@ algorithm, intended as a replacement for HOTPANTS.
 A C++20 core does the numerics; a thin Python layer (zero-copy
 [nanobind](https://nanobind.readthedocs.io) bindings) provides the user-facing API.
 
+> Developed with [Claude Code](https://code.claude.com/docs/en/overview), validated by
+> human, tested rigorously against real data and existing packages.
+
 !!! note "Status"
-    Stable (v1.0). The end-to-end pipeline works (kernel solve → spatially-varying
+    Stable (v1.1). The end-to-end pipeline works (kernel solve → spatially-varying
     subtraction → variance/mask propagation → noise decorrelation → match-filtered
     score), with astropy interop and a CLI. The public API follows semantic
     versioning.

@@ -1,9 +1,15 @@
-# delta
+<p align="center">
+  <img src="assets/logo/delta-star-cut.svg" alt="delta logo" width="112">
+</p>
 
-[![CI](https://github.com/tkillestein/delta/actions/workflows/ci.yml/badge.svg)](https://github.com/tkillestein/delta/actions/workflows/ci.yml)
-[![docs](https://github.com/tkillestein/delta/actions/workflows/docs.yml/badge.svg)](https://tkilleste.in/delta)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+<h1 align="center">delta</h1>
+
+<p align="center">
+  <a href="https://github.com/tkillestein/delta/actions/workflows/ci.yml"><img src="https://github.com/tkillestein/delta/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://tkilleste.in/delta"><img src="https://github.com/tkillestein/delta/actions/workflows/docs.yml/badge.svg" alt="docs"></a>
+  <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License: MIT"></a>
+</p>
 
 A high-performance astronomical difference-imaging engine — a modern,
 statistically-principled reformulation of the Alard & Lupton (1998) PSF-matching

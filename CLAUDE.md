@@ -34,10 +34,12 @@ rebuild on source changes** — uv keys reinstall on the package version (unchan
 so it reports "Checked N packages" and silently runs the stale binary. Python-only
 changes do not need a rebuild.
 
-The core is built `-O3 -march=native` (see `CMakeLists.txt`); the `-O3` is re-asserted
-after nanobind's default `-Os` (last `-O` wins) because `-Os` disables the
-vectorisation the convolution/variance/score hot loops depend on. Set
-`-DDELTA_NATIVE=OFF` for a portable (non-host-tuned) wheel.
+The core is built `-O3` (see `CMakeLists.txt`); the `-O3` is re-asserted after nanobind's
+default `-Os` (last `-O` wins) because `-Os` disables the vectorisation the
+convolution/variance/score hot loops depend on. Host-CPU tuning (`-march=native`) is
+opt-in via `-DDELTA_NATIVE=ON` — it defaults **OFF**, so a plain `uv sync` yields a
+portable binary; the native build is typically 2-4x faster on the hot kernels but SIGILLs
+if run on a different (older/differently-featured) CPU.
 
 System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen (≥ 3.4), CFITSIO.
 The FFT is vendored (header-only PocketFFT, `extern/pocketfft`, BSD-3) — no system FFT
@@ -70,6 +72,9 @@ orchestrated by the Python package in `python/delta/`.
 - `noise` — ZOGY-style decorrelation (apodized FFT blocks, vendored PocketFFT; threaded over blocks,
   one planless FFT workspace per thread) + match-filter score.
 - `fit` — ties stamps + basis + spatial together into the kernel solve.
+- `timing` — utility (not a SPEC module): opt-in, low-overhead sub-stage timers inside the
+  `fit_kernel` / `subtract` entry points, gated on the `DELTA_TIMING` env var (compiles to a
+  no-op when unset). Splits `B_n` precompute/convolve from the GLS solve and variance passes.
 
 **Python layer** (`python/delta/`):
 - `pipeline.py` — `Subtractor` class and `subtract()` convenience wrapper. This is the

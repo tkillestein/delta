@@ -320,8 +320,25 @@ def decorrelate(
     block: int = ...,
     radius: int = ...,
     kernel_cell_blocks: int = ...,
+) -> dict[str, NDArray[np.float32]]:
+    """Spatially-varying noise decorrelation via apodized FFT blocks.
+
+    Returns ``{'difference', 'variance'}`` where ``variance`` is the
+    post-whitening noise level (for pulls and the match-filtered score).
+    """
+
+def whiten_score_psf(
+    psf: NDArray[np.float32],
+    knots: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    beta: float,
+    n_max: int,
+    var_science: NDArray[np.float32],
+    var_reference: NDArray[np.float32],
+    block: int,
+    radius: int = ...,
 ) -> NDArray[np.float32]:
-    """Spatially-varying noise decorrelation via apodized FFT blocks."""
+    """Apply the ZOGY decorrelation filter to a PSF stamp for scoring."""
 
 def matched_filter(
     image: NDArray[np.float32],

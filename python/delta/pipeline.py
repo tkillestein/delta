@@ -96,6 +96,9 @@ def _log_core_timings(timing: dict | None) -> None:
 class DiffResult:
     """Products of a subtraction run."""
 
+    # Difference image (whitened when decorrelate=True) and its matching
+    # per-pixel variance: post-whitening σ_D² after decorrelate, else the
+    # propagated Var(D) = Var(S) + (K² ⊗ Var(R)).
     difference: NDArray[np.float32]
     variance: NDArray[np.float32] | None
     mask: NDArray[np.uint8] | None
@@ -627,10 +630,11 @@ class Subtractor:
             )
 
         whitened = difference
+        white_var = None
         if self.decorrelate:
             if tvar is not None and cvar is not None:
                 with log_timing("noise decorrelation"):
-                    whitened = _core.decorrelate(
+                    dec = _core.decorrelate(
                         difference,
                         solution.knots,
                         solution.theta,
@@ -640,6 +644,13 @@ class Subtractor:
                         cvar,
                         block=self.block,
                     )
+                whitened = dec["difference"]
+                white_var = dec["variance"]
+                # Propagate any raw-Var(D) rescale onto the whitened noise level:
+                # vs/vr mis-scaling that forced variance_scale on Var(D) applies
+                # equally to σ_D² = vs + vr ΣK².
+                if variance_scale is not None:
+                    white_var = white_var * variance_scale
             else:
                 logger.warning("decorrelation requested but no variance available; skipping")
 
@@ -654,14 +665,33 @@ class Subtractor:
                     )
                 psf_radius = min(self.stamp_radius, 8)
                 psf = _estimate_psf(target, stamp_x, stamp_y, psf_radius)
-                if variance is not None:
+                if white_var is not None:
+                    # Whitened difference: normalise with post-whitening variance
+                    # and the Phi-filtered PSF (ZOGY score profile).
+                    score_var = np.asarray(white_var, dtype=np.float32)
+                    if tvar is not None and cvar is not None:
+                        psf = _core.whiten_score_psf(
+                            psf,
+                            solution.knots,
+                            solution.theta,
+                            solution.beta,
+                            solution.n_max,
+                            tvar,
+                            cvar,
+                            self.block,
+                            radius=solution.radius,
+                        )
+                elif variance is not None:
                     score_var = np.asarray(variance, dtype=np.float32)
                 else:
                     fallback = float(np.var(whitened))
                     score_var = np.full(whitened.shape, fallback, dtype=np.float32)
                 score = _core.matched_filter(whitened, psf, score_var)
 
-        out_diff = whitened if self.decorrelate else difference
+        out_diff = whitened
+        # When decorrelated, return the post-whitening variance so difference and
+        # variance describe the same product (pulls D/√V stay valid).
+        out_var = white_var if white_var is not None else variance
 
         source_catalog = None
         if score is not None and self.source_catalog:
@@ -672,7 +702,7 @@ class Subtractor:
 
         return DiffResult(
             difference=out_diff,
-            variance=variance,
+            variance=out_var,
             mask=mask,
             score=score,
             solution=solution,

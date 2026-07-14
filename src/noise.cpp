@@ -235,6 +235,11 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   const int ks = basis.ksize();
 
   std::vector<double> acc(static_cast<std::size_t>(w) * h, 0.0);
+  // Post-whitening variance accumulator: each block contributes its white-noise
+  // level num = vs + vr*ΣK² with the same Hann weights as the difference. Phi is
+  // normalised so whitened pixels have variance num (SPEC §3.4 / ZOGY), not the
+  // pre-whitening propagated Var(D) map.
+  std::vector<double> var_acc(static_cast<std::size_t>(w) * h, 0.0);
 
   const int stride = block / 2;
   // Block origins covering the frame, last block flush with the far edge.
@@ -410,20 +415,27 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
         for (std::size_t i = 0; i < nspec; ++i) fft.freq[i] *= filter[i];
         fft.inverse();
 
-        // Hann-weighted overlap-add into the shared accumulator. The weight is
+        // Hann-weighted overlap-add into the shared accumulators. The weight is
         // the precomputed separable window; wsum is handled analytically (see
-        // above), so the blend only touches acc. Lock-free: same-colour blocks
-        // are pairwise disjoint, so no two threads in this pass write a pixel.
+        // above), so the blend only touches acc / var_acc. Lock-free: same-colour
+        // blocks are pairwise disjoint, so no two threads in this pass write a
+        // pixel. Variance uses the same spatial weights but not inv_n2 (num is
+        // already a real-space variance, not an unnormalised FFT coefficient).
+        const double num = cnum * cnum;
         for (int iy = 0; iy < block; ++iy) {
           const int y = by + iy;
           if (y < 0 || y >= h) continue;
-          const double wy = hwin[iy] * inv_n2;
+          const double wy_sig = hwin[iy] * inv_n2;
+          const double wy_var = hwin[iy];
           const float* frow = fft.real.data() + static_cast<std::size_t>(iy) * block;
           double* arow = acc.data() + static_cast<std::size_t>(y) * w;
+          double* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
           for (int ix = 0; ix < block; ++ix) {
             const int x = bx + ix;
             if (x < 0 || x >= w) continue;
-            arow[x] += wy * hwin[ix] * frow[ix];
+            const double wx = hwin[ix];
+            arow[x] += wy_sig * wx * frow[ix];
+            vrow[x] += wy_var * wx * num;
           }
         }
       }
@@ -431,15 +443,75 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   }
 
   ImageF out(w, h);
+  out.allocate_variance();
+  std::vector<float>& out_var = out.variance();
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
     const double wy = wy_total[y];
     const double* arow = acc.data() + static_cast<std::size_t>(y) * w;
+    const double* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
     float* orow = out.data() + static_cast<std::size_t>(y) * w;
+    float* ovrow = out_var.data() + static_cast<std::size_t>(y) * w;
     for (int x = 0; x < w; ++x) {
       const double wsum = wy * wx_total[x];
-      orow[x] = wsum > 0.0 ? static_cast<float>(arow[x] / wsum) : 0.0f;
+      if (wsum > 0.0) {
+        orow[x] = static_cast<float>(arow[x] / wsum);
+        ovrow[x] = static_cast<float>(vrow[x] / wsum);
+      } else {
+        orow[x] = 0.0f;
+        ovrow[x] = 0.0f;
+      }
     }
+  }
+  return out;
+}
+
+std::vector<float> whiten_psf(const std::vector<float>& psf, int psf_size,
+                              const std::vector<float>& kernel, int ksize,
+                              double var_science, double var_reference, int n) {
+  if (static_cast<int>(psf.size()) != psf_size * psf_size)
+    throw std::runtime_error("whiten_psf: psf size mismatch");
+  if (psf_size > n)
+    throw std::runtime_error("whiten_psf: psf_size must be <= FFT size n");
+  if (static_cast<int>(kernel.size()) != ksize * ksize)
+    throw std::runtime_error("whiten_psf: kernel size mismatch");
+
+  const std::vector<float> filter =
+      decorrelation_filter(kernel, ksize, var_science, var_reference, n);
+
+  // Embed the PSF zero-phase in the n x n FFT grid, apply Phi, crop the centre.
+  Fft2d fft(n);
+  std::fill(fft.real.begin(), fft.real.end(), 0.0f);
+  const int r = psf_size / 2;
+  for (int py = 0; py < psf_size; ++py) {
+    const int gy = ((py - r) % n + n) % n;
+    for (int px = 0; px < psf_size; ++px) {
+      const int gx = ((px - r) % n + n) % n;
+      fft.real[static_cast<std::size_t>(gy) * n + gx] =
+          psf[static_cast<std::size_t>(py) * psf_size + px];
+    }
+  }
+  fft.forward();
+  const std::size_t nspec = static_cast<std::size_t>(n) * fft.nc;
+  for (std::size_t i = 0; i < nspec; ++i) fft.freq[i] *= filter[i];
+  fft.inverse();
+
+  const float inv_n2 = 1.0f / static_cast<float>(n) / static_cast<float>(n);
+  std::vector<float> out(static_cast<std::size_t>(psf_size) * psf_size);
+  double sum = 0.0;
+  for (int py = 0; py < psf_size; ++py) {
+    const int gy = ((py - r) % n + n) % n;
+    for (int px = 0; px < psf_size; ++px) {
+      const int gx = ((px - r) % n + n) % n;
+      const float v =
+          fft.real[static_cast<std::size_t>(gy) * n + gx] * inv_n2;
+      out[static_cast<std::size_t>(py) * psf_size + px] = v;
+      sum += static_cast<double>(v);
+    }
+  }
+  if (sum > 0.0) {
+    const float inv = static_cast<float>(1.0 / sum);
+    for (float& v : out) v *= inv;
   }
   return out;
 }

@@ -102,8 +102,12 @@ def test_decorrelate_spatially_varying_matches_constant_interior():
 
     # Compare a central region (circular-edge artefacts excluded).
     c = slice(48, n - 48)
-    assert abs(_autocorr_lag1(block_out[c, c])) < 0.05
-    np.testing.assert_allclose(block_out[c, c], single[c, c], atol=0.15)
+    assert abs(_autocorr_lag1(block_out["difference"][c, c])) < 0.05
+    np.testing.assert_allclose(block_out["difference"][c, c], single[c, c], atol=0.15)
+    # Post-whitening variance is the white-noise level vs + vr*ΣK².
+    sumk2 = float((kernel0.astype(np.float64) ** 2).sum())
+    expected_var = vs + vr * sumk2
+    np.testing.assert_allclose(block_out["variance"][c, c], expected_var, rtol=0.05)
 
 
 def test_decorrelate_kernel_cache_matches_exact():
@@ -134,8 +138,10 @@ def test_decorrelate_kernel_cache_matches_exact():
     )
 
     c = slice(48, n - 48)
-    rel_rms = np.sqrt(np.mean((auto[c, c] - exact[c, c]) ** 2)) / np.std(exact[c, c])
+    diff = auto["difference"][c, c] - exact["difference"][c, c]
+    rel_rms = np.sqrt(np.mean(diff**2)) / np.std(exact["difference"][c, c])
     assert rel_rms < 0.02
+    np.testing.assert_allclose(auto["variance"][c, c], exact["variance"][c, c], rtol=0.05)
 
 
 def test_matched_filter_unit_variance_noise():
@@ -192,3 +198,95 @@ def test_matched_filter_spatially_varying_noise():
     # Both halves should be ~unit-variance when normalised correctly.
     np.testing.assert_allclose(score[:, : n // 2].std(), 1.0, rtol=0.07)
     np.testing.assert_allclose(score[:, n // 2 :].std(), 1.0, rtol=0.07)
+
+
+def test_whiten_psf_preserves_unit_sum_and_changes_profile():
+    beta, n_max, n = 2.0, 1, 128
+    knots = delta.grid_knots(0.0, 0.0, n - 1.0, n - 1.0, 3, 3)
+    k = knots.shape[0]
+    _, kernels = delta.gauss_hermite_kernels(beta, n_max)
+    ncomp = kernels.shape[0]
+    theta = np.zeros((ncomp + 1) * k)
+    theta[k - 3] = 1.0
+
+    matching = kernels[0]
+    psf = np.clip(matching, 0.0, None).astype(np.float32)
+    psf /= psf.sum()
+
+    white = delta.whiten_score_psf(
+        psf,
+        knots,
+        theta,
+        beta,
+        n_max,
+        np.full((n, n), 1.0, np.float32),
+        np.full((n, n), 1.0, np.float32),
+        block=64,
+    )
+    assert white.shape == psf.shape
+    np.testing.assert_allclose(white.sum(), 1.0, atol=1e-5)
+    # Phi is not identically 1 for a broadening kernel, so the profile moves.
+    assert not np.allclose(white, psf, atol=1e-4)
+
+
+def test_pipeline_decorrelated_variance_matches_pull():
+    """After decorrelate, returned variance matches the whitened difference."""
+    from delta import validation
+
+    h = w = 200
+    rng = np.random.default_rng(11)
+    sig_ref, sig_sci = 1.6, 2.4
+    gain, read = 1.5, 4.0
+    background = 150.0
+    shape = (h, w)
+    positions, fluxes = validation.sample_starfield(
+        shape, 20, rng, flux_range=(2000.0, 40000.0), border=30, min_separation=20.0
+    )
+    ref_s = background + validation.render_stars(shape, positions, fluxes, sig_ref)
+    sci_s = background + validation.render_stars(shape, positions, fluxes, sig_sci)
+    ref_var = (np.maximum(ref_s, 0.0) / gain + read**2).astype(np.float32)
+    sci_var = (np.maximum(sci_s, 0.0) / gain + read**2).astype(np.float32)
+    ref = (ref_s + rng.normal(0.0, np.sqrt(ref_var))).astype(np.float32)
+    sci = (sci_s + rng.normal(0.0, np.sqrt(sci_var))).astype(np.float32)
+
+    res = delta.subtract(
+        sci,
+        ref,
+        science_var=sci_var,
+        reference_var=ref_var,
+        n_knots=4,
+        stamp_radius=12,
+        decorrelate=True,
+        score=True,
+        block=64,
+        source_catalog=False,
+    )
+    assert res.variance is not None and res.score is not None
+    mask = res.mask == 0 if res.mask is not None else np.ones(shape, bool)
+    # Source-free corner: pull and score both ~unit Gaussian under Poisson noise.
+    corner = np.s_[10:70, 10:70]
+    good = mask[corner]
+    pull = res.difference[corner][good] / np.sqrt(res.variance[corner][good])
+    assert 0.7 < np.std(pull) < 1.4
+    score_corner = res.score[corner][good]
+    assert 0.6 < np.std(score_corner) < 1.5
+    # Whitened variance must not inherit the raw Poisson peaks at star centres
+    # (those belong to pre-whitening Var(D), not σ_D² after Phi).
+    raw = delta.subtract(
+        sci,
+        ref,
+        science_var=sci_var,
+        reference_var=ref_var,
+        n_knots=4,
+        stamp_radius=12,
+        decorrelate=False,
+        score=False,
+    )
+    assert raw.variance is not None
+    # At the brightest star, raw Var(D) is elevated; whitened variance stays near sky.
+    bi = int(np.argmax(fluxes))
+    x, y = int(positions[bi][0]), int(positions[bi][1])
+    if mask[y, x]:
+        sky_white = float(np.median(res.variance[corner]))
+        assert res.variance[y, x] < 2.0 * sky_white
+        assert raw.variance[y, x] > 1.5 * float(np.median(raw.variance[corner]))

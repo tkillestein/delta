@@ -32,6 +32,7 @@ from ._core import (
     tps_fit,
     tps_penalty,
     weighted_mean,
+    whiten_score_psf,
     write_fits,
 )
 from ._core import subtract as subtract_model
@@ -74,5 +75,6 @@ __all__ = [
     "tps_penalty",
     "validation",
     "weighted_mean",
+    "whiten_score_psf",
     "write_fits",
 ]

@@ -29,6 +29,54 @@ double median_copy(std::vector<double> v) {
   return v[mid];
 }
 
+// Median of a strided sample of finite, unmasked reference pixels — same fill
+// contract as subtract::reference_fill_value so masked/NaN halo pixels do not
+// ring B_n inside the stamp (SPEC §3.6).
+float reference_fill_value(const ImageF& reference) {
+  const std::size_t n = reference.size();
+  const float* src = reference.data();
+  const bool has_mask = reference.has_mask();
+  const MaskType* m = has_mask ? reference.mask().data() : nullptr;
+
+  std::vector<float> sample;
+  sample.reserve(n / 7 + 1);
+  for (std::size_t i = 0; i < n; i += 7) {
+    const float v = src[i];
+    if (std::isfinite(v) && !(has_mask && m[i] != kMaskGood)) sample.push_back(v);
+  }
+  if (sample.empty()) return 0.0f;
+  std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
+                   sample.end());
+  return sample[sample.size() / 2];
+}
+
+// (K² ⊗ Var)(x,y) with K frozen and zero-pad at the frame edge. Matches the
+// exact independent-pixel convolution variance when a is constant over the
+// kernel footprint (SPEC §3.6). Masked reference pixels contribute 0 (they are
+// median-filled in the model, so they carry no Poisson noise into B_n).
+double conv_var_at(int x, int y, const std::vector<float>& k2, int ks, int r,
+                   const float* var, int iw, int ih, std::size_t w,
+                   const MaskType* mask) {
+  double acc = 0.0;
+  for (int dv = -r; dv <= r; ++dv) {
+    const int sy = y - dv;
+    if (sy < 0 || sy >= ih) continue;
+    const float* krow = k2.data() + static_cast<std::size_t>(dv + r) * ks;
+    const float* vrow = var + static_cast<std::size_t>(sy) * w;
+    const MaskType* mrow =
+        mask ? mask + static_cast<std::size_t>(sy) * w : nullptr;
+    for (int du = -r; du <= r; ++du) {
+      const int sx = x - du;
+      if (sx < 0 || sx >= iw) continue;
+      if (mrow && mrow[sx] != kMaskGood) continue;
+      const float v = vrow[sx];
+      if (!(v > 0.0f) || !std::isfinite(v)) continue;
+      acc += static_cast<double>(krow[du + r]) * v;
+    }
+  }
+  return acc;
+}
+
 }  // namespace
 
 KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
@@ -53,18 +101,25 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   // zero padding is the same as the full-frame engine's).
   const int nc = basis.component_count();
   const int r = basis.radius();
+  const int ks = basis.ksize();
   const int iw = static_cast<int>(w);
   const int ih = static_cast<int>(h);
 
   // Gather all candidate stamp pixels, tagging each with the index of the
   // contributing stamp it belongs to so whole stamps can be clipped together.
   // Target- and convolved-image variances are kept separately: the residual is
-  // target - K (x) conv, whose variance is Var_target + (sum K^2) Var_conv, so
-  // the convolved layer's contribution must be scaled by the (fitted) kernel.
+  // target - K (x) conv, whose variance is Var_target + (K² ⊗ Var_conv), so the
+  // convolved layer must be weighted with the kernel-convolved noise map.
   const bool have_var = science.has_variance() || reference.has_variance();
+  const bool have_cvar = reference.has_variance();
   std::vector<double> px, py, target, var_t, var_c, bn_flat;  // bn_flat (N x nc)
   std::vector<int> pix_stamp;     // contributing-stamp index per pixel
   std::vector<int> stamp_cx, stamp_cy;  // centre of each contributing stamp
+
+  const float ref_fill = reference_fill_value(reference);
+  const bool ref_has_mask = reference.has_mask();
+  const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
+  const float* ref_var = have_cvar ? reference.variance().data() : nullptr;
 
   {
    DELTA_TIME("fit: stamp B_n convolve");
@@ -77,15 +132,27 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     const int stamp_idx = static_cast<int>(stamp_cx.size());
     bool used = false;
 
-    // Reference patch covering the stamp plus a kernel-radius halo, and its
-    // per-component basis convolution (patch-local, zero-padded at patch edges).
+    // Reference patch covering the stamp plus a kernel-radius halo, sanitised
+    // like full-frame subtract: masked / non-finite pixels take the median fill
+    // so they do not ring B_n inside the stamp (detect only clears the stamp
+    // itself, not the convolution halo).
     const int ex0 = std::max(0, x0 - r), ex1 = std::min(iw - 1, x1 + r);
     const int ey0 = std::max(0, y0 - r), ey1 = std::min(ih - 1, y1 + r);
     const int pw = ex1 - ex0 + 1, ph = ey1 - ey0 + 1;
     ImageF patch(pw, ph);
     for (int yy = 0; yy < ph; ++yy) {
-      const float* rrow = reference.data() + static_cast<std::size_t>(ey0 + yy) * w + ex0;
-      std::copy(rrow, rrow + pw, patch.data() + static_cast<std::size_t>(yy) * pw);
+      const int gy = ey0 + yy;
+      const float* rrow = reference.data() + static_cast<std::size_t>(gy) * w;
+      float* prow = patch.data() + static_cast<std::size_t>(yy) * pw;
+      for (int xx = 0; xx < pw; ++xx) {
+        const int gx = ex0 + xx;
+        const float v = rrow[gx];
+        const bool bad =
+            (ref_has_mask &&
+             ref_mask[static_cast<std::size_t>(gy) * w + gx] != kMaskGood) ||
+            !std::isfinite(v);
+        prow[xx] = bad ? ref_fill : v;
+      }
     }
     const std::vector<ImageF> bn = basis_convolve(patch, basis);
 
@@ -99,17 +166,21 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         const float sv = science.data()[i];
         if (!std::isfinite(sv)) continue;
 
-        // Per-pixel target / convolved-image variances (SPEC §3.6).
+        // Per-pixel target variance; reference variance is retained for the
+        // first-pass crude weight and as a positivity gate. IRLS replaces the
+        // Q·Var_c term with (K² ⊗ Var_c) using the full reference variance map.
         const double vt =
-            science.has_variance() ? static_cast<double>(science.variance()[i]) : 0.0;
-        const double vc = reference.has_variance()
-                              ? static_cast<double>(reference.variance()[i])
-                              : 0.0;
+            science.has_variance() ? static_cast<double>(science.variance()[i])
+                                   : 0.0;
+        const double vc = have_cvar ? static_cast<double>(ref_var[i]) : 0.0;
         if (have_var && !(vt + vc > 0.0)) continue;  // drop non-positive variance
 
         bool finite_bn = true;
         for (int n = 0; n < nc; ++n)
-          if (!std::isfinite(bn[n].data()[li])) { finite_bn = false; break; }
+          if (!std::isfinite(bn[n].data()[li])) {
+            finite_bn = false;
+            break;
+          }
         if (!finite_bn) continue;
 
         px.push_back(static_cast<double>(x));
@@ -135,26 +206,16 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   const int n_stamps = static_cast<int>(stamp_cx.size());
   const int k = spatial.n_basis();
 
-  // Kernel-footprint inner products T_nm = sum_u phi_n(u) phi_m(u); the kernel
-  // sum-of-squares at a pixel is Q(x) = a(x)^T T a(x), used to scale the
-  // convolved-image noise into the residual variance (and so the weights).
-  Eigen::MatrixXd tmat(nc, nc);
-  {
-    std::vector<std::vector<float>> phi(nc);
+  // Basis footprints (shared across IRLS passes) for reconstructing K = Σ a_n φ_n
+  // at each stamp centre when building (K² ⊗ Var_c).
+  std::vector<std::vector<float>> phi;
+  if (have_cvar) {
+    phi.resize(nc);
     for (int n = 0; n < nc; ++n) phi[n] = basis.kernel2d(n);
-    const std::size_t ksz = phi[0].size();
-    for (int n = 0; n < nc; ++n)
-      for (int m = 0; m <= n; ++m) {
-        double s = 0.0;
-        for (std::size_t u = 0; u < ksz; ++u)
-          s += static_cast<double>(phi[n][u]) * phi[m][u];
-        tmat(n, m) = s;
-        tmat(m, n) = s;
-      }
   }
 
   // Per-pixel weights, updated each pass from the current kernel (IRLS):
-  //   w_i = 1 / (Var_target,i + Q_i Var_conv,i).
+  //   w_i = 1 / (Var_target,i + (K² ⊗ Var_conv)_i).
   // The first pass uses the cruder 1/(Var_target+Var_conv); without variance,
   // unit weights (the reduced chi^2 is then unnormalised).
   std::vector<double> weights(npix_all, 1.0);
@@ -280,10 +341,6 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     const Eigen::MatrixXd design = spatial.design(points);
     const Eigen::MatrixXd c = coeff_matrix(gls.theta, k, nc + 1);
     const Eigen::MatrixXd fields = design * c;  // npix x (nc+1)
-    const Eigen::MatrixXd a = fields.leftCols(nc);
-    // Q_j = a_j^T T a_j (kernel sum-of-squares at each pixel).
-    const Eigen::VectorXd qvec =
-        (a * tmat).cwiseProduct(a).rowwise().sum();
 
     std::vector<double> sum_chi(n_stamps, 0.0);
     std::vector<int> cnt(n_stamps, 0);
@@ -303,13 +360,46 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     reduced_chi2 = denom > 0.0 ? gls.rss / denom
                                : std::numeric_limits<double>::quiet_NaN();
 
-    // Refine the weights with the kernel sum-of-squares for the next pass.
-    if (have_var)
-      for (int j = 0; j < npix; ++j) {
-        const int i = rows[j];
-        const double rv = var_t[i] + qvec(j) * var_c[i];
-        if (rv > 0.0) weights[i] = 1.0 / rv;
+    // Refine weights: Var(resid) = Var_t + (K² ⊗ Var_c). Freeze K at each stamp
+    // centre (stamps ≪ knot scale, same block-effective idea as subtract) and
+    // convolve the reference variance; the old Q·Var_c(x) form mis-weights
+    // Poisson cores.
+    if (have_var) {
+      if (have_cvar) {
+        std::vector<float> k2(static_cast<std::size_t>(ks) * ks);
+        std::vector<std::vector<float>> stamp_k2(n_stamps);
+        for (int s = 0; s < n_stamps; ++s) {
+          if (!accepted[s] || cnt[s] == 0) continue;
+          Eigen::MatrixXd pt(1, 2);
+          pt(0, 0) = static_cast<double>(stamp_cx[s]);
+          pt(0, 1) = static_cast<double>(stamp_cy[s]);
+          const Eigen::MatrixXd a_s = spatial.design(pt) * c;  // 1 x (nc+1)
+          std::fill(k2.begin(), k2.end(), 0.0f);
+          for (int n = 0; n < nc; ++n) {
+            const float an = static_cast<float>(a_s(0, n));
+            const float* p = phi[n].data();
+            for (std::size_t u = 0; u < k2.size(); ++u) k2[u] += an * p[u];
+          }
+          for (float& v : k2) v *= v;  // elementwise K²
+          stamp_k2[s] = k2;
+        }
+        for (int j = 0; j < npix; ++j) {
+          const int i = rows[j];
+          const int s = pix_stamp[i];
+          const double vc = conv_var_at(
+              static_cast<int>(px[i]), static_cast<int>(py[i]), stamp_k2[s], ks,
+              r, ref_var, iw, ih, w, ref_mask);
+          const double rv = var_t[i] + vc;
+          if (rv > 0.0) weights[i] = 1.0 / rv;
+        }
+      } else {
+        // Science variance only: no convolution term.
+        for (int j = 0; j < npix; ++j) {
+          const int i = rows[j];
+          if (var_t[i] > 0.0) weights[i] = 1.0 / var_t[i];
+        }
       }
+    }
 
     // Robust per-stamp clip: drop accepted stamps with chi^2 above
     // median + clip_sigma * 1.4826 * MAD (worst-first, never below the floor).

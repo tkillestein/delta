@@ -10,28 +10,6 @@
 
 namespace delta {
 
-namespace {
-
-// Reshape theta into the (k x (nc+1)) coefficient matrix C whose column j is
-// theta[j*k : (j+1)*k]. theta is laid out as consecutive field blocks, so a
-// column-major map is exactly that reshape.
-Eigen::MatrixXd coeff_matrix(const Eigen::Ref<const Eigen::VectorXd>& theta,
-                             int k, int n_fields) {
-  if (theta.size() != static_cast<Eigen::Index>(k) * n_fields)
-    throw std::runtime_error("subtract: theta size does not match k*(nc+1)");
-  return Eigen::Map<const Eigen::MatrixXd>(theta.data(), k, n_fields);
-}
-
-// Background fill level for masked / non-finite reference pixels: the median of
-// a strided sample of the good pixels. Convolving the raw reference smears NaNs
-// and the spurious values under bad pixels across the kernel footprint, polluting
-// B_n within a kernel radius of any defect (SPEC §3.6). Filling with the *median*
-// rather than zero matters at mask boundaries: a zero fill convolves a hard step
-// (0 vs background) and rings the model just outside every masked region, which
-// shows up as cruft around the masked template and the frame edge. Median fill
-// removes that step, so the model stays smooth right up to the (dilated-masked)
-// boundary.
-//
 // Only the fill *scalar* is produced here; the substitution itself is fused into
 // the model-convolve tile gather (see below), so the sanitised reference never
 // materialises full-frame -- that copy was a 512 MB DRAM round-trip whose only
@@ -54,6 +32,18 @@ float reference_fill_value(const ImageF& reference) {
   std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
                    sample.end());
   return sample[sample.size() / 2];
+}
+
+namespace {
+
+// Reshape theta into the (k x (nc+1)) coefficient matrix C whose column j is
+// theta[j*k : (j+1)*k]. theta is laid out as consecutive field blocks, so a
+// column-major map is exactly that reshape.
+Eigen::MatrixXd coeff_matrix(const Eigen::Ref<const Eigen::VectorXd>& theta,
+                             int k, int n_fields) {
+  if (theta.size() != static_cast<Eigen::Index>(k) * n_fields)
+    throw std::runtime_error("subtract: theta size does not match k*(nc+1)");
+  return Eigen::Map<const Eigen::MatrixXd>(theta.data(), k, n_fields);
 }
 
 // Separable OR-dilation of a uint8 bitmask by Chebyshev radius r, in place.

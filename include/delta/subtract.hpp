@@ -11,6 +11,18 @@
 
 namespace delta {
 
+// Background fill level for masked / non-finite reference pixels: the median of
+// a strided sample of the good pixels. Convolving the raw reference smears NaNs
+// and the spurious values under bad pixels across the kernel footprint, polluting
+// B_n within a kernel radius of any defect (SPEC §3.6). Filling with the *median*
+// rather than zero matters at mask boundaries: a zero fill convolves a hard step
+// (0 vs background) and rings the model just outside every masked region, which
+// shows up as cruft around the masked template and the frame edge. Median fill
+// removes that step, so the model stays smooth right up to the (dilated-masked)
+// boundary. Shared between the full-frame subtract path and the stamp-local fit
+// path so both stay bit-for-bit consistent (SPEC §3.6).
+float reference_fill_value(const ImageF& reference);
+
 // Spatially-varying coefficient fields evaluated over the full frame.
 //
 // `coeff[n](x,y)` is a_n(x,y), the field multiplying basis-convolved template

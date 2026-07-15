@@ -196,8 +196,7 @@ def _matched_pair(seed, corrupt_n=0, gain=2.0, rn=5.0, size=512, n=50):
 
 def test_reduced_chi2_near_unity_on_clean_data():
     # With a correct per-pixel noise model the fit's reduced chi^2 must be ~1:
-    # the residual variance is Var_target + (sum K^2) Var_conv, so the convolved
-    # reference noise is suppressed by the kernel (it was previously overcounted).
+    # the residual variance is Var_target + (K² ⊗ Var_conv).
     sci, ref, svar, rvar, _ = _matched_pair(7)
     sol = delta.subtract(
         sci,
@@ -210,6 +209,72 @@ def test_reduced_chi2_near_unity_on_clean_data():
     ).solution
     assert abs(sol.reduced_chi2 - 1.0) < 0.1
     assert sol.n_stamps_rejected == 0
+
+
+def test_masked_halo_does_not_ring_bn():
+    """A bad reference pixel just outside the stamp must not poison B_n inside it.
+
+    Detect clears only the stamp footprint; the fit convolves a kernel-radius
+    halo. Without median-fill sanitisation the defect rings into stamp pixels.
+    """
+    h, w, beta, n_max, sr = 80, 80, 2.0, 2, 6
+    rng = np.random.default_rng(21)
+    ref = (50.0 + 0.1 * rng.standard_normal((h, w))).astype(np.float32)
+    sci = ref.copy()
+    cx = cy = 40
+    _, kernels = delta.gauss_hermite_kernels(beta, n_max)
+    r_basis = kernels.shape[1] // 2
+    dx = sr + 1  # just outside the stamp, well inside the fit halo
+    assert dx <= sr + r_basis
+    ref[cy, cx + dx] = 1.0e6
+
+    knots = delta.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, 3, 3)
+    sx = np.array([cx], dtype=np.int32)
+    sy = np.array([cy], dtype=np.int32)
+
+    # Spiked frame contaminates a raw full-frame B_n at the stamp edge.
+    dirty = delta.basis_convolve(ref, beta, n_max)
+    ref_clean = ref.copy()
+    ref_clean[cy, cx + dx] = float(np.median(ref[ref < 1.0e5]))
+    clean = delta.basis_convolve(ref_clean, beta, n_max)
+    edge = cx + sr
+    assert abs(float(dirty[0, cy, edge]) - float(clean[0, cy, edge])) > 10.0
+
+    # Masked spike: fit_kernel median-fills the halo, so the solve stays healthy.
+    mask = np.zeros((h, w), np.uint8)
+    mask[cy, cx + dx] = 1
+    fit = delta.fit_kernel(
+        sci,
+        ref,
+        knots,
+        sx,
+        sy,
+        sr,
+        beta,
+        n_max,
+        np.array([1e-2]),
+        clip_iterations=0,
+        reference_mask=mask,
+    )
+    assert fit["n_pixels"] > 0
+    assert np.all(np.isfinite(fit["theta"]))
+    assert fit["rss"] < 1e3  # no 1e6-spike ringing into the design
+
+
+def test_irls_weights_stable_under_poisson_cores():
+    """IRLS with (K² ⊗ Var) keeps reduced chi² near 1 on Poisson star stamps."""
+    sci, ref, svar, rvar, _ = _matched_pair(19, size=256, n=40)
+    sol = delta.subtract(
+        sci,
+        ref,
+        science_var=svar,
+        reference_var=rvar,
+        n_knots=4,
+        stamp_radius=12,
+        threshold_sigma=6,
+    ).solution
+    assert abs(sol.reduced_chi2 - 1.0) < 0.15
+    assert sol.n_stamps_used >= 10
 
 
 def test_sigma_clipping_rejects_bad_stamps():

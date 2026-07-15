@@ -34,10 +34,15 @@ struct KernelFit {
 //
 // For each stamp centre (stamp_x[i], stamp_y[i]) the (2*stamp_radius+1)^2 pixel
 // box is gathered (clipped to the frame). Pixels flagged bad in either mask, or
-// non-finite, are excluded (SPEC §3.6). The target is the science value; the
-// design row is [B_0(x,y) ... B_{nc-1}(x,y)] with B_n = phi_n (x) reference; the
-// weight is the inverse of the summed input variances (1 if none supplied). The
-// smoothing lambda is selected by GCV over `lambda_grid`.
+// non-finite, are excluded (SPEC §3.6). The reference patch includes a
+// kernel-radius halo that is median-filled where masked/non-finite so defects
+// just outside the stamp do not ring B_n. The target is the science value; the
+// design row is [B_0(x,y) ... B_{nc-1}(x,y)] with B_n = phi_n (x) reference.
+// With variance maps, IRLS weights use
+//   w = 1 / (Var_target + (K² ⊗ Var_reference))
+// with K frozen at each stamp centre (first pass uses the cruder
+// 1/(Var_t+Var_c)). Without variance, unit weights. The smoothing lambda is
+// selected by GCV over `lambda_grid`.
 //
 // Bad stamps (variable sources, dipoles from misregistration, cosmics, saturated
 // cores) bias the global kernel, so the solve is iterated with per-stamp sigma

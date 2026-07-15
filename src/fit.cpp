@@ -29,27 +29,6 @@ double median_copy(std::vector<double> v) {
   return v[mid];
 }
 
-// Median of a strided sample of finite, unmasked reference pixels — same fill
-// contract as subtract::reference_fill_value so masked/NaN halo pixels do not
-// ring B_n inside the stamp (SPEC §3.6).
-float reference_fill_value(const ImageF& reference) {
-  const std::size_t n = reference.size();
-  const float* src = reference.data();
-  const bool has_mask = reference.has_mask();
-  const MaskType* m = has_mask ? reference.mask().data() : nullptr;
-
-  std::vector<float> sample;
-  sample.reserve(n / 7 + 1);
-  for (std::size_t i = 0; i < n; i += 7) {
-    const float v = src[i];
-    if (std::isfinite(v) && !(has_mask && m[i] != kMaskGood)) sample.push_back(v);
-  }
-  if (sample.empty()) return 0.0f;
-  std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
-                   sample.end());
-  return sample[sample.size() / 2];
-}
-
 // (K² ⊗ Var)(x,y) with K frozen and zero-pad at the frame edge. Matches the
 // exact independent-pixel convolution variance when a is constant over the
 // kernel footprint (SPEC §3.6). Masked reference pixels contribute 0 (they are

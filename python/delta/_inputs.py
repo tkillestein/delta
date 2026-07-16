@@ -29,6 +29,12 @@ def _split(obj) -> Layers:
         variance = arr**2 if utype == "std" else arr
 
     mask = getattr(obj, "mask", None)
+    if mask is np.ma.nomask:
+        # np.ma.MaskedArray with no masked values reports `mask` as the
+        # scalar `nomask` sentinel rather than a per-pixel array; treat it
+        # the same as "no mask supplied" instead of letting the scalar flow
+        # into the shape check below.
+        mask = None
     return np.asarray(data), variance, mask
 
 

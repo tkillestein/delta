@@ -57,17 +57,21 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
 //   D(x,y) = S(x,y) - sum_n a_n(x,y) B_n(x,y) - b(x,y),   B_n = phi_n (x) R
 //
 // If either input carries a variance layer the difference carries propagated
-// variance Var(S) + (K^2 (x) Var(R)), where the spatially-varying kernel-square
-// convolution is evaluated via the separable factorisation
-//   (K^2 (x) Var(R))(x,y) = sum_{n,m} a_n a_m [(phi_n phi_m) (x) Var(R)](x,y).
+// variance Var(S) + (K^2 (x) Var(R)). The exact expansion
+//   (K^2 (x) Var(R))(x,y) = sum_{n,m} a_n a_m [(phi_n phi_m) (x) Var(R)](x,y)
+// costs nc(nc+1)/2 separable convolutions; the implementation instead uses a
+// block-effective approximation: per tile, K = sum_n a_n phi_n is frozen at the
+// tile centre, squared, and convolved with Var(R) directly (see subtract.cpp) --
+// exact for a spatially-constant kernel, a piecewise-constant approximation
+// otherwise, and far cheaper.
 // If either input carries a mask the difference carries the science mask unioned
 // with the reference mask dilated by the kernel radius, plus a one-kernel-radius
 // edge border (kMaskEdge); non-finite difference pixels are flagged.
-// `saturation` (> 0) flags pixels at or above that level in either input as
-// kMaskSaturated and grows them by the kernel radius: a bright/saturated stellar
-// core is non-linear and never matches the model, so propagating it leaves a
-// large spurious residual; masking the affected footprint keeps it out of the
-// difference (and downstream detection). 0 disables it.
+// `saturation` (> 0) flags pixels at or above that level as kMaskSaturated. A
+// saturated *reference* pixel is grown by the kernel radius (it is convolved, so
+// its non-linear value pollutes a kernel-radius neighbourhood of the model); a
+// saturated *science* (target) pixel is not convolved and propagates 1:1, so it
+// is flagged but not grown. 0 disables saturation masking.
 ImageF subtract(const ImageF& science, const ImageF& reference,
                 const ThinPlateBasis& spatial,
                 const Eigen::Ref<const Eigen::VectorXd>& theta,

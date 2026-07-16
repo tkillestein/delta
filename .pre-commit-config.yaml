@@ -1,0 +1,25 @@
+# Runs via `prek` (a fast, drop-in-compatible reimplementation of the pre-commit
+# framework) or the standard `pre-commit` tool. Both handle partially-staged
+# files correctly: unstaged hunks are stashed before hooks run and restored
+# after, so a hook's `git add` of its own fixes never sweeps in unrelated
+# unstaged changes (unlike the old .githooks/pre-commit script this replaces).
+#
+# Install once per clone:
+#   prek install
+# (or `pre-commit install` if using the Python tool instead of prek)
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.17 # keep in sync with the `ruff` dev dependency in pyproject.toml
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty check
+        entry: uv run ty check --fix
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]

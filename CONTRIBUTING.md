@@ -28,11 +28,13 @@ uv run ty check               # type-check
 > rebuild on source changes (uv keys reinstall on the package version, which is
 > unchanged) and will silently run the stale binary. Python-only changes need no rebuild.
 
-Enable the pre-commit hook once per clone (it runs ruff fix/format + `ty check` on staged
-Python and gates the commit):
+Enable the pre-commit hooks once per clone with [`prek`](https://github.com/j178/prek)
+(a fast, drop-in-compatible reimplementation of the `pre-commit` framework; the
+standard `pre-commit` tool works too) — it runs ruff fix/format + `ty check` on
+staged Python and gates the commit:
 
 ```sh
-git config core.hooksPath .githooks
+prek install
 ```
 
 ## Pull requests

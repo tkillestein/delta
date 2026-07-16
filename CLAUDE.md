@@ -45,8 +45,9 @@ System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen (≥ 3.4),
 The FFT is vendored (header-only PocketFFT, `extern/pocketfft`, BSD-3) — no system FFT
 library is required. OpenMP is used if found.
 
-Enable the pre-commit hook once per clone (`git config core.hooksPath .githooks`); it
-runs ruff fix/format + `ty check` on staged Python and gates the commit.
+Enable the pre-commit hooks once per clone with `prek install` (or `pre-commit
+install`; config in `.pre-commit-config.yaml`); it runs ruff fix/format + `ty
+check` on staged Python and gates the commit.
 
 ## Architecture
 

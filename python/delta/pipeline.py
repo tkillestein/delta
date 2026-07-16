@@ -511,6 +511,21 @@ class Subtractor:
             fit["n_stamps_total"],
             fit["n_pixels"],
         )
+        lam_grid = np.asarray(fit["lambda_grid"])
+        if lam_grid.size > 1 and fit["lambda"] in (lam_grid[0], lam_grid[-1]):
+            edge = "lower" if fit["lambda"] == lam_grid[0] else "upper"
+            logger.warning(
+                "selected lambda={:.3g} ({}) sits at the {} edge of lambda_grid "
+                "[{:.3g}, {:.3g}] -- the search may be under-constrained; consider "
+                "widening lambda_grid to confirm this isn't clipping the true "
+                "optimum (under-smoothing at the lower edge, over-smoothing at "
+                "the upper edge).",
+                fit["lambda"],
+                selector,
+                edge,
+                lam_grid[0],
+                lam_grid[-1],
+            )
         design_bytes = fit.get("cv_exact_design_bytes", 0)
         if design_bytes > _CV_EXACT_DESIGN_WARN_BYTES:
             logger.warning(

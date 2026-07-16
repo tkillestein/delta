@@ -272,3 +272,25 @@ def test_write_fits_provenance(tmp_path):
     # Caller-supplied extra_cards, e.g. input paths / invocation, from the CLI.
     assert header["DLTSCI"] == "sci.fits"
     assert "delta subtract" in header["DLTCMD"]
+
+
+def test_cv_exact_design_size_warning(monkeypatch):
+    import delta.pipeline as pipeline_module
+    from loguru import logger
+
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    # Force the threshold well below any real design size so the warning fires
+    # deterministically regardless of frame/knot geometry, and force the exact
+    # (non-stamped) CV path so cv_exact_design_bytes is nonzero in the first place.
+    monkeypatch.setattr(pipeline_module, "_CV_EXACT_DESIGN_WARN_BYTES", 1)
+    monkeypatch.setenv("DELTA_STAMP_APPROX", "0")
+
+    messages = []
+    sink_id = logger.add(lambda msg: messages.append(msg.record["message"]), level="WARNING")
+    logger.enable("delta")
+    try:
+        delta.subtract(sci, ref, gain=1.5, n_knots=4, stamp_radius=12, cv_folds=3)
+    finally:
+        logger.remove(sink_id)
+
+    assert any("exact (non-stamped) k-fold CV" in m for m in messages)

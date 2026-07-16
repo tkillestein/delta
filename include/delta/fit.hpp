@@ -27,6 +27,13 @@ struct KernelFit {
   std::vector<int> stamp_x, stamp_y;
   std::vector<double> stamp_chi2;
   std::vector<std::uint8_t> stamp_accepted;
+  // Bytes of the whitened N x P design matrix built by the *exact* (non-stamped)
+  // k-fold CV path (solve_gls_cv), 0 if cv_folds < 2 or the stamped fast path
+  // (solve_gls_cv_stamped) was used instead. That matrix is rebuilt every IRLS
+  // pass and can reach ~1GB on mid-size frames with fine knots where the
+  // stamped path's 16x knot-spacing gate doesn't apply (see solve.cpp); callers
+  // can use this to warn.
+  std::size_t cv_exact_design_bytes = 0;
 };
 
 // Fit the spatially-varying matching kernel + differential background by

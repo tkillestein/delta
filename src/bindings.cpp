@@ -626,6 +626,7 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
   out["n_stamps_total"] = fit.n_stamps_total;
   out["n_stamps_rejected"] = fit.n_stamps_rejected;
   out["reduced_chi2"] = fit.reduced_chi2;
+  out["cv_exact_design_bytes"] = fit.cv_exact_design_bytes;
   out["stamp_x"] = to_numpy<int>(std::vector<int>(fit.stamp_x),
                                  {fit.stamp_x.size()});
   out["stamp_y"] = to_numpy<int>(std::vector<int>(fit.stamp_y),

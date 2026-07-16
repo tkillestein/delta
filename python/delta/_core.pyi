@@ -71,6 +71,9 @@ KernelFit = TypedDict(
         "n_stamps_total": int,
         "n_stamps_rejected": int,
         "reduced_chi2": float,
+        # Bytes of the whitened N x P design the exact (non-stamped) CV path
+        # materialises; 0 if that path wasn't used (see solve_gls_cv).
+        "cv_exact_design_bytes": int,
         "stamp_x": NDArray[np.int32],
         "stamp_y": NDArray[np.int32],
         "stamp_chi2": NDArray[np.float64],

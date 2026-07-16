@@ -51,6 +51,10 @@ _CONFIG_KEYS = frozenset(
     }
 )
 
+# Warn when the exact (non-stamped) k-fold CV path's rebuilt-every-IRLS-pass
+# whitened design exceeds this size (see fit_kernel's cv_exact_design_bytes).
+_CV_EXACT_DESIGN_WARN_BYTES = 256 * 1024 * 1024
+
 # Median of a chi-square_1 (squared standard normal) distribution. Used to turn a
 # robust median(z^2) into a reduced-chi2-equivalent scale factor without the
 # mean's sensitivity to high-|z| outliers (genuine transients).
@@ -507,6 +511,16 @@ class Subtractor:
             fit["n_stamps_total"],
             fit["n_pixels"],
         )
+        design_bytes = fit.get("cv_exact_design_bytes", 0)
+        if design_bytes > _CV_EXACT_DESIGN_WARN_BYTES:
+            logger.warning(
+                "exact (non-stamped) k-fold CV path used a {:.2f} GB whitened "
+                "design, rebuilt every IRLS pass -- the 16x knot-spacing gate to "
+                "the cheaper stamped path was not met (fine knots relative to "
+                "stamp_radius). Consider fewer/coarser knots, a larger "
+                "spatial_scale, or a smaller stamp_radius if this is slow.",
+                design_bytes / 1e9,
+            )
         if fit["reduced_chi2"] > 3.0:
             logger.warning(
                 "kernel fit reduced chi2={:.2f} >> 1: stellar residuals likely. "

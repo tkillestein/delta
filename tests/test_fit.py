@@ -321,3 +321,64 @@ def test_stamped_solve_matches_exact(monkeypatch):
     )
     assert diff_rel < 1e-3
     assert abs(stamped.solution.reduced_chi2 - exact.solution.reduced_chi2) < 0.02
+
+
+def test_cv_exact_design_bytes(monkeypatch):
+    # Same fine-knots/large-stamp geometry as test_stamped_solve_matches_exact: the
+    # 16x knot-spacing gate rejects the stamped fast path, so solve_gls_cv (the
+    # exact per-row path) runs and should report a nonzero whitened-design size.
+    sci, ref, svar, rvar, _ = _matched_pair(11, size=1024, n=120)
+    sel = delta.select_stamps(sci, ref)
+    knots = delta.grid_knots(0.0, 0.0, sci.shape[1] - 1.0, sci.shape[0] - 1.0, 3, 3)
+    grid = np.logspace(-6, 4, 8)
+
+    monkeypatch.setenv("DELTA_STAMP_APPROX", "0")
+    exact = delta.fit_kernel(
+        sci,
+        ref,
+        knots,
+        sel["x"],
+        sel["y"],
+        12,
+        2.0,
+        2,
+        grid,
+        cv_folds=5,
+        science_var=svar,
+        reference_var=rvar,
+    )
+    assert exact["cv_exact_design_bytes"] > 0
+
+    monkeypatch.setenv("DELTA_STAMP_APPROX", "1")
+    stamped = delta.fit_kernel(
+        sci,
+        ref,
+        knots,
+        sel["x"],
+        sel["y"],
+        12,
+        2.0,
+        2,
+        grid,
+        cv_folds=5,
+        science_var=svar,
+        reference_var=rvar,
+    )
+    assert stamped["cv_exact_design_bytes"] == 0
+
+    # cv_folds <= 1 never takes the CV path at all.
+    gcv = delta.fit_kernel(
+        sci,
+        ref,
+        knots,
+        sel["x"],
+        sel["y"],
+        12,
+        2.0,
+        2,
+        grid,
+        cv_folds=0,
+        science_var=svar,
+        reference_var=rvar,
+    )
+    assert gcv["cv_exact_design_bytes"] == 0

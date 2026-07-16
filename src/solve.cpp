@@ -353,8 +353,15 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
   const int n = static_cast<int>(points.rows());
-  if (n_groups < 2 || static_cast<int>(group.size()) != n)
-    return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+  // `group.size() != n` is a caller bug (mismatched inputs), not a valid way to
+  // opt out of CV -- unlike n_groups < 2, which is the documented opt-out and
+  // degrades to GCV. Erroring here matters most for the public `_core.solve_gls_cv`
+  // binding, where silently switching lambda-selection strategy on a shape
+  // mismatch would be a trap; fit_kernel's internal caller always sizes `group`
+  // to match `points` so this never fires on that path.
+  if (static_cast<int>(group.size()) != n)
+    throw std::runtime_error("solve_gls_cv: group.size() must match points.rows()");
+  if (n_groups < 2) return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
 
   const int nc = static_cast<int>(bn.cols());
   const Eigen::MatrixXd d = basis.design(points);  // N x k

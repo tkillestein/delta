@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "delta/timing.hpp"
+
 namespace delta {
 
 namespace {
@@ -318,6 +320,8 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   // central block. Built up front (one FFT per cell) over the thread team.
   std::vector<double> cell_power(static_cast<std::size_t>(ncell) * nspec);
   std::vector<double> cell_sumk2(ncell);
+  {
+    DELTA_TIME("decorrelate: kernel-power cache");
 #pragma omp parallel
   {
     Fft2d fft(block);
@@ -337,6 +341,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       for (float v : kern) sumk2 += static_cast<double>(v) * v;
       cell_sumk2[ci] = sumk2;
     }
+  }
   }
 
   struct BlockJob {
@@ -369,6 +374,8 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       if (y >= 0 && y < h) wy_total[y] += hwin[iy];
     }
 
+  {
+    DELTA_TIME("decorrelate: block filter+blend");
 #pragma omp parallel
   {
     Fft2d fft(block);
@@ -446,10 +453,12 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       }
     }
   }
+  }
 
   ImageF out(w, h);
   out.allocate_variance();
   std::vector<float>& out_var = out.variance();
+  DELTA_TIME("decorrelate: normalise");
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
     const double wy = wy_total[y];
@@ -536,6 +545,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
   float sumpsf2 = 0.0f;
   for (float v : psf) sumpsf2 += v * v;
 
+  DELTA_TIME("score: blocked correlation");
   ImageF out(w, h);
 
   // Cache-blocked correlation: out(x) = (1/norm(x)) sum_u psf(u) image(x+u).

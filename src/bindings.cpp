@@ -736,6 +736,7 @@ nb::dict decorrelate(InArray<float> difference, const Eigen::MatrixXd& knots,
   nb::dict result;
   result["difference"] = to_numpy<float>(std::move(out.pixels()), {h, w});
   result["variance"] = to_numpy<float>(std::move(out.variance()), {h, w});
+  result["timing"] = timing_dict();
   return result;
 }
 
@@ -975,4 +976,8 @@ NB_MODULE(_core, m) {
   m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "variance"_a,
         "Match-filtered score image (per-pixel S/N map). variance must be a "
         "same-shape float32 image of per-pixel noise variance.");
+  m.def("drain_timing", &timing_dict,
+        "Drain accumulated DELTA_TIMING sub-stage timers into a {label: "
+        "seconds} dict (None when timing is disabled). For callers of "
+        "functions that return bare arrays (e.g. matched_filter).");
 }

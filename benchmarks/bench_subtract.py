@@ -84,6 +84,12 @@ SUBSTAGES = {
         "subtract: variance propagation",
         "subtract: mask growth",
     ),
+    "noise decorrelation": (
+        "decorrelate: kernel-power cache",
+        "decorrelate: block filter+blend",
+        "decorrelate: normalise",
+    ),
+    "matched-filter score": ("score: blocked correlation",),
 }
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"

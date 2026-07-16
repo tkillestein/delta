@@ -32,7 +32,9 @@ double median_copy(std::vector<double> v) {
 // (K² ⊗ Var)(x,y) with K frozen and zero-pad at the frame edge. Matches the
 // exact independent-pixel convolution variance when a is constant over the
 // kernel footprint (SPEC §3.6). Masked reference pixels contribute 0 (they are
-// median-filled in the model, so they carry no Poisson noise into B_n).
+// median-filled in the model, so they carry no Poisson noise into B_n) -- unlike
+// subtract.cpp's full-frame variance pass, which doesn't exclude them (harmless
+// there since those output pixels are mask-grown anyway).
 double conv_var_at(int x, int y, const std::vector<float>& k2, int ks, int r,
                    const float* var, int iw, int ih, std::size_t w,
                    const MaskType* mask) {
@@ -100,16 +102,28 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
   const float* ref_var = have_cvar ? reference.variance().data() : nullptr;
 
+  // Per-stamp scratch, filled in parallel below and merged serially afterwards
+  // so the merged pixel order (and therefore stamp_idx / pix_stamp) exactly
+  // matches the original serial loop -- deterministic regardless of thread
+  // scheduling. Each stamp's own work (patch gather + basis convolve + pixel
+  // selection) is independent of every other stamp.
+  struct StampGather {
+    bool used = false;
+    int cx = 0, cy = 0;
+    std::vector<double> px, py, target, var_t, var_c, bn_flat;
+  };
+  std::vector<StampGather> gathered(stamp_x.size());
+
   {
    DELTA_TIME("fit: stamp B_n convolve");
+#pragma omp parallel for schedule(dynamic)
    for (std::size_t s = 0; s < stamp_x.size(); ++s) {
+    StampGather& out = gathered[s];
     const int cx = stamp_x[s], cy = stamp_y[s];
     const int x0 = std::max(0, cx - stamp_radius);
     const int x1 = std::min(iw - 1, cx + stamp_radius);
     const int y0 = std::max(0, cy - stamp_radius);
     const int y1 = std::min(ih - 1, cy + stamp_radius);
-    const int stamp_idx = static_cast<int>(stamp_cx.size());
-    bool used = false;
 
     // Reference patch covering the stamp plus a kernel-radius halo, sanitised
     // like full-frame subtract: masked / non-finite pixels take the median fill
@@ -162,22 +176,37 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           }
         if (!finite_bn) continue;
 
-        px.push_back(static_cast<double>(x));
-        py.push_back(static_cast<double>(y));
-        target.push_back(static_cast<double>(sv));
-        var_t.push_back(vt);
-        var_c.push_back(vc);
-        pix_stamp.push_back(stamp_idx);
+        out.px.push_back(static_cast<double>(x));
+        out.py.push_back(static_cast<double>(y));
+        out.target.push_back(static_cast<double>(sv));
+        out.var_t.push_back(vt);
+        out.var_c.push_back(vc);
         for (int n = 0; n < nc; ++n)
-          bn_flat.push_back(static_cast<double>(bn[n].data()[li]));
-        used = true;
+          out.bn_flat.push_back(static_cast<double>(bn[n].data()[li]));
+        out.used = true;
       }
     }
-    if (used) {
-      stamp_cx.push_back(cx);
-      stamp_cy.push_back(cy);
+    if (out.used) {
+      out.cx = cx;
+      out.cy = cy;
     }
    }
+  }
+
+  // Serial merge, in original stamp order, so stamp_idx / pix_stamp exactly
+  // match what the old single-threaded loop produced.
+  for (const StampGather& g : gathered) {
+    if (!g.used) continue;
+    const int stamp_idx = static_cast<int>(stamp_cx.size());
+    stamp_cx.push_back(g.cx);
+    stamp_cy.push_back(g.cy);
+    px.insert(px.end(), g.px.begin(), g.px.end());
+    py.insert(py.end(), g.py.begin(), g.py.end());
+    target.insert(target.end(), g.target.begin(), g.target.end());
+    var_t.insert(var_t.end(), g.var_t.begin(), g.var_t.end());
+    var_c.insert(var_c.end(), g.var_c.begin(), g.var_c.end());
+    bn_flat.insert(bn_flat.end(), g.bn_flat.begin(), g.bn_flat.end());
+    pix_stamp.insert(pix_stamp.end(), g.px.size(), stamp_idx);
   }
 
   const int npix_all = static_cast<int>(target.size());
@@ -221,6 +250,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   GlsResult gls;
   int npix = 0;
   double reduced_chi2 = std::numeric_limits<double>::quiet_NaN();
+  std::size_t cv_exact_design_bytes = 0;
   // Carries the previous pass's CV-selected lambda index into the next pass so the
   // search warm-starts at it (the clip barely moves the curve). -1 = cold start.
   int warm_start = -1;
@@ -306,6 +336,10 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
         gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
                            cv_folds, warm_start);
+        // The exact path (see solve_gls_cv) materialises an N x P whitened
+        // design every IRLS pass; record its size so the caller can warn.
+        const std::size_t p = static_cast<std::size_t>(nc + 1) * k;
+        cv_exact_design_bytes = static_cast<std::size_t>(npix) * p * sizeof(double);
       }
       // Recover the selected grid index (min of the CV-error curve; unevaluated
       // entries are +inf) to warm-start the next IRLS pass.
@@ -382,7 +416,10 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
 
     // Robust per-stamp clip: drop accepted stamps with chi^2 above
     // median + clip_sigma * 1.4826 * MAD (worst-first, never below the floor).
-    int rejected_now = 0;
+    // Rejections are only *applied* below if another pass will actually refit
+    // on them — otherwise `accepted`/`stamp_accepted` would describe a stamp
+    // set the returned `theta` was never fitted on.
+    std::vector<int> to_reject;
     if (clip_passes > 0 && iter < clip_passes) {
       std::vector<double> active_chi2;
       active_chi2.reserve(n_stamps);
@@ -401,15 +438,17 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         std::sort(cand.begin(), cand.end(),
                   [&](int aa, int bb) { return stamp_chi2[aa] > stamp_chi2[bb]; });
         for (int s : cand) {
-          if (n_active - rejected_now <= floor_stamps) break;
-          accepted[s] = 0;
-          ++rejected_now;
+          if (n_active - static_cast<int>(to_reject.size()) <= floor_stamps) break;
+          to_reject.push_back(s);
         }
       }
     }
 
+    const int rejected_now = static_cast<int>(to_reject.size());
     if (rejected_now == 0 && iter >= min_pass) break;
-    if (iter >= hard_max) break;
+    if (iter >= hard_max) break;  // no further pass; leave `accepted` untouched.
+
+    for (int s : to_reject) accepted[s] = 0;
   }
 
   int n_used = 0;
@@ -428,6 +467,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   out.stamp_y = stamp_cy;
   out.stamp_chi2 = stamp_chi2;
   out.stamp_accepted = accepted;
+  out.cv_exact_design_bytes = cv_exact_design_bytes;
   return out;
 }
 

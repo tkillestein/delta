@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1]
+
+### Added
+- `apply` API + CLI command: apply a saved `KernelSolution` to a new image pair
+  without re-fitting.
+- Connected-component source catalog (`build_catalog`) from the match-filtered
+  score image, with FWHM-consistency filtering, dipole flagging, and mask-flag
+  aggregation (SPEC §3.7).
+- Full run provenance (`DLT*` FITS header cards): fit, config, environment,
+  and runtime layers, merged by `DiffResult.write()`.
+- A scalar variance rescale so the difference-image reduced chi2 is forced to 1.
+
+### Changed
+- The kernel fit is now weighted by `K²⊗Var` instead of `Q·Var_c`.
+- The decorrelated difference and its variance are now statistically consistent.
+
 ## [1.0.0] - 2026-06-18
 
 First public release. The API is now considered stable under semantic versioning.

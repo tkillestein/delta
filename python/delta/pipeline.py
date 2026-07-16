@@ -34,6 +34,8 @@ _CONFIG_KEYS = frozenset(
         "threshold_sigma",
         "max_stamps",
         "saturation",
+        "match_radius",
+        "fwhm_radius",
         "bright_mask",
         "lambda_grid",
         "clip_sigma",
@@ -48,6 +50,10 @@ _CONFIG_KEYS = frozenset(
         "rescale_variance",
     }
 )
+
+# Warn when the exact (non-stamped) k-fold CV path's rebuilt-every-IRLS-pass
+# whitened design exceeds this size (see fit_kernel's cv_exact_design_bytes).
+_CV_EXACT_DESIGN_WARN_BYTES = 256 * 1024 * 1024
 
 # Median of a chi-square_1 (squared standard normal) distribution. Used to turn a
 # robust median(z^2) into a reduced-chi2-equivalent scale factor without the
@@ -278,6 +284,8 @@ class Subtractor:
         threshold_sigma: float = 5.0,
         max_stamps: int = 200,
         saturation: float = 0.0,
+        match_radius: int = 2,
+        fwhm_radius: int = 0,
         bright_mask: float = 0.0,
         lambda_grid: NDArray[np.float64] | None = None,
         clip_sigma: float = 4.0,
@@ -301,6 +309,12 @@ class Subtractor:
         self.stamp_radius = stamp_radius
         self.threshold_sigma = threshold_sigma
         self.max_stamps = max_stamps
+        # Science/reference stamp cross-match tolerance in pixels; widen this if
+        # inputs are astrometrically misregistered, which otherwise fails stamp
+        # selection with "no stamps selected" and no obvious knob to reach for.
+        self.match_radius = match_radius
+        # FWHM moment window; 0 auto-sizes to max(5, stamp_radius/2).
+        self.fwhm_radius = fwhm_radius
         # `saturation` is the instrument detector level: genuinely saturated
         # (non-linear) pixels, rejected from stamp selection AND masked in the
         # output. `bright_mask` is a data-driven, output-only level: it masks the
@@ -310,7 +324,9 @@ class Subtractor:
         self.saturation = saturation
         self.bright_mask = bright_mask
         self.lambda_grid = (
-            np.logspace(-6.0, 6.0, 25) if lambda_grid is None else np.asarray(lambda_grid)
+            np.logspace(-6.0, 6.0, 25, dtype=np.float64)
+            if lambda_grid is None
+            else np.asarray(lambda_grid, dtype=np.float64)
         )
         self.clip_sigma = clip_sigma
         self.clip_iterations = clip_iterations
@@ -342,6 +358,8 @@ class Subtractor:
             "DLTTHSIG": self.threshold_sigma,
             "DLTMAXST": self.max_stamps,
             "DLTSAT": self.saturation,
+            "DLTMRAD": self.match_radius,
+            "DLTFRAD": self.fwhm_radius,
             "DLTBMASK": self.bright_mask,
             "DLTCLPSG": self.clip_sigma,
             "DLTCLPIT": self.clip_iterations,
@@ -373,6 +391,8 @@ class Subtractor:
             threshold_sigma=self.threshold_sigma,
             max_stamps=self.max_stamps,
             saturation=self.saturation,
+            match_radius=self.match_radius,
+            fwhm_radius=self.fwhm_radius,
         )
 
     def _fit(
@@ -409,9 +429,17 @@ class Subtractor:
             sel["median_fwhm_reference"],
         )
         if n_stamps == 0:
-            raise ValueError("no stamps selected; lower --threshold-sigma or supply a --catalog")
+            raise ValueError(
+                "no stamps selected; lower threshold_sigma, supply a catalog, or "
+                "widen match_radius if science/reference are astrometrically "
+                "misregistered"
+            )
         if direction is None:
             direction = sel["direction"]
+        elif direction not in ("science", "reference"):
+            raise ValueError(
+                f"direction must be 'science', 'reference', or None, got {direction!r}"
+            )
         logger.info("convolution direction: {}", direction)
 
         # The convolved image is the sharper one; the other is the fit target.
@@ -485,6 +513,31 @@ class Subtractor:
             fit["n_stamps_total"],
             fit["n_pixels"],
         )
+        lam_grid = np.asarray(fit["lambda_grid"])
+        if lam_grid.size > 1 and fit["lambda"] in (lam_grid[0], lam_grid[-1]):
+            edge = "lower" if fit["lambda"] == lam_grid[0] else "upper"
+            logger.warning(
+                "selected lambda={:.3g} ({}) sits at the {} edge of lambda_grid "
+                "[{:.3g}, {:.3g}] -- the search may be under-constrained; consider "
+                "widening lambda_grid to confirm this isn't clipping the true "
+                "optimum (under-smoothing at the lower edge, over-smoothing at "
+                "the upper edge).",
+                fit["lambda"],
+                selector,
+                edge,
+                lam_grid[0],
+                lam_grid[-1],
+            )
+        design_bytes = fit.get("cv_exact_design_bytes", 0)
+        if design_bytes > _CV_EXACT_DESIGN_WARN_BYTES:
+            logger.warning(
+                "exact (non-stamped) k-fold CV path used a {:.2f} GB whitened "
+                "design, rebuilt every IRLS pass -- the 16x knot-spacing gate to "
+                "the cheaper stamped path was not met (fine knots relative to "
+                "stamp_radius). Consider fewer/coarser knots, a larger "
+                "spatial_scale, or a smaller stamp_radius if this is slow.",
+                design_bytes / 1e9,
+            )
         if fit["reduced_chi2"] > 3.0:
             logger.warning(
                 "kernel fit reduced chi2={:.2f} >> 1: stellar residuals likely. "

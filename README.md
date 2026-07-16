@@ -114,12 +114,15 @@ Pages on push to `main`.
 
 ### Git hooks
 
-A pre-commit hook (`.githooks/pre-commit`) auto-runs `ruff check --fix`,
+A pre-commit config (`.pre-commit-config.yaml`) auto-runs `ruff check --fix`,
 `ruff format`, and `ty check --fix` on staged Python, and blocks the commit on
-any remaining lint/type errors. Enable it once per clone:
+any remaining lint/type errors. Install it once per clone with
+[`prek`](https://github.com/j178/prek) (a fast, drop-in-compatible
+reimplementation of the `pre-commit` framework — `pipx install prek` or see its
+README for other install methods; the standard `pre-commit` tool works too):
 
 ```sh
-git config core.hooksPath .githooks
+prek install
 ```
 
 ## Related work

@@ -69,7 +69,8 @@ delta::ImageF make_image(InArray<float> data,
 
 delta::DetectParams make_params(int stamp_radius, double threshold_sigma,
                                 int max_stamps, double saturation,
-                                int isolation_radius, int border) {
+                                int isolation_radius, int border,
+                                int fwhm_radius, int match_radius) {
   delta::DetectParams p;
   p.stamp_radius = stamp_radius;
   p.threshold_sigma = threshold_sigma;
@@ -77,6 +78,8 @@ delta::DetectParams make_params(int stamp_radius, double threshold_sigma,
   p.saturation = saturation;
   p.isolation_radius = isolation_radius;
   p.border = border;
+  p.fwhm_radius = fwhm_radius;
+  p.match_radius = match_radius;
   return p;
 }
 
@@ -243,11 +246,12 @@ nb::object estimate_background(InArray<float> data,
 nb::dict detect_stamps(InArray<float> data,
                        std::optional<InArray<std::uint8_t>> mask,
                        int stamp_radius, double threshold_sigma, int max_stamps,
-                       double saturation, int isolation_radius, int border) {
+                       double saturation, int isolation_radius, int border,
+                       int fwhm_radius, int match_radius) {
   const delta::ImageF img = make_image(data, mask);
-  const delta::DetectParams p = make_params(stamp_radius, threshold_sigma,
-                                            max_stamps, saturation,
-                                            isolation_radius, border);
+  const delta::DetectParams p =
+      make_params(stamp_radius, threshold_sigma, max_stamps, saturation,
+                 isolation_radius, border, fwhm_radius, match_radius);
   const std::vector<delta::Stamp> stamps = delta::detect_stamps(img, p);
   const std::size_t n = stamps.size();
 
@@ -283,12 +287,13 @@ nb::dict select_stamps(InArray<float> science, InArray<float> reference,
                        std::optional<InArray1D<std::int32_t>> catalog_x,
                        std::optional<InArray1D<std::int32_t>> catalog_y,
                        int stamp_radius, double threshold_sigma, int max_stamps,
-                       double saturation, int isolation_radius, int border) {
+                       double saturation, int isolation_radius, int border,
+                       int fwhm_radius, int match_radius) {
   const delta::ImageF sci = make_image(science, science_mask);
   const delta::ImageF ref = make_image(reference, reference_mask);
-  const delta::DetectParams p = make_params(stamp_radius, threshold_sigma,
-                                            max_stamps, saturation,
-                                            isolation_radius, border);
+  const delta::DetectParams p =
+      make_params(stamp_radius, threshold_sigma, max_stamps, saturation,
+                 isolation_radius, border, fwhm_radius, match_radius);
 
   delta::StampSelection sel;
   if (catalog_x && catalog_y) {
@@ -364,8 +369,11 @@ nb::dict build_catalog(InArray<float> score, InArray<float> difference,
   const delta::CatalogParams p = make_catalog_params(
       threshold_sigma, threshold_sigma_dipole, expected_fwhm,
       fwhm_tolerance_lo, fwhm_tolerance_hi, aperture_radius, exclude_bad_pixels);
-  const std::vector<delta::CatalogEntry> entries =
-      delta::build_catalog(score_img, diff_img, p, return_negative);
+  std::vector<delta::CatalogEntry> entries;
+  {
+    nb::gil_scoped_release release;
+    entries = delta::build_catalog(score_img, diff_img, p, return_negative);
+  }
 
   const std::size_t n = entries.size();
   std::vector<double> x, y, peak_snr, flux, expected_n_pix, fwhm_ratio;
@@ -553,7 +561,11 @@ nb::dict subtract(InArray<float> science, InArray<float> reference,
                                        resolve_radius(beta, n_max, radius));
 
   delta::timing::clear();
-  delta::ImageF diff = delta::subtract(sci, ref, spatial, theta, basis, saturation);
+  delta::ImageF diff;
+  {
+    nb::gil_scoped_release release;
+    diff = delta::subtract(sci, ref, spatial, theta, basis, saturation);
+  }
   const std::size_t h = diff.height();
   const std::size_t w = diff.width();
 
@@ -598,9 +610,12 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
                                  lambda_grid.data() + lambda_grid.size());
 
   delta::timing::clear();
-  const delta::KernelFit fit =
-      delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
-                        clip_sigma, clip_iterations, min_stamps, cv_folds);
+  delta::KernelFit fit;
+  {
+    nb::gil_scoped_release release;
+    fit = delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
+                            clip_sigma, clip_iterations, min_stamps, cv_folds);
+  }
 
   nb::dict out = gls_result_to_dict(fit.gls);
   out["timing"] = timing_dict();
@@ -611,6 +626,7 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
   out["n_stamps_total"] = fit.n_stamps_total;
   out["n_stamps_rejected"] = fit.n_stamps_rejected;
   out["reduced_chi2"] = fit.reduced_chi2;
+  out["cv_exact_design_bytes"] = fit.cv_exact_design_bytes;
   out["stamp_x"] = to_numpy<int>(std::vector<int>(fit.stamp_x),
                                  {fit.stamp_x.size()});
   out["stamp_y"] = to_numpy<int>(std::vector<int>(fit.stamp_y),
@@ -711,8 +727,12 @@ nb::dict decorrelate(InArray<float> difference, const Eigen::MatrixXd& knots,
   const delta::ThinPlateBasis spatial(knots);
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
-  delta::ImageF out = delta::decorrelate(diff, spatial, theta, basis, vs, vr,
-                                         block, kernel_cell_blocks);
+  delta::ImageF out;
+  {
+    nb::gil_scoped_release release;
+    out = delta::decorrelate(diff, spatial, theta, basis, vs, vr, block,
+                             kernel_cell_blocks);
+  }
   nb::dict result;
   result["difference"] = to_numpy<float>(std::move(out.pixels()), {h, w});
   result["variance"] = to_numpy<float>(std::move(out.variance()), {h, w});
@@ -823,7 +843,11 @@ nb::ndarray<nb::numpy, float> matched_filter(InArray<float> image,
   delta::ImageF var(w, h);
   std::copy(variance.data(), variance.data() + h * w, var.pixels().begin());
   const std::vector<float> p(psf.data(), psf.data() + psf.size());
-  delta::ImageF out = delta::matched_filter(img, p, ps, var);
+  delta::ImageF out;
+  {
+    nb::gil_scoped_release release;
+    out = delta::matched_filter(img, p, ps, var);
+  }
   return to_numpy<float>(std::move(out.pixels()), {h, w});
 }
 
@@ -860,14 +884,19 @@ NB_MODULE(_core, m) {
   m.def("detect_stamps", &detect_stamps, "data"_a, "mask"_a = nb::none(),
         "stamp_radius"_a = 15, "threshold_sigma"_a = 5.0, "max_stamps"_a = 200,
         "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
+        "fwhm_radius"_a = 0, "match_radius"_a = 2,
         "Detect bright, isolated, unsaturated point-source stamps.");
   m.def("select_stamps", &select_stamps, "science"_a, "reference"_a,
         "science_mask"_a = nb::none(), "reference_mask"_a = nb::none(),
         "catalog_x"_a = nb::none(), "catalog_y"_a = nb::none(),
         "stamp_radius"_a = 15, "threshold_sigma"_a = 5.0, "max_stamps"_a = 200,
         "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
+        "fwhm_radius"_a = 0, "match_radius"_a = 2,
         "Select matched stamps across both images and the convolution "
-        "direction.");
+        "direction. `match_radius` is the science/reference cross-match "
+        "pixel tolerance (default 2px) — widen it if inputs are astrometrically "
+        "misregistered by more than that, which otherwise fails with no "
+        "stamps selected.");
   m.def("build_catalog", &build_catalog, "score"_a, "difference"_a,
         "mask"_a = nb::none(), "threshold_sigma"_a = 5.0,
         "threshold_sigma_dipole"_a = 3.0, "expected_fwhm"_a = 3.5,

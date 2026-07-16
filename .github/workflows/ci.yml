@@ -22,6 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,11 +48,11 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python-version }}
 
       # Builds the C++ `_core` extension and installs dev deps.
       - name: Build + install
-        run: uv sync
+        run: uv sync -p ${{ matrix.python-version }}
 
       - name: Lint (ruff)
         run: uv run ruff check
@@ -62,6 +63,10 @@ jobs:
       - name: Type check (ty)
         run: uv run ty check
 
-      # Exclude the `slow` large-frame marker (see large-frame integration test).
+      # No test currently carries the `slow` marker (registered in
+      # pyproject.toml) — the large-frame integration test defaults to a
+      # 1536px frame (~20s) and runs here too; `-m "not slow"` is a no-op
+      # today, kept as the hook for a future test that dials `SIZE` up to
+      # the full SPEC §13.3 8192px frame.
       - name: Test (pytest)
         run: uv run pytest -m "not slow"

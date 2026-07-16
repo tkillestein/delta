@@ -366,7 +366,7 @@ def main():
             threshold_sigma=8.0,
             max_stamps=300,
             saturation=552.0,
-            lambda_grid=np.logspace(3, 12, 28),
+            lambda_grid=np.logspace(3, 12, 28, dtype=np.float64),
             decorrelate=False,
             score=False,
         ).subtract(

@@ -9,6 +9,7 @@ effective degrees of freedom.
 
 import delta
 import numpy as np
+import pytest
 
 
 def _build_design(knots, points, bn):
@@ -119,7 +120,7 @@ def test_gcv_search_returns_curve_minimum():
     x = _build_design(knots, points, bn)
     target = x @ rng.standard_normal(x.shape[1]) + 0.2 * rng.standard_normal(n)
 
-    grid = np.logspace(-8, 8, 25)
+    grid = np.logspace(-8, 8, 25, dtype=np.float64)
     res = delta.solve_gls_gcv(knots, points, target, np.ones(n), bn, grid)
 
     curve = res["gcv_curve"]
@@ -147,3 +148,37 @@ def test_gcv_fixed_lambda_matches_solve_gls():
     np.testing.assert_allclose(single["theta"], via_gcv["theta"], rtol=1e-9)
     np.testing.assert_allclose(single["gcv"], via_gcv["gcv"], rtol=1e-9)
     np.testing.assert_allclose(single["effective_dof"], via_gcv["effective_dof"], rtol=1e-9)
+
+
+def test_cv_group_size_mismatch_raises():
+    knots = delta.grid_knots(0.0, 0.0, 80.0, 80.0, 4, 4)
+    rng = np.random.default_rng(7)
+    n = 200
+    points = rng.uniform(0, 80, size=(n, 2))
+    bn = rng.standard_normal((n, 2))
+    x = _build_design(knots, points, bn)
+    target = x @ rng.standard_normal(x.shape[1])
+    weights = np.ones(n)
+    grid = np.logspace(-4, 4, 5, dtype=np.float64)
+
+    short_group = np.zeros(n - 1, dtype=np.int32)
+    with pytest.raises(RuntimeError, match="group.size"):
+        delta.solve_gls_cv(knots, points, target, weights, bn, grid, short_group, 5)
+
+
+def test_cv_selects_lambda_from_grid():
+    knots = delta.grid_knots(0.0, 0.0, 80.0, 80.0, 4, 4)
+    rng = np.random.default_rng(8)
+    n = 400
+    points = rng.uniform(0, 80, size=(n, 2))
+    bn = rng.standard_normal((n, 2))
+    x = _build_design(knots, points, bn)
+    target = x @ rng.standard_normal(x.shape[1]) + 0.2 * rng.standard_normal(n)
+    weights = np.ones(n)
+    grid = np.logspace(-4, 4, 9, dtype=np.float64)
+    n_groups = 5
+    group = (np.arange(n) % n_groups).astype(np.int32)
+
+    res = delta.solve_gls_cv(knots, points, target, weights, bn, grid, group, n_groups)
+    assert res["lambda"] in grid
+    assert res["gcv_curve"].shape == grid.shape

@@ -60,7 +60,7 @@ double conv_var_at(int x, int y, const std::vector<float>& k2, int ks, int r,
 
 }  // namespace
 
-KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
+KernelFit fit_kernel(const ImageViewF& science, const ImageViewF& reference,
                      const ThinPlateBasis& spatial,
                      const GaussHermiteBasis& basis,
                      const std::vector<int>& stamp_x,
@@ -99,8 +99,8 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
 
   const float ref_fill = reference_fill_value(reference);
   const bool ref_has_mask = reference.has_mask();
-  const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
-  const float* ref_var = have_cvar ? reference.variance().data() : nullptr;
+  const MaskType* ref_mask = ref_has_mask ? reference.mask() : nullptr;
+  const float* ref_var = have_cvar ? reference.variance() : nullptr;
 
   // Per-stamp scratch, filled in parallel below and merged serially afterwards
   // so the merged pixel order (and therefore stamp_idx / pix_stamp) exactly

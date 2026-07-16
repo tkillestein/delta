@@ -37,7 +37,8 @@ ImageF convolve_x(const ImageF& in, const std::vector<float>& k) {
     const std::size_t row = static_cast<std::size_t>(y) * width;
     float* drow = dst + row;
     const float* srow = src + row;
-    for (int x = 0; x < width; ++x) drow[x] = 0.0f;
+    // No per-row zero pass: the ImageF constructor value-initialises the whole
+    // buffer, so re-zeroing every row here was a duplicate sweep.
     for (int j = 0; j < ks; ++j) {
       const float kc = k[j];
       const int sh = h - j;  // src index = x + sh
@@ -67,7 +68,7 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
     if (static_cast<std::size_t>(height) * width >= kParallelMinWork)
   for (int y = 0; y < height; ++y) {
     float* drow = dst + static_cast<std::size_t>(y) * width;
-    for (int x = 0; x < width; ++x) drow[x] = 0.0f;
+    // No per-row zero pass (see convolve_x).
     const int jmin = std::max(0, y + h - height + 1);
     const int jmax = std::min(ks - 1, y + h);
     for (int j = jmin; j <= jmax; ++j) {

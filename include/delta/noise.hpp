@@ -61,10 +61,10 @@ ImageF decorrelation_kernel_image(const std::vector<float>& filter, int n);
 // σ_D² = v_S + v_R ΣK² per block, Hann-blended like the difference. Phi is
 // normalised so whitened pixels have this variance (not the pre-whitening
 // propagated Var(D) map); use it for pulls and the match-filtered score.
-ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
+ImageF decorrelate(const ImageViewF& difference, const ThinPlateBasis& spatial,
                    const Eigen::Ref<const Eigen::VectorXd>& theta,
-                   const GaussHermiteBasis& basis, const ImageF& var_science,
-                   const ImageF& var_reference, int block,
+                   const GaussHermiteBasis& basis, const ImageViewF& var_science,
+                   const ImageViewF& var_reference, int block,
                    int kernel_cell_blocks = 0);
 
 // Apply the ZOGY decorrelation filter Phi(k) to a centred PSF stamp so the
@@ -85,11 +85,11 @@ std::vector<float> whiten_psf(const std::vector<float>& psf, int psf_size,
 // normalised by sqrt(var(x,y) * sum(psf^2)), so source-free noise is a unit
 // Gaussian even under spatially-varying noise. Pixels with zero or negative
 // variance yield 0.
-ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
-                      int psf_size, const ImageF& variance);
+ImageF matched_filter(const ImageViewF& image, const std::vector<float>& psf,
+                      int psf_size, const ImageViewF& variance);
 
 // Convenience overload with a spatially-constant noise variance.
-ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
+ImageF matched_filter(const ImageViewF& image, const std::vector<float>& psf,
                       int psf_size, double noise_var);
 
 }  // namespace delta

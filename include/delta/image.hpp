@@ -78,4 +78,51 @@ private:
 using ImageF = Image<float>;
 using ImageD = Image<double>;
 
+// Non-owning, read-only view of an image with optional variance and mask
+// layers. The read-only entry points (subtract, fit_kernel, decorrelate,
+// matched_filter) take views so the Python boundary can pass NumPy buffers
+// through without the full-frame copy an owning Image would cost (~190 MB per
+// layer at survey-cadence sizes). Borrow contract: the caller guarantees the
+// buffers outlive the call -- at the bindings, nanobind holds the input
+// ndarrays alive for the call duration and the GIL-released region does not
+// outlive it. An owning Image converts implicitly, so internal callers that
+// hold an Image (or tests) are unaffected.
+template <typename T>
+class ImageView {
+public:
+  ImageView() = default;
+  ImageView(std::size_t width, std::size_t height, const T* data,
+            const T* variance = nullptr, const MaskType* mask = nullptr)
+      : width_(width),
+        height_(height),
+        data_(data),
+        variance_(variance),
+        mask_(mask) {}
+  ImageView(const Image<T>& img)  // NOLINT(google-explicit-constructor)
+      : width_(img.width()),
+        height_(img.height()),
+        data_(img.data()),
+        variance_(img.has_variance() ? img.variance().data() : nullptr),
+        mask_(img.has_mask() ? img.mask().data() : nullptr) {}
+
+  std::size_t width() const { return width_; }
+  std::size_t height() const { return height_; }
+  std::size_t size() const { return width_ * height_; }
+
+  const T* data() const { return data_; }
+  bool has_variance() const { return variance_ != nullptr; }
+  bool has_mask() const { return mask_ != nullptr; }
+  const T* variance() const { return variance_; }
+  const MaskType* mask() const { return mask_; }
+
+private:
+  std::size_t width_ = 0;
+  std::size_t height_ = 0;
+  const T* data_ = nullptr;
+  const T* variance_ = nullptr;
+  const MaskType* mask_ = nullptr;
+};
+
+using ImageViewF = ImageView<float>;
+
 }  // namespace delta

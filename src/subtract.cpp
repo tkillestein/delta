@@ -17,11 +17,11 @@ namespace delta {
 // consumer was the convolution. The strided sample (stride 7, as before) leaves
 // the fill value, and hence the whole result, bit-for-bit identical to the
 // previous full-frame sanitised copy.
-float reference_fill_value(const ImageF& reference) {
+float reference_fill_value(const ImageViewF& reference) {
   const std::size_t n = reference.size();
   const float* src = reference.data();
   const bool has_mask = reference.has_mask();
-  const MaskType* m = has_mask ? reference.mask().data() : nullptr;
+  const MaskType* m = has_mask ? reference.mask() : nullptr;
 
   // Chunked threaded gather; the order statistic depends only on the sample
   // multiset, so this stays value-identical to the serial stride-7 scan.
@@ -426,7 +426,7 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
   return out;
 }
 
-ImageF subtract(const ImageF& science, const ImageF& reference,
+ImageF subtract(const ImageViewF& science, const ImageViewF& reference,
                 const ThinPlateBasis& spatial,
                 const Eigen::Ref<const Eigen::VectorXd>& theta,
                 const GaussHermiteBasis& basis, double saturation) {
@@ -455,7 +455,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     return reference_fill_value(reference);
   }();
   const bool ref_has_mask = reference.has_mask();
-  const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
+  const MaskType* ref_mask = ref_has_mask ? reference.mask() : nullptr;
   const int hh = static_cast<int>(h);
   const int ww = static_cast<int>(w);
 
@@ -658,7 +658,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       // For a spatially constant field every tile yields the same K, so the result
       // is identical to the exact expansion; for a varying field it is a per-tile
       // piecewise-constant approximation of the (slowly varying) coefficient maps.
-      const std::vector<float>& vr = reference.variance();
+      const float* vr = reference.variance();
       const int ks = basis.ksize();
       const int rk = basis.radius();
       // A tile takes the flat-Var(R) shortcut when its window's relative spread is
@@ -757,7 +757,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
               wmax = std::max(wmax, 0.0f);
               continue;
             }
-            const float* vrow = vr.data() + static_cast<std::size_t>(gy) * w;
+            const float* vrow = vr + static_cast<std::size_t>(gy) * w;
             for (int ix = 0; ix < iww; ++ix) {
               const int gx = bx - rk + ix;
               const float v = (gx < 0 || gx >= ww) ? 0.0f : vrow[gx];
@@ -817,7 +817,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       }
     }
     if (science.has_variance()) {
-      const std::vector<float>& vs = science.variance();
+      const float* vs = science.variance();
 #pragma omp parallel for schedule(static)
       for (std::size_t i = 0; i < var.size(); ++i) var[i] += vs[i];
     }
@@ -834,8 +834,8 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     const bool has_sm = science.has_mask();
     const bool has_rm = reference.has_mask();
     const bool has_sat = saturation > 0.0;
-    const MaskType* sm = has_sm ? science.mask().data() : nullptr;
-    const MaskType* rm = has_rm ? reference.mask().data() : nullptr;
+    const MaskType* sm = has_sm ? science.mask() : nullptr;
+    const MaskType* rm = has_rm ? reference.mask() : nullptr;
     const float sat = static_cast<float>(saturation);
     const float* rd = reference.data();
     const float* sd = science.data();

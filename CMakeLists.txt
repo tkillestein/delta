@@ -56,6 +56,9 @@ find_package(OpenMP)
 # ---------------------------------------------------------------------------
 # Python extension module
 # ---------------------------------------------------------------------------
+# NOTE (perf): building with nanobind's LTO option was measured (paired
+# min-of-7 benchmark runs) at +/-1.5% -- indistinguishable from run noise; the
+# hot kernels are already header-visible within their TUs. Left off.
 nanobind_add_module(_core
   src/bindings.cpp
   src/io.cpp

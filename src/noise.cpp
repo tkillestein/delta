@@ -197,7 +197,7 @@ std::vector<float> local_kernel(const ThinPlateBasis& spatial,
 // regions and the frame edge. The median is immune to a minority of fill pixels
 // and is also a cleaner white-noise level estimate than the mean (which sources
 // and the sentinel both bias high).
-double block_variance(const ImageF& var, int bx, int by, int block, int w,
+double block_variance(const ImageViewF& var, int bx, int by, int block, int w,
                       int h) {
   // The block noise level is a single robust scalar over thousands of pixels;
   // a regular subsample of the block estimates the same median to far better
@@ -225,10 +225,10 @@ double block_variance(const ImageF& var, int bx, int by, int block, int w,
 
 }  // namespace
 
-ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
+ImageF decorrelate(const ImageViewF& difference, const ThinPlateBasis& spatial,
                    const Eigen::Ref<const Eigen::VectorXd>& theta,
-                   const GaussHermiteBasis& basis, const ImageF& var_science,
-                   const ImageF& var_reference, int block,
+                   const GaussHermiteBasis& basis, const ImageViewF& var_science,
+                   const ImageViewF& var_reference, int block,
                    int kernel_cell_blocks) {
   const int w = static_cast<int>(difference.width());
   const int h = static_cast<int>(difference.height());
@@ -530,8 +530,8 @@ std::vector<float> whiten_psf(const std::vector<float>& psf, int psf_size,
   return out;
 }
 
-ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
-                      int psf_size, const ImageF& variance) {
+ImageF matched_filter(const ImageViewF& image, const std::vector<float>& psf,
+                      int psf_size, const ImageViewF& variance) {
   if (static_cast<int>(psf.size()) != psf_size * psf_size)
     throw std::runtime_error("matched_filter: psf size mismatch");
   const int w = static_cast<int>(image.width());
@@ -629,7 +629,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
   return out;
 }
 
-ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
+ImageF matched_filter(const ImageViewF& image, const std::vector<float>& psf,
                       int psf_size, double noise_var) {
   const int w = static_cast<int>(image.width());
   const int h = static_cast<int>(image.height());

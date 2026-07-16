@@ -53,7 +53,7 @@ def test_fit_kernel_matches_python_assembly():
     sx, sy = np.meshgrid(np.arange(12, w - 12, 16), np.arange(12, h - 12, 16))
     sx = sx.ravel().astype(np.int32)
     sy = sy.ravel().astype(np.int32)
-    grid = np.logspace(-6, 4, 12)
+    grid = np.logspace(-6, 4, 12, dtype=np.float64)
 
     # clip_iterations=0 -> raw single solve under 1/(Var_s+Var_r) weights, which
     # is what the NumPy reference replicates (the default fit additionally does
@@ -330,7 +330,7 @@ def test_cv_exact_design_bytes(monkeypatch):
     sci, ref, svar, rvar, _ = _matched_pair(11, size=1024, n=120)
     sel = delta.select_stamps(sci, ref)
     knots = delta.grid_knots(0.0, 0.0, sci.shape[1] - 1.0, sci.shape[0] - 1.0, 3, 3)
-    grid = np.logspace(-6, 4, 8)
+    grid = np.logspace(-6, 4, 8, dtype=np.float64)
 
     monkeypatch.setenv("DELTA_STAMP_APPROX", "0")
     exact = delta.fit_kernel(

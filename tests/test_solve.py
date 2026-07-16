@@ -120,7 +120,7 @@ def test_gcv_search_returns_curve_minimum():
     x = _build_design(knots, points, bn)
     target = x @ rng.standard_normal(x.shape[1]) + 0.2 * rng.standard_normal(n)
 
-    grid = np.logspace(-8, 8, 25)
+    grid = np.logspace(-8, 8, 25, dtype=np.float64)
     res = delta.solve_gls_gcv(knots, points, target, np.ones(n), bn, grid)
 
     curve = res["gcv_curve"]
@@ -159,7 +159,7 @@ def test_cv_group_size_mismatch_raises():
     x = _build_design(knots, points, bn)
     target = x @ rng.standard_normal(x.shape[1])
     weights = np.ones(n)
-    grid = np.logspace(-4, 4, 5)
+    grid = np.logspace(-4, 4, 5, dtype=np.float64)
 
     short_group = np.zeros(n - 1, dtype=np.int32)
     with pytest.raises(RuntimeError, match="group.size"):
@@ -175,7 +175,7 @@ def test_cv_selects_lambda_from_grid():
     x = _build_design(knots, points, bn)
     target = x @ rng.standard_normal(x.shape[1]) + 0.2 * rng.standard_normal(n)
     weights = np.ones(n)
-    grid = np.logspace(-4, 4, 9)
+    grid = np.logspace(-4, 4, 9, dtype=np.float64)
     n_groups = 5
     group = (np.arange(n) % n_groups).astype(np.int32)
 

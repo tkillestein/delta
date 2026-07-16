@@ -106,7 +106,11 @@ def build_catalog(
     )
     raw_columns = cast("dict[str, NDArray]", dict(raw))
     n = raw_columns["x"].shape[0]
-    cat = np.empty(n, dtype=CATALOG_DTYPE)
+    # `np.empty(n, dtype=CATALOG_DTYPE)` isn't recognised as a structured
+    # (void-dtype) array by static type checkers since CATALOG_DTYPE is a
+    # runtime np.dtype value, not a literal -- cast explicitly so the by-name
+    # field assignment below type-checks.
+    cat = cast("NDArray[np.void]", np.empty(n, dtype=CATALOG_DTYPE))
     for name in CATALOG_DTYPE.names or ():
         cat[name] = raw_columns[name]
 

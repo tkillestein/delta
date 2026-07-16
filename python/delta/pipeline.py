@@ -324,7 +324,9 @@ class Subtractor:
         self.saturation = saturation
         self.bright_mask = bright_mask
         self.lambda_grid = (
-            np.logspace(-6.0, 6.0, 25) if lambda_grid is None else np.asarray(lambda_grid)
+            np.logspace(-6.0, 6.0, 25, dtype=np.float64)
+            if lambda_grid is None
+            else np.asarray(lambda_grid, dtype=np.float64)
         )
         self.clip_sigma = clip_sigma
         self.clip_iterations = clip_iterations

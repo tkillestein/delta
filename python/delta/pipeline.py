@@ -412,6 +412,10 @@ class Subtractor:
             raise ValueError("no stamps selected; lower --threshold-sigma or supply a --catalog")
         if direction is None:
             direction = sel["direction"]
+        elif direction not in ("science", "reference"):
+            raise ValueError(
+                f"direction must be 'science', 'reference', or None, got {direction!r}"
+            )
         logger.info("convolution direction: {}", direction)
 
         # The convolved image is the sharper one; the other is the fit target.

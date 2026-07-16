@@ -68,6 +68,12 @@ def test_direction_flips_when_science_sharper(preview):
     assert np.abs(_window_max(res.difference, (80, 80))) < 0.25 * amp_t
 
 
+def test_invalid_direction_raises():
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    with pytest.raises(ValueError, match="direction"):
+        delta.subtract(sci, ref, gain=1.5, n_knots=4, stamp_radius=12, direction="Science")
+
+
 def test_variance_and_mask_propagate():
     ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.2)
     sci_mask = np.zeros(sci.shape, np.uint8)

@@ -102,16 +102,28 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
   const float* ref_var = have_cvar ? reference.variance().data() : nullptr;
 
+  // Per-stamp scratch, filled in parallel below and merged serially afterwards
+  // so the merged pixel order (and therefore stamp_idx / pix_stamp) exactly
+  // matches the original serial loop -- deterministic regardless of thread
+  // scheduling. Each stamp's own work (patch gather + basis convolve + pixel
+  // selection) is independent of every other stamp.
+  struct StampGather {
+    bool used = false;
+    int cx = 0, cy = 0;
+    std::vector<double> px, py, target, var_t, var_c, bn_flat;
+  };
+  std::vector<StampGather> gathered(stamp_x.size());
+
   {
    DELTA_TIME("fit: stamp B_n convolve");
+#pragma omp parallel for schedule(dynamic)
    for (std::size_t s = 0; s < stamp_x.size(); ++s) {
+    StampGather& out = gathered[s];
     const int cx = stamp_x[s], cy = stamp_y[s];
     const int x0 = std::max(0, cx - stamp_radius);
     const int x1 = std::min(iw - 1, cx + stamp_radius);
     const int y0 = std::max(0, cy - stamp_radius);
     const int y1 = std::min(ih - 1, cy + stamp_radius);
-    const int stamp_idx = static_cast<int>(stamp_cx.size());
-    bool used = false;
 
     // Reference patch covering the stamp plus a kernel-radius halo, sanitised
     // like full-frame subtract: masked / non-finite pixels take the median fill
@@ -164,22 +176,37 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           }
         if (!finite_bn) continue;
 
-        px.push_back(static_cast<double>(x));
-        py.push_back(static_cast<double>(y));
-        target.push_back(static_cast<double>(sv));
-        var_t.push_back(vt);
-        var_c.push_back(vc);
-        pix_stamp.push_back(stamp_idx);
+        out.px.push_back(static_cast<double>(x));
+        out.py.push_back(static_cast<double>(y));
+        out.target.push_back(static_cast<double>(sv));
+        out.var_t.push_back(vt);
+        out.var_c.push_back(vc);
         for (int n = 0; n < nc; ++n)
-          bn_flat.push_back(static_cast<double>(bn[n].data()[li]));
-        used = true;
+          out.bn_flat.push_back(static_cast<double>(bn[n].data()[li]));
+        out.used = true;
       }
     }
-    if (used) {
-      stamp_cx.push_back(cx);
-      stamp_cy.push_back(cy);
+    if (out.used) {
+      out.cx = cx;
+      out.cy = cy;
     }
    }
+  }
+
+  // Serial merge, in original stamp order, so stamp_idx / pix_stamp exactly
+  // match what the old single-threaded loop produced.
+  for (const StampGather& g : gathered) {
+    if (!g.used) continue;
+    const int stamp_idx = static_cast<int>(stamp_cx.size());
+    stamp_cx.push_back(g.cx);
+    stamp_cy.push_back(g.cy);
+    px.insert(px.end(), g.px.begin(), g.px.end());
+    py.insert(py.end(), g.py.begin(), g.py.end());
+    target.insert(target.end(), g.target.begin(), g.target.end());
+    var_t.insert(var_t.end(), g.var_t.begin(), g.var_t.end());
+    var_c.insert(var_c.end(), g.var_c.begin(), g.var_c.end());
+    bn_flat.insert(bn_flat.end(), g.bn_flat.begin(), g.bn_flat.end());
+    pix_stamp.insert(pix_stamp.end(), g.px.size(), stamp_idx);
   }
 
   const int npix_all = static_cast<int>(target.size());

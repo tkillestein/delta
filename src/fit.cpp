@@ -336,8 +336,10 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
         gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
                            cv_folds, warm_start);
-        // The exact path (see solve_gls_cv) materialises an N x P whitened
-        // design every IRLS pass; record its size so the caller can warn.
+        // The exact path (see solve_gls_cv) rebuilds and reduces an N x P whitened
+        // design every IRLS pass (chunked, not materialised in full -- issue #49);
+        // record the equivalent size as a proxy for that rebuild's O(N P^2) cost so
+        // the caller can warn when the exact path is likely to be slow.
         const std::size_t p = static_cast<std::size_t>(nc + 1) * k;
         cv_exact_design_bytes = static_cast<std::size_t>(npix) * p * sizeof(double);
       }

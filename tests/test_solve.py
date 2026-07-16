@@ -182,3 +182,55 @@ def test_cv_selects_lambda_from_grid():
     res = delta.solve_gls_cv(knots, points, target, weights, bn, grid, group, n_groups)
     assert res["lambda"] in grid
     assert res["gcv_curve"].shape == grid.shape
+
+
+def test_cv_matches_numpy_leave_group_out():
+    # N large enough to span several of solve_gls_cv's internal row chunks per fold
+    # (kMaxFoldChunk=2048), so this exercises the chunked whitened-design build
+    # (issue #49) across chunk boundaries, not just a single-chunk fold.
+    knots = delta.grid_knots(0.0, 0.0, 100.0, 100.0, 5, 5)
+    rng = np.random.default_rng(11)
+    n = 6000
+    points = rng.uniform(0, 100, size=(n, 2))
+    bn = rng.standard_normal((n, 3))
+    x = _build_design(knots, points, bn)
+    theta_true = rng.standard_normal(x.shape[1])
+    target = x @ theta_true + 0.2 * rng.standard_normal(n)
+    weights = rng.uniform(0.5, 2.0, n)
+    grid = np.logspace(-4, 4, 9, dtype=np.float64)
+    n_groups = 5
+    group = (np.arange(n) % n_groups).astype(np.int32)
+
+    res = delta.solve_gls_cv(knots, points, target, weights, bn, grid, group, n_groups)
+
+    # Independent NumPy leave-one-group-out CV over the same block design as
+    # _build_design, penalised normal equations matching solve_at()'s A = M + lam*P0.
+    pen = delta.tps_penalty(knots)
+    k = pen.shape[0]
+    p = x.shape[1]
+    nc = bn.shape[1]
+    pmat = np.zeros((p, p))
+    for b in range(nc + 1):
+        pmat[b * k : (b + 1) * k, b * k : (b + 1) * k] = pen
+
+    def cv_error(lam):
+        total = 0.0
+        for g in range(n_groups):
+            train, hold = group != g, group == g
+            xg, wg, tg = x[train], weights[train], target[train]
+            a = xg.T @ (wg[:, None] * xg) + lam * pmat
+            th = np.linalg.solve(a, xg.T @ (wg * tg))
+            xh, wh, th_t = x[hold], weights[hold], target[hold]
+            total += np.sum(wh * (th_t - xh @ th) ** 2)
+        return total
+
+    # solve_gls_cv's coarse-to-fine lambda search doesn't evaluate every grid
+    # point (see cv_finish); only compare the curve where it did.
+    evaluated = np.isfinite(res["gcv_curve"])
+    ref_curve = np.array([cv_error(lam) for lam in grid[evaluated]])
+    np.testing.assert_allclose(res["gcv_curve"][evaluated], ref_curve, rtol=1e-6)
+    assert res["lambda"] == grid[np.argmin(res["gcv_curve"])]
+
+    a_full = x.T @ (weights[:, None] * x) + res["lambda"] * pmat
+    theta_ref = np.linalg.solve(a_full, x.T @ (weights * target))
+    np.testing.assert_allclose(res["theta"], theta_ref, rtol=1e-6, atol=1e-6)

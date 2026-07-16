@@ -274,6 +274,18 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   // search warm-starts at it (the clip barely moves the curve). -1 = cold start.
   int warm_start = -1;
   delta::timing::ScopedTimer solve_timer("fit: GLS solve");
+
+  // Pixel coordinates never change across IRLS passes (clipping only selects a
+  // row subset), so the O(N k^2) thin-plate design over all stamp pixels is
+  // evaluated once here and row-gathered per pass -- it was previously rebuilt
+  // inside the solver every pass and a second time for the residual step.
+  Eigen::MatrixXd pts_all(npix_all, 2);
+  for (int i = 0; i < npix_all; ++i) {
+    pts_all(i, 0) = px[i];
+    pts_all(i, 1) = py[i];
+  }
+  const Eigen::MatrixXd design_all = spatial.design(pts_all);  // N_all x k
+
   for (int iter = 0;; ++iter) {
     // Active pixel rows = pixels whose stamp is still accepted.
     std::vector<int> rows;
@@ -286,6 +298,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     Eigen::MatrixXd points(npix, 2);
     Eigen::VectorXd tgt(npix), wts(npix);
     Eigen::MatrixXd bn_mat(npix, nc);
+    Eigen::MatrixXd design_act(npix, k);
     for (int j = 0; j < npix; ++j) {
       const int i = rows[j];
       points(j, 0) = px[i];
@@ -294,6 +307,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
       wts(j) = weights[i];
       for (int n = 0; n < nc; ++n)
         bn_mat(j, n) = bn_flat[static_cast<std::size_t>(i) * nc + n];
+      design_act.row(j) = design_all.row(i);
     }
 
     if (cv_folds > 1) {
@@ -353,8 +367,8 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         // held out (leave-stamp-out CV).
         std::vector<int> grp(npix);
         for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
-        gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
-                           cv_folds, warm_start);
+        gls = solve_gls_cv_design(design_act, tgt, wts, bn_mat, spatial,
+                                  lambda_grid, grp, cv_folds, warm_start);
         // The exact path (see solve_gls_cv) materialises an N x P whitened
         // design every IRLS pass; record its size so the caller can warn.
         const std::size_t p = static_cast<std::size_t>(nc + 1) * k;
@@ -366,13 +380,13 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           std::min_element(gls.gcv_curve.begin(), gls.gcv_curve.end()) -
           gls.gcv_curve.begin());
     } else {
-      gls = solve_gls_gcv(points, tgt, wts, bn_mat, spatial, lambda_grid);
+      gls = solve_gls_gcv_design(design_act, tgt, wts, bn_mat, spatial,
+                                 lambda_grid);
     }
 
     // Model and per-pixel residual under this solution; fields = design * C.
-    const Eigen::MatrixXd design = spatial.design(points);
     const Eigen::MatrixXd c = coeff_matrix(gls.theta, k, nc + 1);
-    const Eigen::MatrixXd fields = design * c;  // npix x (nc+1)
+    const Eigen::MatrixXd fields = design_act * c;  // npix x (nc+1)
 
     std::vector<double> sum_chi(n_stamps, 0.0);
     std::vector<int> cnt(n_stamps, 0);

@@ -36,17 +36,19 @@ struct System {
   int p = 0;           // total unknowns = (nc + 1) * k
 };
 
-System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
+// `d` is the precomputed N x k spatial design basis.design(points) -- passed
+// in (not rebuilt here) so IRLS callers with fixed pixel coordinates can
+// amortise its O(N k^2) construction across passes.
+System assemble(const Eigen::Ref<const Eigen::MatrixXd>& d,
                 const Eigen::Ref<const Eigen::VectorXd>& target,
                 const Eigen::Ref<const Eigen::VectorXd>& weights,
                 const Eigen::Ref<const Eigen::MatrixXd>& bn,
                 const ThinPlateBasis& basis) {
-  const int n = static_cast<int>(points.rows());
+  const int n = static_cast<int>(d.rows());
   const int nc = static_cast<int>(bn.cols());
   if (target.size() != n || weights.size() != n || bn.rows() != n)
-    throw std::runtime_error("solve_gls: row counts of points/target/weights/bn disagree");
+    throw std::runtime_error("solve_gls: row counts of design/target/weights/bn disagree");
 
-  const Eigen::MatrixXd d = basis.design(points);  // N x k
   const int k = static_cast<int>(d.cols());
   const int p = (nc + 1) * k;
 
@@ -157,7 +159,8 @@ GlsResult solve_gls(const Eigen::Ref<const Eigen::MatrixXd>& points,
                     const Eigen::Ref<const Eigen::VectorXd>& weights,
                     const Eigen::Ref<const Eigen::MatrixXd>& bn,
                     const ThinPlateBasis& basis, double lambda) {
-  return solve_at(assemble(points, target, weights, bn, basis), lambda);
+  return solve_at(assemble(basis.design(points), target, weights, bn, basis),
+                  lambda);
 }
 
 GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
@@ -166,10 +169,20 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                         const Eigen::Ref<const Eigen::MatrixXd>& bn,
                         const ThinPlateBasis& basis,
                         const std::vector<double>& lambda_grid) {
+  return solve_gls_gcv_design(basis.design(points), target, weights, bn, basis,
+                              lambda_grid);
+}
+
+GlsResult solve_gls_gcv_design(const Eigen::Ref<const Eigen::MatrixXd>& design,
+                               const Eigen::Ref<const Eigen::VectorXd>& target,
+                               const Eigen::Ref<const Eigen::VectorXd>& weights,
+                               const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                               const ThinPlateBasis& basis,
+                               const std::vector<double>& lambda_grid) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_gcv: lambda_grid is empty");
 
-  const System s = assemble(points, target, weights, bn, basis);
+  const System s = assemble(design, target, weights, bn, basis);
 
   // Each lambda is an independent LDLT solve + trace on the shared (read-only)
   // system; evaluate the grid in parallel, then reduce to the GCV-minimising fit.
@@ -350,9 +363,21 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const std::vector<double>& lambda_grid,
                        const std::vector<int>& group, int n_groups,
                        int warm_start) {
+  return solve_gls_cv_design(basis.design(points), target, weights, bn, basis,
+                             lambda_grid, group, n_groups, warm_start);
+}
+
+GlsResult solve_gls_cv_design(const Eigen::Ref<const Eigen::MatrixXd>& d,
+                              const Eigen::Ref<const Eigen::VectorXd>& target,
+                              const Eigen::Ref<const Eigen::VectorXd>& weights,
+                              const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                              const ThinPlateBasis& basis,
+                              const std::vector<double>& lambda_grid,
+                              const std::vector<int>& group, int n_groups,
+                              int warm_start) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
-  const int n = static_cast<int>(points.rows());
+  const int n = static_cast<int>(d.rows());
   // `group.size() != n` is a caller bug (mismatched inputs), not a valid way to
   // opt out of CV -- unlike n_groups < 2, which is the documented opt-out and
   // degrades to GCV. Erroring here matters most for the public `_core.solve_gls_cv`
@@ -361,10 +386,10 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   // to match `points` so this never fires on that path.
   if (static_cast<int>(group.size()) != n)
     throw std::runtime_error("solve_gls_cv: group.size() must match points.rows()");
-  if (n_groups < 2) return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+  if (n_groups < 2)
+    return solve_gls_gcv_design(d, target, weights, bn, basis, lambda_grid);
 
   const int nc = static_cast<int>(bn.cols());
-  const Eigen::MatrixXd d = basis.design(points);  // N x k
   const int k = static_cast<int>(d.cols());
   const int p = (nc + 1) * k;
 

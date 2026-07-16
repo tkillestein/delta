@@ -234,12 +234,17 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
     throw std::runtime_error("decorrelate: block must be a power of two >= 8");
   const int ks = basis.ksize();
 
-  std::vector<double> acc(static_cast<std::size_t>(w) * h, 0.0);
+  // float32 accumulators: at 50%-overlap stride at most 4 blocks contribute to
+  // any pixel, so the extra rounding from accumulating in float rather than
+  // double is negligible next to the block-effective approximations already in
+  // this pass -- and it halves the ~770MB (8000x6000 double x2) these full-frame
+  // buffers would otherwise cost.
+  std::vector<float> acc(static_cast<std::size_t>(w) * h, 0.0f);
   // Post-whitening variance accumulator: each block contributes its white-noise
   // level num = vs + vr*ΣK² with the same Hann weights as the difference. Phi is
   // normalised so whitened pixels have variance num (SPEC §3.4 / ZOGY), not the
   // pre-whitening propagated Var(D) map.
-  std::vector<double> var_acc(static_cast<std::size_t>(w) * h, 0.0);
+  std::vector<float> var_acc(static_cast<std::size_t>(w) * h, 0.0f);
 
   const int stride = block / 2;
   // Block origins covering the frame, last block flush with the far edge.
@@ -428,14 +433,14 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
           const double wy_sig = hwin[iy] * inv_n2;
           const double wy_var = hwin[iy];
           const float* frow = fft.real.data() + static_cast<std::size_t>(iy) * block;
-          double* arow = acc.data() + static_cast<std::size_t>(y) * w;
-          double* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
+          float* arow = acc.data() + static_cast<std::size_t>(y) * w;
+          float* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
           for (int ix = 0; ix < block; ++ix) {
             const int x = bx + ix;
             if (x < 0 || x >= w) continue;
             const double wx = hwin[ix];
-            arow[x] += wy_sig * wx * frow[ix];
-            vrow[x] += wy_var * wx * num;
+            arow[x] = static_cast<float>(arow[x] + wy_sig * wx * frow[ix]);
+            vrow[x] = static_cast<float>(vrow[x] + wy_var * wx * num);
           }
         }
       }
@@ -448,8 +453,8 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
 #pragma omp parallel for schedule(static)
   for (int y = 0; y < h; ++y) {
     const double wy = wy_total[y];
-    const double* arow = acc.data() + static_cast<std::size_t>(y) * w;
-    const double* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
+    const float* arow = acc.data() + static_cast<std::size_t>(y) * w;
+    const float* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
     float* orow = out.data() + static_cast<std::size_t>(y) * w;
     float* ovrow = out_var.data() + static_cast<std::size_t>(y) * w;
     for (int x = 0; x < w; ++x) {

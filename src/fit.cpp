@@ -382,7 +382,10 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
 
     // Robust per-stamp clip: drop accepted stamps with chi^2 above
     // median + clip_sigma * 1.4826 * MAD (worst-first, never below the floor).
-    int rejected_now = 0;
+    // Rejections are only *applied* below if another pass will actually refit
+    // on them — otherwise `accepted`/`stamp_accepted` would describe a stamp
+    // set the returned `theta` was never fitted on.
+    std::vector<int> to_reject;
     if (clip_passes > 0 && iter < clip_passes) {
       std::vector<double> active_chi2;
       active_chi2.reserve(n_stamps);
@@ -401,15 +404,17 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         std::sort(cand.begin(), cand.end(),
                   [&](int aa, int bb) { return stamp_chi2[aa] > stamp_chi2[bb]; });
         for (int s : cand) {
-          if (n_active - rejected_now <= floor_stamps) break;
-          accepted[s] = 0;
-          ++rejected_now;
+          if (n_active - static_cast<int>(to_reject.size()) <= floor_stamps) break;
+          to_reject.push_back(s);
         }
       }
     }
 
+    const int rejected_now = static_cast<int>(to_reject.size());
     if (rejected_now == 0 && iter >= min_pass) break;
-    if (iter >= hard_max) break;
+    if (iter >= hard_max) break;  // no further pass; leave `accepted` untouched.
+
+    for (int s : to_reject) accepted[s] = 0;
   }
 
   int n_used = 0;

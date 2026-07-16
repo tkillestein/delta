@@ -90,17 +90,23 @@ std::vector<ImageF> basis_convolve(const ImageF& image,
                                    const GaussHermiteBasis& basis) {
   const int n_max = basis.n_max();
 
+  // kernel1d returns a fresh vector per call; sample each order once up front
+  // (this runs per stamp in the fit, so the per-component allocations add up).
+  std::vector<std::vector<float>> k1;
+  k1.reserve(n_max + 1);
+  for (int n = 0; n <= n_max; ++n) k1.push_back(basis.kernel1d(n));
+
   // Share the x-pass across all components with the same nx.
   std::vector<ImageF> tx;
   tx.reserve(n_max + 1);
   for (int nx = 0; nx <= n_max; ++nx) {
-    tx.push_back(convolve_x(image, basis.kernel1d(nx)));
+    tx.push_back(convolve_x(image, k1[nx]));
   }
 
   std::vector<ImageF> out;
   out.reserve(basis.component_count());
   for (const auto& [nx, ny] : basis.orders()) {
-    out.push_back(convolve_y(tx[nx], basis.kernel1d(ny)));
+    out.push_back(convolve_y(tx[nx], k1[ny]));
   }
   return out;
 }

@@ -194,7 +194,26 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   }
 
   // Serial merge, in original stamp order, so stamp_idx / pix_stamp exactly
-  // match what the old single-threaded loop produced.
+  // match what the old single-threaded loop produced. Reserve the final sizes
+  // up front: the appends below total ~npix_all*(5+nc) doubles, and letting
+  // the vectors grow geometrically re-copies that payload several times over.
+  {
+    std::size_t total_pix = 0, total_stamps = 0;
+    for (const StampGather& g : gathered) {
+      if (!g.used) continue;
+      ++total_stamps;
+      total_pix += g.px.size();
+    }
+    stamp_cx.reserve(total_stamps);
+    stamp_cy.reserve(total_stamps);
+    px.reserve(total_pix);
+    py.reserve(total_pix);
+    target.reserve(total_pix);
+    var_t.reserve(total_pix);
+    var_c.reserve(total_pix);
+    bn_flat.reserve(total_pix * static_cast<std::size_t>(nc));
+    pix_stamp.reserve(total_pix);
+  }
   for (const StampGather& g : gathered) {
     if (!g.used) continue;
     const int stamp_idx = static_cast<int>(stamp_cx.size());
@@ -396,6 +415,10 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           for (float& v : k2) v *= v;  // elementwise K²
           stamp_k2[s] = k2;
         }
+        // Each iteration writes a distinct weights[rows[j]] and conv_var_at is
+        // read-only, so the O(npix * ks^2) reweight threads cleanly (it was a
+        // measurable serial chunk of every IRLS pass).
+#pragma omp parallel for schedule(dynamic, 256)
         for (int j = 0; j < npix; ++j) {
           const int i = rows[j];
           const int s = pix_stamp[i];

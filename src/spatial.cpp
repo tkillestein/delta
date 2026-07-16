@@ -89,7 +89,7 @@ Eigen::MatrixXd ThinPlateBasis::design(
   }
 
   Eigen::MatrixXd d(m, k);
-  if (nr > 0) d.leftCols(nr) = sigma * nullspace_;
+  if (nr > 0) d.leftCols(nr).noalias() = sigma * nullspace_;
   d.col(nr).setOnes();
   d.col(nr + 1) = ux.matrix();
   d.col(nr + 2) = uy.matrix();

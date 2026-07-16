@@ -903,6 +903,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     // preserved so PSF wings and transients close to bright stars / mask edges
     // stay assessable. (Setting the whole grown footprint to a constant boxed out
     // exactly those wings.) Filled pixels remain masked -- the value is cosmetic.
+#pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < out.size(); ++i) {
       if (out[i] == kMaskGood) continue;
       if (exact_bad[i]) {

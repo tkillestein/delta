@@ -208,6 +208,15 @@ def subtract(
     saturation: Annotated[
         float, typer.Option("--saturation", help="Saturation level; reject stamps above (0=off).")
     ] = 0.0,
+    match_radius: Annotated[
+        int,
+        typer.Option(
+            "--match-radius",
+            min=1,
+            help="Science/reference stamp cross-match tolerance (px). Widen if the "
+            "inputs are astrometrically misregistered.",
+        ),
+    ] = 2,
     catalog: Annotated[
         Path | None,
         typer.Option("--catalog", help="Text file of 'x y' stamp centres (overrides detection)."),
@@ -278,6 +287,7 @@ def subtract(
         threshold_sigma=threshold_sigma,
         max_stamps=max_stamps,
         saturation=saturation,
+        match_radius=match_radius,
         decorrelate=decorrelate,
         score=score,
         block=block,

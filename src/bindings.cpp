@@ -69,7 +69,8 @@ delta::ImageF make_image(InArray<float> data,
 
 delta::DetectParams make_params(int stamp_radius, double threshold_sigma,
                                 int max_stamps, double saturation,
-                                int isolation_radius, int border) {
+                                int isolation_radius, int border,
+                                int fwhm_radius, int match_radius) {
   delta::DetectParams p;
   p.stamp_radius = stamp_radius;
   p.threshold_sigma = threshold_sigma;
@@ -77,6 +78,8 @@ delta::DetectParams make_params(int stamp_radius, double threshold_sigma,
   p.saturation = saturation;
   p.isolation_radius = isolation_radius;
   p.border = border;
+  p.fwhm_radius = fwhm_radius;
+  p.match_radius = match_radius;
   return p;
 }
 
@@ -243,11 +246,12 @@ nb::object estimate_background(InArray<float> data,
 nb::dict detect_stamps(InArray<float> data,
                        std::optional<InArray<std::uint8_t>> mask,
                        int stamp_radius, double threshold_sigma, int max_stamps,
-                       double saturation, int isolation_radius, int border) {
+                       double saturation, int isolation_radius, int border,
+                       int fwhm_radius, int match_radius) {
   const delta::ImageF img = make_image(data, mask);
-  const delta::DetectParams p = make_params(stamp_radius, threshold_sigma,
-                                            max_stamps, saturation,
-                                            isolation_radius, border);
+  const delta::DetectParams p =
+      make_params(stamp_radius, threshold_sigma, max_stamps, saturation,
+                 isolation_radius, border, fwhm_radius, match_radius);
   const std::vector<delta::Stamp> stamps = delta::detect_stamps(img, p);
   const std::size_t n = stamps.size();
 
@@ -283,12 +287,13 @@ nb::dict select_stamps(InArray<float> science, InArray<float> reference,
                        std::optional<InArray1D<std::int32_t>> catalog_x,
                        std::optional<InArray1D<std::int32_t>> catalog_y,
                        int stamp_radius, double threshold_sigma, int max_stamps,
-                       double saturation, int isolation_radius, int border) {
+                       double saturation, int isolation_radius, int border,
+                       int fwhm_radius, int match_radius) {
   const delta::ImageF sci = make_image(science, science_mask);
   const delta::ImageF ref = make_image(reference, reference_mask);
-  const delta::DetectParams p = make_params(stamp_radius, threshold_sigma,
-                                            max_stamps, saturation,
-                                            isolation_radius, border);
+  const delta::DetectParams p =
+      make_params(stamp_radius, threshold_sigma, max_stamps, saturation,
+                 isolation_radius, border, fwhm_radius, match_radius);
 
   delta::StampSelection sel;
   if (catalog_x && catalog_y) {
@@ -878,14 +883,19 @@ NB_MODULE(_core, m) {
   m.def("detect_stamps", &detect_stamps, "data"_a, "mask"_a = nb::none(),
         "stamp_radius"_a = 15, "threshold_sigma"_a = 5.0, "max_stamps"_a = 200,
         "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
+        "fwhm_radius"_a = 0, "match_radius"_a = 2,
         "Detect bright, isolated, unsaturated point-source stamps.");
   m.def("select_stamps", &select_stamps, "science"_a, "reference"_a,
         "science_mask"_a = nb::none(), "reference_mask"_a = nb::none(),
         "catalog_x"_a = nb::none(), "catalog_y"_a = nb::none(),
         "stamp_radius"_a = 15, "threshold_sigma"_a = 5.0, "max_stamps"_a = 200,
         "saturation"_a = 0.0, "isolation_radius"_a = 0, "border"_a = 0,
+        "fwhm_radius"_a = 0, "match_radius"_a = 2,
         "Select matched stamps across both images and the convolution "
-        "direction.");
+        "direction. `match_radius` is the science/reference cross-match "
+        "pixel tolerance (default 2px) — widen it if inputs are astrometrically "
+        "misregistered by more than that, which otherwise fails with no "
+        "stamps selected.");
   m.def("build_catalog", &build_catalog, "score"_a, "difference"_a,
         "mask"_a = nb::none(), "threshold_sigma"_a = 5.0,
         "threshold_sigma_dipole"_a = 3.0, "expected_fwhm"_a = 3.5,

@@ -145,6 +145,8 @@ def detect_stamps(
     saturation: float = ...,
     isolation_radius: int = ...,
     border: int = ...,
+    fwhm_radius: int = ...,
+    match_radius: int = ...,
 ) -> DetectedStamps:
     """Detect bright, isolated, unsaturated point-source stamps."""
 
@@ -161,6 +163,8 @@ def select_stamps(
     saturation: float = ...,
     isolation_radius: int = ...,
     border: int = ...,
+    fwhm_radius: int = ...,
+    match_radius: int = ...,
 ) -> StampSelection:
     """Select matched stamps across both images and the convolution direction."""
 

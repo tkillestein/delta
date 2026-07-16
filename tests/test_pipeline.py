@@ -68,6 +68,12 @@ def test_direction_flips_when_science_sharper(preview):
     assert np.abs(_window_max(res.difference, (80, 80))) < 0.25 * amp_t
 
 
+def test_match_radius_config_card():
+    ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
+    res = delta.subtract(sci, ref, gain=1.5, n_knots=4, stamp_radius=12, match_radius=5)
+    assert res.config["DLTMRAD"] == 5
+
+
 def test_invalid_direction_raises():
     ref, sci, _ = _pair(sig_ref=1.6, sig_sci=2.4)
     with pytest.raises(ValueError, match="direction"):

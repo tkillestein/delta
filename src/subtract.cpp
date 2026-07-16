@@ -721,6 +721,10 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
           // Gather the (bh+2rk) x (bw+2rk) input window, zero-padded at the frame
           // edge, into a contiguous buffer of row stride ibw. Track the min/max of
           // the gathered Var(R) to decide whether it is flat over the footprint.
+          // Unlike fit.cpp's conv_var_at (the stamp-local equivalent used during
+          // the kernel solve), masked reference pixels are not excluded here --
+          // harmless, since the corresponding output pixels are mask-grown by the
+          // kernel radius regardless (see mask growth above).
           const int iwh = bh + 2 * rk;
           const int iww = bw + 2 * rk;
           float wmin = std::numeric_limits<float>::infinity();

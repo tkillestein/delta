@@ -32,7 +32,9 @@ double median_copy(std::vector<double> v) {
 // (K² ⊗ Var)(x,y) with K frozen and zero-pad at the frame edge. Matches the
 // exact independent-pixel convolution variance when a is constant over the
 // kernel footprint (SPEC §3.6). Masked reference pixels contribute 0 (they are
-// median-filled in the model, so they carry no Poisson noise into B_n).
+// median-filled in the model, so they carry no Poisson noise into B_n) -- unlike
+// subtract.cpp's full-frame variance pass, which doesn't exclude them (harmless
+// there since those output pixels are mask-grown anyway).
 double conv_var_at(int x, int y, const std::vector<float>& k2, int ks, int r,
                    const float* var, int iw, int ih, std::size_t w,
                    const MaskType* mask) {

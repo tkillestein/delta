@@ -364,8 +364,11 @@ nb::dict build_catalog(InArray<float> score, InArray<float> difference,
   const delta::CatalogParams p = make_catalog_params(
       threshold_sigma, threshold_sigma_dipole, expected_fwhm,
       fwhm_tolerance_lo, fwhm_tolerance_hi, aperture_radius, exclude_bad_pixels);
-  const std::vector<delta::CatalogEntry> entries =
-      delta::build_catalog(score_img, diff_img, p, return_negative);
+  std::vector<delta::CatalogEntry> entries;
+  {
+    nb::gil_scoped_release release;
+    entries = delta::build_catalog(score_img, diff_img, p, return_negative);
+  }
 
   const std::size_t n = entries.size();
   std::vector<double> x, y, peak_snr, flux, expected_n_pix, fwhm_ratio;
@@ -553,7 +556,11 @@ nb::dict subtract(InArray<float> science, InArray<float> reference,
                                        resolve_radius(beta, n_max, radius));
 
   delta::timing::clear();
-  delta::ImageF diff = delta::subtract(sci, ref, spatial, theta, basis, saturation);
+  delta::ImageF diff;
+  {
+    nb::gil_scoped_release release;
+    diff = delta::subtract(sci, ref, spatial, theta, basis, saturation);
+  }
   const std::size_t h = diff.height();
   const std::size_t w = diff.width();
 
@@ -598,9 +605,12 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
                                  lambda_grid.data() + lambda_grid.size());
 
   delta::timing::clear();
-  const delta::KernelFit fit =
-      delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
-                        clip_sigma, clip_iterations, min_stamps, cv_folds);
+  delta::KernelFit fit;
+  {
+    nb::gil_scoped_release release;
+    fit = delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
+                            clip_sigma, clip_iterations, min_stamps, cv_folds);
+  }
 
   nb::dict out = gls_result_to_dict(fit.gls);
   out["timing"] = timing_dict();
@@ -711,8 +721,12 @@ nb::dict decorrelate(InArray<float> difference, const Eigen::MatrixXd& knots,
   const delta::ThinPlateBasis spatial(knots);
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
-  delta::ImageF out = delta::decorrelate(diff, spatial, theta, basis, vs, vr,
-                                         block, kernel_cell_blocks);
+  delta::ImageF out;
+  {
+    nb::gil_scoped_release release;
+    out = delta::decorrelate(diff, spatial, theta, basis, vs, vr, block,
+                             kernel_cell_blocks);
+  }
   nb::dict result;
   result["difference"] = to_numpy<float>(std::move(out.pixels()), {h, w});
   result["variance"] = to_numpy<float>(std::move(out.variance()), {h, w});
@@ -823,7 +837,11 @@ nb::ndarray<nb::numpy, float> matched_filter(InArray<float> image,
   delta::ImageF var(w, h);
   std::copy(variance.data(), variance.data() + h * w, var.pixels().begin());
   const std::vector<float> p(psf.data(), psf.data() + psf.size());
-  delta::ImageF out = delta::matched_filter(img, p, ps, var);
+  delta::ImageF out;
+  {
+    nb::gil_scoped_release release;
+    out = delta::matched_filter(img, p, ps, var);
+  }
   return to_numpy<float>(std::move(out.pixels()), {h, w});
 }
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import platform
+import re
 import socket
 import subprocess
 from datetime import datetime, timezone
@@ -17,16 +18,51 @@ from pathlib import Path
 from . import __version__
 
 
+def _is_delta_checkout(toplevel: Path) -> bool:
+    """Whether `toplevel` is delta's own repo root, not an unrelated one.
+
+    A venv created inside a user's own git repo puts site-packages inside
+    that repo's working tree, so `git rev-parse --show-toplevel` run from
+    the installed package directory finds the *user's* repo, not delta's.
+    Guard against that by checking the discovered root actually looks like
+    delta's checkout (its pyproject.toml declares `name = "delta"`) rather
+    than trusting whatever repo happens to contain us.
+    """
+    pyproject = toplevel / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    try:
+        text = pyproject.read_text()
+    except OSError:
+        return False
+    return re.search(r'(?m)^name\s*=\s*"delta"\s*$', text) is not None
+
+
 def _git_commit() -> str:
     """Short commit hash of the running source checkout, or "unknown".
 
     Best-effort: most installs (wheels, site-packages) aren't a git checkout,
-    so failures here are the common case, not an error.
+    so failures here are the common case, not an error. Also "unknown" if the
+    nearest git repo isn't delta's own (see `_is_delta_checkout`) — recording
+    an unrelated project's commit as delta's would be silently wrong
+    provenance, worse than "unknown".
     """
+    cwd = Path(__file__).resolve().parent
     try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if top.returncode != 0:
+            return "unknown"
+        if not _is_delta_checkout(Path(top.stdout.strip())):
+            return "unknown"
         out = subprocess.run(
             ["git", "rev-parse", "--short=12", "HEAD"],
-            cwd=Path(__file__).resolve().parent,
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=2,

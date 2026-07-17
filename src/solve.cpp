@@ -456,19 +456,17 @@ GlsResult solve_gls_cv_design(const Eigen::Ref<const Eigen::MatrixXd>& d,
   const int k = static_cast<int>(d.cols());
   const int p = (nc + 1) * k;
 
-  // Whitened design Xs = W^{1/2} X and target ds = W^{1/2} y (see assemble()).
-  // Xs is an N x P matrix rebuilt every IRLS pass; building it serially was ~19%
-  // of the GLS solve. The nc+1 column blocks are independent (block c is D scaled
-  // row-wise by sqrt(w)*B_c, the trailing block by sqrt(w) alone), so build them
-  // in parallel.
+  // Whitened target ds = W^{1/2} y; sw = sqrt(w) per row. Unlike assemble() /
+  // solve_gls_gcv, the whitened design Xs = W^{1/2} X (N x P, P = (nc+1)k ~ 700) is
+  // never materialised here -- at N ~ 1e5-1e6 rows that's a GB-scale allocation,
+  // live for the whole exact-CV fit and rebuilt from scratch every IRLS pass
+  // (issue #49). Folds partition the rows, so the row-chunked per-fold build below
+  // (which already has to touch every row exactly once) instead constructs each
+  // chunk's Xs_g block directly from d/bn/sw -- same column-block-broadcast
+  // construction as assemble(), just done per chunk instead of once for all N rows
+  // -- and immediately reduces it into that fold's M_g/rhs_g, so Xs itself is never
+  // resident.
   const Eigen::ArrayXd sw = weights.array().sqrt();
-  Eigen::MatrixXd xs(n, p);
-#pragma omp parallel for schedule(static)
-  for (int c = 0; c <= nc; ++c) {
-    const Eigen::ArrayXd col =
-        (c < nc) ? (bn.col(c).array() * sw).eval() : sw;
-    xs.block(0, c * k, n, k) = (d.array().colwise() * col).matrix();
-  }
   const Eigen::VectorXd ds = (sw * target.array()).matrix();
 
   // Row indices per fold, then each fold's normal-equation contribution
@@ -513,16 +511,33 @@ GlsResult solve_gls_cv_design(const Eigen::Ref<const Eigen::MatrixXd>& d,
       Eigen::MatrixXd m_loc = Eigen::MatrixXd::Zero(p, p);
       Eigen::VectorXd rhs_loc = Eigen::VectorXd::Zero(p);
       double ysq_loc = 0.0;
-      // Reused per-thread gather buffers (sized to the largest possible chunk).
+      // Reused per-thread buffers (sized to the largest possible chunk). d_chunk /
+      // bn_chunk / sw_chunk gather this chunk's rows of d/bn/sw (O(chunk*(k+nc)),
+      // not O(chunk*p)); xb is then built from them with the same vectorised
+      // column-block broadcast assemble() uses, avoiding a full Xs materialisation
+      // while keeping the per-chunk build itself SIMD-friendly.
+      Eigen::MatrixXd d_chunk(kMaxFoldChunk, k);
+      Eigen::MatrixXd bn_chunk(kMaxFoldChunk, nc);
+      Eigen::ArrayXd sw_chunk(kMaxFoldChunk);
       Eigen::MatrixXd xb(kMaxFoldChunk, p);
       Eigen::VectorXd yb(kMaxFoldChunk);
 #pragma omp for schedule(dynamic) nowait
       for (int r0 = 0; r0 < nf; r0 += fold_chunk) {
         const int nr = std::min(fold_chunk, nf - r0);
         for (int j = 0; j < nr; ++j) {
-          xb.row(j) = xs.row(idx[r0 + j]);
-          yb(j) = ds(idx[r0 + j]);
+          const int i = idx[r0 + j];
+          d_chunk.row(j) = d.row(i);
+          bn_chunk.row(j) = bn.row(i);
+          sw_chunk(j) = sw(i);
+          yb(j) = ds(i);
         }
+        const auto dtop = d_chunk.topRows(nr);
+        const auto swtop = sw_chunk.head(nr);
+        for (int c = 0; c < nc; ++c) {
+          const Eigen::ArrayXd col = bn_chunk.topRows(nr).col(c).array() * swtop;
+          xb.block(0, c * k, nr, k) = (dtop.array().colwise() * col).matrix();
+        }
+        xb.block(0, nc * k, nr, k) = (dtop.array().colwise() * swtop).matrix();
         const auto xt = xb.topRows(nr).transpose();
         m_loc.selfadjointView<Eigen::Lower>().rankUpdate(xt);
         rhs_loc.noalias() += xt * yb.head(nr);

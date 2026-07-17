@@ -52,7 +52,9 @@ _CONFIG_KEYS = frozenset(
 )
 
 # Warn when the exact (non-stamped) k-fold CV path's rebuilt-every-IRLS-pass
-# whitened design exceeds this size (see fit_kernel's cv_exact_design_bytes).
+# whitened design (chunked, not materialised in full -- see fit_kernel's
+# cv_exact_design_bytes) exceeds this equivalent size, a proxy for its O(N P^2)
+# rebuild cost relative to the cheaper stamped path.
 _CV_EXACT_DESIGN_WARN_BYTES = 256 * 1024 * 1024
 
 # Median of a chi-square_1 (squared standard normal) distribution. Used to turn a
@@ -531,11 +533,11 @@ class Subtractor:
         design_bytes = fit.get("cv_exact_design_bytes", 0)
         if design_bytes > _CV_EXACT_DESIGN_WARN_BYTES:
             logger.warning(
-                "exact (non-stamped) k-fold CV path used a {:.2f} GB whitened "
-                "design, rebuilt every IRLS pass -- the 16x knot-spacing gate to "
-                "the cheaper stamped path was not met (fine knots relative to "
-                "stamp_radius). Consider fewer/coarser knots, a larger "
-                "spatial_scale, or a smaller stamp_radius if this is slow.",
+                "exact (non-stamped) k-fold CV path used a whitened design "
+                "equivalent to {:.2f} GB, rebuilt every IRLS pass -- the 16x "
+                "knot-spacing gate to the cheaper stamped path was not met (fine "
+                "knots relative to stamp_radius). Consider fewer/coarser knots, a "
+                "larger spatial_scale, or a smaller stamp_radius if this is slow.",
                 design_bytes / 1e9,
             )
         if fit["reduced_chi2"] > 3.0:

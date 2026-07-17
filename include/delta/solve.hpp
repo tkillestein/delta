@@ -44,6 +44,18 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                         const ThinPlateBasis& basis,
                         const std::vector<double>& lambda_grid);
 
+// Design-taking variant: `design` is the precomputed N x k spatial design
+// basis.design(points). The point-based overload is a thin wrapper around
+// this. Exists so an IRLS caller whose pixel coordinates are fixed across
+// passes (fit_kernel) can evaluate the O(N k^2) design once and re-use it,
+// instead of rebuilding it inside the solver every pass.
+GlsResult solve_gls_gcv_design(const Eigen::Ref<const Eigen::MatrixXd>& design,
+                               const Eigen::Ref<const Eigen::VectorXd>& target,
+                               const Eigen::Ref<const Eigen::VectorXd>& weights,
+                               const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                               const ThinPlateBasis& basis,
+                               const std::vector<double>& lambda_grid);
+
 // Select lambda by k-fold *group* cross-validation rather than GCV. `group[i]`
 // assigns pixel i to a fold (0..n_groups-1); folds should be whole stamps so the
 // held-out prediction error respects the strong within-stamp pixel correlation
@@ -68,6 +80,17 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const std::vector<double>& lambda_grid,
                        const std::vector<int>& group, int n_groups,
                        int warm_start = -1);
+
+// Design-taking variant of solve_gls_cv (see solve_gls_gcv_design): `design`
+// is the precomputed N x k spatial design basis.design(points).
+GlsResult solve_gls_cv_design(const Eigen::Ref<const Eigen::MatrixXd>& design,
+                              const Eigen::Ref<const Eigen::VectorXd>& target,
+                              const Eigen::Ref<const Eigen::VectorXd>& weights,
+                              const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                              const ThinPlateBasis& basis,
+                              const std::vector<double>& lambda_grid,
+                              const std::vector<int>& group, int n_groups,
+                              int warm_start = -1);
 
 // Per-stamp factorised group-CV solve (SPEC §3.2-3.3 approximation). Stamps are
 // small (≈30 px) relative to the knot spacing (which sets the field length-scale),

@@ -37,7 +37,8 @@ ImageF convolve_x(const ImageF& in, const std::vector<float>& k) {
     const std::size_t row = static_cast<std::size_t>(y) * width;
     float* drow = dst + row;
     const float* srow = src + row;
-    for (int x = 0; x < width; ++x) drow[x] = 0.0f;
+    // No per-row zero pass: the ImageF constructor value-initialises the whole
+    // buffer, so re-zeroing every row here was a duplicate sweep.
     for (int j = 0; j < ks; ++j) {
       const float kc = k[j];
       const int sh = h - j;  // src index = x + sh
@@ -67,7 +68,7 @@ ImageF convolve_y(const ImageF& in, const std::vector<float>& k) {
     if (static_cast<std::size_t>(height) * width >= kParallelMinWork)
   for (int y = 0; y < height; ++y) {
     float* drow = dst + static_cast<std::size_t>(y) * width;
-    for (int x = 0; x < width; ++x) drow[x] = 0.0f;
+    // No per-row zero pass (see convolve_x).
     const int jmin = std::max(0, y + h - height + 1);
     const int jmax = std::min(ks - 1, y + h);
     for (int j = jmin; j <= jmax; ++j) {
@@ -90,17 +91,23 @@ std::vector<ImageF> basis_convolve(const ImageF& image,
                                    const GaussHermiteBasis& basis) {
   const int n_max = basis.n_max();
 
+  // kernel1d returns a fresh vector per call; sample each order once up front
+  // (this runs per stamp in the fit, so the per-component allocations add up).
+  std::vector<std::vector<float>> k1;
+  k1.reserve(n_max + 1);
+  for (int n = 0; n <= n_max; ++n) k1.push_back(basis.kernel1d(n));
+
   // Share the x-pass across all components with the same nx.
   std::vector<ImageF> tx;
   tx.reserve(n_max + 1);
   for (int nx = 0; nx <= n_max; ++nx) {
-    tx.push_back(convolve_x(image, basis.kernel1d(nx)));
+    tx.push_back(convolve_x(image, k1[nx]));
   }
 
   std::vector<ImageF> out;
   out.reserve(basis.component_count());
   for (const auto& [nx, ny] : basis.orders()) {
-    out.push_back(convolve_y(tx[nx], basis.kernel1d(ny)));
+    out.push_back(convolve_y(tx[nx], k1[ny]));
   }
   return out;
 }

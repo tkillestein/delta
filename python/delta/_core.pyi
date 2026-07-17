@@ -91,6 +91,12 @@ class DiffProducts(TypedDict):
     # Opt-in C++ sub-stage timings (DELTA_TIMING); None otherwise.
     timing: dict[str, float] | None
 
+class DecorrelateResult(TypedDict):
+    difference: NDArray[np.float32]
+    variance: NDArray[np.float32]
+    # Opt-in C++ sub-stage timings (DELTA_TIMING); None otherwise.
+    timing: dict[str, float] | None
+
 class StampSelection(TypedDict):
     x: NDArray[np.int32]
     y: NDArray[np.int32]
@@ -328,11 +334,19 @@ def decorrelate(
     block: int = ...,
     radius: int = ...,
     kernel_cell_blocks: int = ...,
-) -> dict[str, NDArray[np.float32]]:
+) -> DecorrelateResult:
     """Spatially-varying noise decorrelation via apodized FFT blocks.
 
     Returns ``{'difference', 'variance'}`` where ``variance`` is the
     post-whitening noise level (for pulls and the match-filtered score).
+    """
+
+def drain_timing() -> dict[str, float] | None:
+    """Drain accumulated DELTA_TIMING sub-stage timers ({label: seconds}).
+
+    None when timing is disabled. For callers of functions that return bare
+    arrays (e.g. matched_filter); fit/subtract/decorrelate attach theirs to
+    their result dicts.
     """
 
 def whiten_score_psf(

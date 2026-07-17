@@ -166,6 +166,28 @@ def test_cv_group_size_mismatch_raises():
         delta.solve_gls_cv(knots, points, target, weights, bn, grid, short_group, 5)
 
 
+def test_gcv_rank_deficient_system_falls_back():
+    """Fewer pixels than unknowns: M = XtWX is singular, so the spectral
+    (Demmler-Reinsch) grid path must fall back to the per-lambda LDLT solve
+    and still return finite results with the reported minimum on the curve."""
+    knots = delta.grid_knots(0.0, 0.0, 100.0, 100.0, 5, 5)  # k = 25
+    rng = np.random.default_rng(9)
+    n = 40  # << (nc + 1) * k = 75 unknowns
+    points = rng.uniform(0, 100, size=(n, 2))
+    bn = rng.standard_normal((n, 2))
+    x = _build_design(knots, points, bn)
+    target = x @ rng.standard_normal(x.shape[1]) + 0.1 * rng.standard_normal(n)
+
+    grid = np.logspace(-4, 4, 9, dtype=np.float64)
+    res = delta.solve_gls_gcv(knots, points, target, np.ones(n), bn, grid)
+    assert np.isfinite(res["theta"]).all()
+    assert np.isfinite(res["effective_dof"])
+    assert res["lambda"] in grid
+    imin = int(np.argmin(res["gcv_curve"]))
+    assert res["lambda"] == grid[imin]
+    assert res["gcv"] == res["gcv_curve"][imin]
+
+
 def test_cv_selects_lambda_from_grid():
     knots = delta.grid_knots(0.0, 0.0, 80.0, 80.0, 4, 4)
     rng = np.random.default_rng(8)

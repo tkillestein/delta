@@ -166,34 +166,58 @@ std::vector<Stamp> detect_stamps(const ImageF& image,
   const int border = resolved_border(params);
   const int fwhm_radius = resolved_fwhm_radius(params);
 
-  // 3x3 local maxima above threshold, with a valid stamp footprint.
+  // 3x3 local maxima above threshold, with a valid stamp footprint. The scan
+  // reads the whole frame (the one full-image pass of stamp selection), so it
+  // is split into row bands over threads; each band collects its candidates
+  // locally and the bands concatenate in order, reproducing the serial scan
+  // order exactly (so the flux sort and greedy isolation below see identical
+  // input regardless of thread schedule).
   std::vector<Stamp> candidates;
-  for (int y = border; y < h - border; ++y) {
-    for (int x = border; x < w - border; ++x) {
-      const double v = static_cast<double>(image.data()[static_cast<std::size_t>(y) * w + x]);
-      if (v <= threshold) continue;
+  {
+    constexpr int kBandRows = 64;
+    const int y_lo = border, y_hi = h - border;
+    const int n_bands =
+        y_hi > y_lo ? (y_hi - y_lo + kBandRows - 1) / kBandRows : 0;
+    std::vector<std::vector<Stamp>> bands(n_bands);
+#pragma omp parallel for schedule(dynamic)
+    for (int b = 0; b < n_bands; ++b) {
+      std::vector<Stamp>& band = bands[b];
+      const int by0 = y_lo + b * kBandRows;
+      const int by1 = std::min(y_hi, by0 + kBandRows);
+      for (int y = by0; y < by1; ++y) {
+        for (int x = border; x < w - border; ++x) {
+          const double v = static_cast<double>(
+              image.data()[static_cast<std::size_t>(y) * w + x]);
+          if (v <= threshold) continue;
 
-      bool peak = true;
-      for (int dy = -1; dy <= 1 && peak; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-          if (dx == 0 && dy == 0) continue;
-          const double nv = static_cast<double>(
-              image.data()[static_cast<std::size_t>(y + dy) * w + (x + dx)]);
-          if (nv > v) { peak = false; break; }
+          bool peak = true;
+          for (int dy = -1; dy <= 1 && peak; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+              if (dx == 0 && dy == 0) continue;
+              const double nv = static_cast<double>(
+                  image.data()[static_cast<std::size_t>(y + dy) * w + (x + dx)]);
+              if (nv > v) { peak = false; break; }
+            }
+          }
+          if (!peak) continue;
+          if (!footprint_ok(image, x, y, params.stamp_radius, params.saturation))
+            continue;
+
+          Stamp s;
+          s.x = x;
+          s.y = y;
+          s.flux = v - bg.median;
+          s.snr = bg.sigma > 0.0 ? s.flux / bg.sigma : s.flux;
+          s.fwhm = estimate_fwhm(image, x, y, fwhm_radius, bg.median);
+          band.push_back(s);
         }
       }
-      if (!peak) continue;
-      if (!footprint_ok(image, x, y, params.stamp_radius, params.saturation))
-        continue;
-
-      Stamp s;
-      s.x = x;
-      s.y = y;
-      s.flux = v - bg.median;
-      s.snr = bg.sigma > 0.0 ? s.flux / bg.sigma : s.flux;
-      s.fwhm = estimate_fwhm(image, x, y, fwhm_radius, bg.median);
-      candidates.push_back(s);
     }
+    std::size_t total = 0;
+    for (const auto& band : bands) total += band.size();
+    candidates.reserve(total);
+    for (const auto& band : bands)
+      candidates.insert(candidates.end(), band.begin(), band.end());
   }
 
   // Brightest-first greedy isolation (non-maximum suppression).

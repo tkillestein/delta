@@ -93,6 +93,65 @@ tolerance:
   and the rms log made lazy (the silent-by-default library no longer computes a 48 Mpix
   `np.std` for a message no sink emits).
 
+### Final pre-deployment pass (2026-07)
+
+A further sweep, A/B'd on a 4-core host (same commit pair, same box, warm
+min-of-5, 8000×6000): **wall 8.35 → 6.29 s (1.33×)**. Stage deltas:
+
+| stage                  | before (s) | after (s) | delta |
+|------------------------|-----------:|----------:|------:|
+| stamp selection        |       0.33 |      0.23 |  −30% |
+| kernel solve           |       1.67 |      0.90 |  −46% |
+| full-frame subtraction |       2.74 |      2.28 |  −17% |
+| noise decorrelation    |       1.56 |      1.25 |  −20% |
+| matched-filter score   |       1.25 |      0.83 |  −33% |
+
+What landed (all bit-identical — verified by output-hash probes — except the
+effective-dof identity, which is exact in real arithmetic and shifts only
+roundoff):
+
+- **Zero-copy input views** (`ImageView` in `image.hpp`): `subtract`,
+  `fit_kernel`, `decorrelate`, and `matched_filter` read the caller's NumPy
+  buffers directly instead of copying every full-frame layer into an owning
+  `ImageF` (~190 MB/layer); the one-pass range constructor covers the
+  remaining owning marshals (`write_fits` etc.). This is most of the score /
+  decorrelation stage deltas — their C++ kernels were already tight.
+- **Mask growth fused + threaded** (`subtract.cpp`): five serial full-frame
+  sweeps + two dilations became one threaded flag pass + one combined
+  dilation (OR-dilation is per-bit independent), with the dilated footprint
+  folded into the existing edge/non-finite pass (~2× on 4 threads, more on
+  wider hosts).
+- **IRLS reweight threaded and the thin-plate design cached** across IRLS
+  passes (`fit.cpp`; the design was rebuilt inside the solver every pass and
+  again for residuals — the saving scales as O(N·k²) with knot count).
+- **Detect peak scan** band-parallelised with a deterministic band-order merge.
+- **Effective-dof trace identity** in `solve_at`:
+  `tr(A⁻¹M) = P − λ‖L⁻¹F‖²_F` with `P0 = FFᵀ` (`System::pen_half`) — one
+  triangular solve over rank(P0) columns instead of the full `A⁻¹M` solve,
+  ~1.6× per factorisation across every λ-selection path.
+- Assorted: convolve row-zeroing deduplicated, `basis_convolve` kernel
+  sampling hoisted, merge vectors reserved, per-fold CV training matrices
+  hoisted out of the (λ, fold) grid.
+
+Two negative results, recorded so they are not re-attempted: **Demmler-Reinsch
+λ-grid amortisation is numerically unsound here** (with a realistic
+ill-conditioned thin-plate `M`, the spectral GCV curve misranks λ — up to
+~400× curve error on a P=704 probe; see the NOTE in `solve.cpp`), and
+**nanobind LTO measured ±1.5%** — indistinguishable from run noise.
+
+**The build now defaults to `-march=x86-64-v3`** (AVX2 + FMA; Haswell 2013+ /
+Excavator 2015+, skipped automatically on non-x86 targets). On the same 4-core
+host this took the 8000×6000 wall from 6.29 → **4.26 s** (model convolve and
+score roughly halved — these loops were written to vectorise and the SSE2
+baseline was the limiter), i.e. **1.96× cumulative** over the pre-pass code.
+`DELTA_X86_64_V3=OFF` restores the SSE2 baseline for pre-2013 CPUs;
+`DELTA_NATIVE=ON` still supersedes both for host-tuned builds (AVX-512 etc.).
+Unlike the rest of the pass this shifts float rounding (~1 ulp, FMA
+contraction); the full suite passes unchanged. The decorrelate output pair is
+also now adopted from the overlap-add accumulators (no fresh full-frame
+allocation), and `catalog` is attributed as its own benchmark stage instead of
+landing in "other".
+
 Two findings fall straight out of the splits:
 
 - **`noise decorrelation` is now the single tallest stage (~25%)**, ahead of `model
@@ -145,9 +204,10 @@ per-stage gaps below.
 The five Python-orchestrated stages are timed by the pipeline's loguru `log_timing`.
 The finer C++ splits above come from opt-in RAII timers
 (`include/delta/timing.hpp`): set `DELTA_TIMING=1` and they are accumulated per label,
-returned through the `fit_kernel` / `subtract` result dicts under `"timing"`, and
-logged by the pipeline in the same `"<label> done in <s>s"` form the benchmark
-captures. When `DELTA_TIMING` is unset the timers compile down to one cached bool
+returned through the `fit_kernel` / `subtract` / `decorrelate` result dicts under
+`"timing"` (for `matched_filter`, which returns a bare array, the pipeline drains them
+via `_core.drain_timing()`), and logged by the pipeline in the same
+`"<label> done in <s>s"` form the benchmark captures. When `DELTA_TIMING` is unset the timers compile down to one cached bool
 check, so production runs are unaffected. To split a stage further, add a
 `DELTA_TIME("…")` scope in the relevant `src/*.cpp` and a label to `SUBSTAGES` in
 `bench_subtract.py`.

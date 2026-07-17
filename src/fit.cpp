@@ -60,7 +60,7 @@ double conv_var_at(int x, int y, const std::vector<float>& k2, int ks, int r,
 
 }  // namespace
 
-KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
+KernelFit fit_kernel(const ImageViewF& science, const ImageViewF& reference,
                      const ThinPlateBasis& spatial,
                      const GaussHermiteBasis& basis,
                      const std::vector<int>& stamp_x,
@@ -99,8 +99,8 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
 
   const float ref_fill = reference_fill_value(reference);
   const bool ref_has_mask = reference.has_mask();
-  const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
-  const float* ref_var = have_cvar ? reference.variance().data() : nullptr;
+  const MaskType* ref_mask = ref_has_mask ? reference.mask() : nullptr;
+  const float* ref_var = have_cvar ? reference.variance() : nullptr;
 
   // Per-stamp scratch, filled in parallel below and merged serially afterwards
   // so the merged pixel order (and therefore stamp_idx / pix_stamp) exactly
@@ -194,7 +194,26 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   }
 
   // Serial merge, in original stamp order, so stamp_idx / pix_stamp exactly
-  // match what the old single-threaded loop produced.
+  // match what the old single-threaded loop produced. Reserve the final sizes
+  // up front: the appends below total ~npix_all*(5+nc) doubles, and letting
+  // the vectors grow geometrically re-copies that payload several times over.
+  {
+    std::size_t total_pix = 0, total_stamps = 0;
+    for (const StampGather& g : gathered) {
+      if (!g.used) continue;
+      ++total_stamps;
+      total_pix += g.px.size();
+    }
+    stamp_cx.reserve(total_stamps);
+    stamp_cy.reserve(total_stamps);
+    px.reserve(total_pix);
+    py.reserve(total_pix);
+    target.reserve(total_pix);
+    var_t.reserve(total_pix);
+    var_c.reserve(total_pix);
+    bn_flat.reserve(total_pix * static_cast<std::size_t>(nc));
+    pix_stamp.reserve(total_pix);
+  }
   for (const StampGather& g : gathered) {
     if (!g.used) continue;
     const int stamp_idx = static_cast<int>(stamp_cx.size());
@@ -255,6 +274,18 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
   // search warm-starts at it (the clip barely moves the curve). -1 = cold start.
   int warm_start = -1;
   delta::timing::ScopedTimer solve_timer("fit: GLS solve");
+
+  // Pixel coordinates never change across IRLS passes (clipping only selects a
+  // row subset), so the O(N k^2) thin-plate design over all stamp pixels is
+  // evaluated once here and row-gathered per pass -- it was previously rebuilt
+  // inside the solver every pass and a second time for the residual step.
+  Eigen::MatrixXd pts_all(npix_all, 2);
+  for (int i = 0; i < npix_all; ++i) {
+    pts_all(i, 0) = px[i];
+    pts_all(i, 1) = py[i];
+  }
+  const Eigen::MatrixXd design_all = spatial.design(pts_all);  // N_all x k
+
   for (int iter = 0;; ++iter) {
     // Active pixel rows = pixels whose stamp is still accepted.
     std::vector<int> rows;
@@ -267,6 +298,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
     Eigen::MatrixXd points(npix, 2);
     Eigen::VectorXd tgt(npix), wts(npix);
     Eigen::MatrixXd bn_mat(npix, nc);
+    Eigen::MatrixXd design_act(npix, k);
     for (int j = 0; j < npix; ++j) {
       const int i = rows[j];
       points(j, 0) = px[i];
@@ -275,6 +307,7 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
       wts(j) = weights[i];
       for (int n = 0; n < nc; ++n)
         bn_mat(j, n) = bn_flat[static_cast<std::size_t>(i) * nc + n];
+      design_act.row(j) = design_all.row(i);
     }
 
     if (cv_folds > 1) {
@@ -349,13 +382,13 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           std::min_element(gls.gcv_curve.begin(), gls.gcv_curve.end()) -
           gls.gcv_curve.begin());
     } else {
-      gls = solve_gls_gcv(points, tgt, wts, bn_mat, spatial, lambda_grid);
+      gls = solve_gls_gcv_design(design_act, tgt, wts, bn_mat, spatial,
+                                 lambda_grid);
     }
 
     // Model and per-pixel residual under this solution; fields = design * C.
-    const Eigen::MatrixXd design = spatial.design(points);
     const Eigen::MatrixXd c = coeff_matrix(gls.theta, k, nc + 1);
-    const Eigen::MatrixXd fields = design * c;  // npix x (nc+1)
+    const Eigen::MatrixXd fields = design_act * c;  // npix x (nc+1)
 
     std::vector<double> sum_chi(n_stamps, 0.0);
     std::vector<int> cnt(n_stamps, 0);
@@ -398,6 +431,10 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           for (float& v : k2) v *= v;  // elementwise K²
           stamp_k2[s] = k2;
         }
+        // Each iteration writes a distinct weights[rows[j]] and conv_var_at is
+        // read-only, so the O(npix * ks^2) reweight threads cleanly (it was a
+        // measurable serial chunk of every IRLS pass).
+#pragma omp parallel for schedule(dynamic, 256)
         for (int j = 0; j < npix; ++j) {
           const int i = rows[j];
           const int s = pix_stamp[i];

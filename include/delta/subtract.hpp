@@ -21,7 +21,7 @@ namespace delta {
 // removes that step, so the model stays smooth right up to the (dilated-masked)
 // boundary. Shared between the full-frame subtract path and the stamp-local fit
 // path so both stay bit-for-bit consistent (SPEC §3.6).
-float reference_fill_value(const ImageF& reference);
+float reference_fill_value(const ImageViewF& reference);
 
 // Spatially-varying coefficient fields evaluated over the full frame.
 //
@@ -72,7 +72,7 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
 // its non-linear value pollutes a kernel-radius neighbourhood of the model); a
 // saturated *science* (target) pixel is not convolved and propagates 1:1, so it
 // is flagged but not grown. 0 disables saturation masking.
-ImageF subtract(const ImageF& science, const ImageF& reference,
+ImageF subtract(const ImageViewF& science, const ImageViewF& reference,
                 const ThinPlateBasis& spatial,
                 const Eigen::Ref<const Eigen::VectorXd>& theta,
                 const GaussHermiteBasis& basis, double saturation = 0.0);

@@ -71,6 +71,7 @@ STAGES = (
     "full-frame subtraction",
     "noise decorrelation",
     "matched-filter score",
+    "catalog",
 )
 
 # C++ sub-stage timers nested under their parent (emitted only with DELTA_TIMING
@@ -83,6 +84,24 @@ SUBSTAGES = {
         "subtract: model convolve",
         "subtract: variance propagation",
         "subtract: mask growth",
+    ),
+    "noise decorrelation": (
+        "decorrelate: kernel-power cache",
+        "decorrelate: block filter+blend",
+        "decorrelate: normalise",
+    ),
+    "matched-filter score": ("score: blocked correlation",),
+    "catalog": (
+        "catalog: marshal input",
+        "catalog: seed",
+        "catalog: label positive",
+        "catalog: bucket positive",
+        "catalog: summarize positive",
+        "catalog: dipole flag",
+        "catalog: label negative",
+        "catalog: bucket negative",
+        "catalog: summarize negative",
+        "catalog: marshal output",
     ),
 }
 

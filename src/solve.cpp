@@ -29,6 +29,11 @@ struct System {
   Eigen::MatrixXd m;   // X^T W X
   Eigen::VectorXd rhs;  // X^T W d
   Eigen::MatrixXd p0;  // block-diagonal penalty (one block per component + bg)
+  // Half-factor F with F F^T = P0 (P x rank(P0)), from the eigendecomposition
+  // of the k x k penalty block embedded per field. Lets solve_at() compute the
+  // effective dof via tr(A^-1 M) = P - lambda tr(F^T A^-1 F) -- one triangular
+  // solve on rank(P0) columns instead of the full P-column solve of A^-1 M.
+  Eigen::MatrixXd pen_half;
   double ywy = 0.0;    // d^T W d
   int n = 0;           // number of pixels (rows)
   int nc = 0;          // number of kernel components
@@ -36,17 +41,42 @@ struct System {
   int p = 0;           // total unknowns = (nc + 1) * k
 };
 
-System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
+// Build the block-diagonal half-factor F (F F^T = P0) from the shared k x k
+// penalty block: eigendecompose pen = V W V^T once (k is small), keep the
+// numerically nonzero eigenpairs, and embed Fk = V sqrt(W) per field block.
+Eigen::MatrixXd make_pen_half(const Eigen::MatrixXd& pen, int nc, int k) {
+  const Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(pen);
+  if (es.info() != Eigen::Success) return Eigen::MatrixXd();
+  const Eigen::VectorXd& w = es.eigenvalues();
+  const double wmax = w.size() > 0 ? w.cwiseAbs().maxCoeff() : 0.0;
+  const double tol = wmax * static_cast<double>(k) *
+                     std::numeric_limits<double>::epsilon();
+  std::vector<int> keep;
+  for (int i = 0; i < w.size(); ++i)
+    if (w(i) > tol) keep.push_back(i);
+  const int r = static_cast<int>(keep.size());
+  Eigen::MatrixXd fk(k, r);
+  for (int j = 0; j < r; ++j)
+    fk.col(j) = es.eigenvectors().col(keep[j]) * std::sqrt(w(keep[j]));
+  const int p = (nc + 1) * k;
+  Eigen::MatrixXd f = Eigen::MatrixXd::Zero(p, (nc + 1) * r);
+  for (int b = 0; b <= nc; ++b) f.block(b * k, b * r, k, r) = fk;
+  return f;
+}
+
+// `d` is the precomputed N x k spatial design basis.design(points) -- passed
+// in (not rebuilt here) so IRLS callers with fixed pixel coordinates can
+// amortise its O(N k^2) construction across passes.
+System assemble(const Eigen::Ref<const Eigen::MatrixXd>& d,
                 const Eigen::Ref<const Eigen::VectorXd>& target,
                 const Eigen::Ref<const Eigen::VectorXd>& weights,
                 const Eigen::Ref<const Eigen::MatrixXd>& bn,
                 const ThinPlateBasis& basis) {
-  const int n = static_cast<int>(points.rows());
+  const int n = static_cast<int>(d.rows());
   const int nc = static_cast<int>(bn.cols());
   if (target.size() != n || weights.size() != n || bn.rows() != n)
-    throw std::runtime_error("solve_gls: row counts of points/target/weights/bn disagree");
+    throw std::runtime_error("solve_gls: row counts of design/target/weights/bn disagree");
 
-  const Eigen::MatrixXd d = basis.design(points);  // N x k
   const int k = static_cast<int>(d.cols());
   const int p = (nc + 1) * k;
 
@@ -110,6 +140,7 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
   s.p0 = Eigen::MatrixXd::Zero(p, p);
   const Eigen::MatrixXd& pen = basis.penalty();
   for (int b = 0; b <= nc; ++b) s.p0.block(b * k, b * k, k, k) = pen;
+  s.pen_half = make_pen_half(pen, nc, k);
   return s;
 }
 
@@ -131,7 +162,18 @@ GlsResult solve_at(const System& s, double lambda) {
   const Eigen::LLT<Eigen::MatrixXd> llt(a);
   if (llt.info() == Eigen::Success) {
     r.theta = llt.solve(s.rhs);
-    r.effective_dof = (llt.solve(s.m)).trace();
+    if (s.pen_half.size() > 0) {
+      // tr(A^-1 M) = tr(A^-1 (A - lambda P0)) = P - lambda tr(F^T A^-1 F)
+      //            = P - lambda ||L^-1 F||_F^2  with A = L L^T, P0 = F F^T.
+      // One forward substitution over rank(P0) columns, ~half the cost of the
+      // former full A^-1 M solve whose off-diagonal entries were discarded by
+      // the trace. Exact identity; differs from the old form only in roundoff.
+      r.effective_dof =
+          static_cast<double>(s.p) -
+          lambda * llt.matrixL().solve(s.pen_half).squaredNorm();
+    } else {
+      r.effective_dof = (llt.solve(s.m)).trace();
+    }
   } else {
     const Eigen::LDLT<Eigen::MatrixXd> ldlt(a);
     r.theta = ldlt.solve(s.rhs);
@@ -150,6 +192,17 @@ GlsResult solve_at(const System& s, double lambda) {
   return r;
 }
 
+// NOTE (perf): amortising the lambda grid with a one-time Demmler-Reinsch
+// orthogonalisation (M = LL^T, eig of L^-1 P0 L^-T, then O(P) per lambda) was
+// implemented and measured here, and REJECTED: with a realistic thin-plate
+// design M is severely ill-conditioned -- smoothing exists precisely because
+// it is -- so L^-1 amplifies roundoff and the eigenvalues of L^-1 P0 L^-T
+// (spanning ~15 decades) carry absolute errors that corrupt the reconstructed
+// GCV curve away from lambda -> 0 (observed: up to ~400x curve error and a
+// mis-selected lambda on a P=704 system whose direct-path optimum was clearly
+// elsewhere). The per-lambda factorisations below are each unconditionally
+// stable, and the grid is evaluated in parallel; leave them.
+
 }  // namespace
 
 GlsResult solve_gls(const Eigen::Ref<const Eigen::MatrixXd>& points,
@@ -157,7 +210,8 @@ GlsResult solve_gls(const Eigen::Ref<const Eigen::MatrixXd>& points,
                     const Eigen::Ref<const Eigen::VectorXd>& weights,
                     const Eigen::Ref<const Eigen::MatrixXd>& bn,
                     const ThinPlateBasis& basis, double lambda) {
-  return solve_at(assemble(points, target, weights, bn, basis), lambda);
+  return solve_at(assemble(basis.design(points), target, weights, bn, basis),
+                  lambda);
 }
 
 GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
@@ -166,14 +220,26 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                         const Eigen::Ref<const Eigen::MatrixXd>& bn,
                         const ThinPlateBasis& basis,
                         const std::vector<double>& lambda_grid) {
+  return solve_gls_gcv_design(basis.design(points), target, weights, bn, basis,
+                              lambda_grid);
+}
+
+GlsResult solve_gls_gcv_design(const Eigen::Ref<const Eigen::MatrixXd>& design,
+                               const Eigen::Ref<const Eigen::VectorXd>& target,
+                               const Eigen::Ref<const Eigen::VectorXd>& weights,
+                               const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                               const ThinPlateBasis& basis,
+                               const std::vector<double>& lambda_grid) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_gcv: lambda_grid is empty");
 
-  const System s = assemble(points, target, weights, bn, basis);
-
-  // Each lambda is an independent LDLT solve + trace on the shared (read-only)
-  // system; evaluate the grid in parallel, then reduce to the GCV-minimising fit.
+  const System s = assemble(design, target, weights, bn, basis);
   const int ng = static_cast<int>(lambda_grid.size());
+
+  // Each lambda is an independent factorisation + solve on the shared
+  // (read-only) system; evaluate the grid in parallel, then reduce to the
+  // GCV-minimising fit. (See the NOTE above solve_at for why this is not
+  // amortised across the grid with a one-time eigendecomposition.)
   std::vector<GlsResult> results(ng);
 #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < ng; ++i) results[i] = solve_at(s, lambda_grid[i]);
@@ -226,6 +292,17 @@ GlsResult cv_finish(const std::vector<Eigen::MatrixXd>& mf,
   s.p0 = Eigen::MatrixXd::Zero(p, p);
   const Eigen::MatrixXd& pen = basis.penalty();
   for (int b = 0; b <= nc; ++b) s.p0.block(b * k, b * k, k, k) = pen;
+  s.pen_half = make_pen_half(pen, nc, k);
+
+  // Per-fold training pieces, hoisted out of the (lambda, fold) grid: they
+  // depend only on the fold, and rebuilding the P x P difference inside every
+  // grid point paid an extra full-matrix pass per factorisation.
+  std::vector<Eigen::MatrixXd> m_train(n_groups);
+  std::vector<Eigen::VectorXd> rhs_train(n_groups);
+  for (int g = 0; g < n_groups; ++g) {
+    m_train[g] = s.m - mf[g];
+    rhs_train[g] = s.rhs - rf[g];
+  }
 
   // Held-out weighted SSE for every (lambda, fold): fit on M_all - M_g, predict
   // fold g via ds_g^T ds_g - 2 theta^T rhs_g + theta^T M_g theta.
@@ -244,17 +321,16 @@ GlsResult cv_finish(const std::vector<Eigen::MatrixXd>& mf,
 #pragma omp parallel for collapse(2) schedule(dynamic)
     for (int ii = 0; ii < m; ++ii) {
       for (int g = 0; g < n_groups; ++g) {
-        const Eigen::MatrixXd a = (s.m - mf[g]) + lambda_grid[idx[ii]] * s.p0;
+        const Eigen::MatrixXd a = m_train[g] + lambda_grid[idx[ii]] * s.p0;
         // SPD training normal matrix -> Cholesky (LLT); fall back to the robust
         // pivoted LDLT only when a fold's system is not positive-definite (an
         // under-constrained field at tiny lambda). See solve_at().
-        const Eigen::VectorXd rhs_g = s.rhs - rf[g];
         const Eigen::LLT<Eigen::MatrixXd> llt(a);
         Eigen::VectorXd th;
         if (llt.info() == Eigen::Success)
-          th = llt.solve(rhs_g);
+          th = llt.solve(rhs_train[g]);
         else
-          th = Eigen::LDLT<Eigen::MatrixXd>(a).solve(rhs_g);
+          th = Eigen::LDLT<Eigen::MatrixXd>(a).solve(rhs_train[g]);
         const double e = ysq[g] - 2.0 * th.dot(rf[g]) + th.dot(mf[g] * th);
         err(ii, g) = e > 0.0 ? e : 0.0;
       }
@@ -350,9 +426,21 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const std::vector<double>& lambda_grid,
                        const std::vector<int>& group, int n_groups,
                        int warm_start) {
+  return solve_gls_cv_design(basis.design(points), target, weights, bn, basis,
+                             lambda_grid, group, n_groups, warm_start);
+}
+
+GlsResult solve_gls_cv_design(const Eigen::Ref<const Eigen::MatrixXd>& d,
+                              const Eigen::Ref<const Eigen::VectorXd>& target,
+                              const Eigen::Ref<const Eigen::VectorXd>& weights,
+                              const Eigen::Ref<const Eigen::MatrixXd>& bn,
+                              const ThinPlateBasis& basis,
+                              const std::vector<double>& lambda_grid,
+                              const std::vector<int>& group, int n_groups,
+                              int warm_start) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
-  const int n = static_cast<int>(points.rows());
+  const int n = static_cast<int>(d.rows());
   // `group.size() != n` is a caller bug (mismatched inputs), not a valid way to
   // opt out of CV -- unlike n_groups < 2, which is the documented opt-out and
   // degrades to GCV. Erroring here matters most for the public `_core.solve_gls_cv`
@@ -361,10 +449,10 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   // to match `points` so this never fires on that path.
   if (static_cast<int>(group.size()) != n)
     throw std::runtime_error("solve_gls_cv: group.size() must match points.rows()");
-  if (n_groups < 2) return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+  if (n_groups < 2)
+    return solve_gls_gcv_design(d, target, weights, bn, basis, lambda_grid);
 
   const int nc = static_cast<int>(bn.cols());
-  const Eigen::MatrixXd d = basis.design(points);  // N x k
   const int k = static_cast<int>(d.cols());
   const int p = (nc + 1) * k;
 

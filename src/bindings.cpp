@@ -150,21 +150,16 @@ void write_fits(const std::string& path, InArray<float> data,
   const std::size_t h = data.shape(0);
   const std::size_t w = data.shape(1);
 
-  delta::ImageF image(w, h);
-  std::copy(data.data(), data.data() + h * w, image.pixels().begin());
-
+  delta::ImageF image(w, h, data.data());
   if (variance) {
     if (variance->shape(0) != h || variance->shape(1) != w)
       throw std::runtime_error("variance shape does not match data");
-    image.allocate_variance();
-    std::copy(variance->data(), variance->data() + h * w,
-              image.variance().begin());
+    image.variance().assign(variance->data(), variance->data() + h * w);
   }
   if (mask) {
     if (mask->shape(0) != h || mask->shape(1) != w)
       throw std::runtime_error("mask shape does not match data");
-    image.allocate_mask();
-    std::copy(mask->data(), mask->data() + h * w, image.mask().begin());
+    image.mask().assign(mask->data(), mask->data() + h * w);
   }
 
   delta::io::write_image(path, image, overwrite);
@@ -216,8 +211,7 @@ nb::ndarray<nb::numpy, float> basis_convolve(InArray<float> image, double beta,
   const std::size_t h = image.shape(0);
   const std::size_t w = image.shape(1);
 
-  delta::ImageF img(w, h);
-  std::copy(image.data(), image.data() + h * w, img.pixels().begin());
+  delta::ImageF img(w, h, image.data());
 
   const delta::GaussHermiteBasis b(beta, n_max,
                                    resolve_radius(beta, n_max, radius));
@@ -511,27 +505,24 @@ nb::dict solve_gls_cv(const Eigen::MatrixXd& knots, const Eigen::MatrixXd& point
 // ---- subtract (full-frame spatially-varying subtraction) -------------------
 
 // Build an ImageF from data with optional variance and mask layers.
-delta::ImageF make_image_vm(InArray<float> data,
-                            std::optional<InArray<float>> variance,
-                            std::optional<InArray<std::uint8_t>> mask) {
+// Zero-copy view of the caller's NumPy layers: the read-only core entry
+// points (subtract / fit_kernel / decorrelate / matched_filter) take
+// ImageViewF, so no full-frame layer is copied into C++ at all (~190 MB per
+// layer at survey-cadence sizes). Lifetime: the InArray arguments keep the
+// ndarrays alive for the duration of the binding call, which the view (and
+// the GIL-released region inside it) never outlives.
+delta::ImageViewF make_view_vm(const InArray<float>& data,
+                               const std::optional<InArray<float>>& variance,
+                               const std::optional<InArray<std::uint8_t>>& mask) {
   const std::size_t h = data.shape(0);
   const std::size_t w = data.shape(1);
-  delta::ImageF img(w, h);
-  std::copy(data.data(), data.data() + h * w, img.pixels().begin());
-  if (variance) {
-    if (variance->shape(0) != h || variance->shape(1) != w)
-      throw std::runtime_error("variance shape does not match data");
-    img.allocate_variance();
-    std::copy(variance->data(), variance->data() + h * w,
-              img.variance().begin());
-  }
-  if (mask) {
-    if (mask->shape(0) != h || mask->shape(1) != w)
-      throw std::runtime_error("mask shape does not match data");
-    img.allocate_mask();
-    std::copy(mask->data(), mask->data() + h * w, img.mask().begin());
-  }
-  return img;
+  if (variance && (variance->shape(0) != h || variance->shape(1) != w))
+    throw std::runtime_error("variance shape does not match data");
+  if (mask && (mask->shape(0) != h || mask->shape(1) != w))
+    throw std::runtime_error("mask shape does not match data");
+  return delta::ImageViewF(w, h, data.data(),
+                           variance ? variance->data() : nullptr,
+                           mask ? mask->data() : nullptr);
 }
 
 // Drain the opt-in C++ sub-stage timers (DELTA_TIMING) into a {label: seconds}
@@ -553,9 +544,9 @@ nb::dict subtract(InArray<float> science, InArray<float> reference,
                   std::optional<InArray<float>> reference_var,
                   std::optional<InArray<std::uint8_t>> science_mask,
                   std::optional<InArray<std::uint8_t>> reference_mask) {
-  const delta::ImageF sci = make_image_vm(science, science_var, science_mask);
-  const delta::ImageF ref =
-      make_image_vm(reference, reference_var, reference_mask);
+  const delta::ImageViewF sci = make_view_vm(science, science_var, science_mask);
+  const delta::ImageViewF ref =
+      make_view_vm(reference, reference_var, reference_mask);
   const delta::ThinPlateBasis spatial(knots);
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
@@ -598,9 +589,9 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
                     std::optional<InArray<float>> reference_var,
                     std::optional<InArray<std::uint8_t>> science_mask,
                     std::optional<InArray<std::uint8_t>> reference_mask) {
-  const delta::ImageF sci = make_image_vm(science, science_var, science_mask);
-  const delta::ImageF ref =
-      make_image_vm(reference, reference_var, reference_mask);
+  const delta::ImageViewF sci = make_view_vm(science, science_var, science_mask);
+  const delta::ImageViewF ref =
+      make_view_vm(reference, reference_var, reference_mask);
   const delta::ThinPlateBasis spatial(knots);
   const delta::GaussHermiteBasis basis(beta, n_max,
                                        resolve_radius(beta, n_max, radius));
@@ -715,14 +706,11 @@ nb::dict decorrelate(InArray<float> difference, const Eigen::MatrixXd& knots,
                      int block, int radius, int kernel_cell_blocks) {
   const std::size_t h = difference.shape(0);
   const std::size_t w = difference.shape(1);
-  delta::ImageF diff(w, h);
-  std::copy(difference.data(), difference.data() + h * w,
-            diff.pixels().begin());
-  delta::ImageF vs(w, h), vr(w, h);
-  std::copy(var_science.data(), var_science.data() + h * w,
-            vs.pixels().begin());
-  std::copy(var_reference.data(), var_reference.data() + h * w,
-            vr.pixels().begin());
+  // Zero-copy views (see make_view_vm): the three full-frame input copies
+  // were a measurable slice of the decorrelation stage.
+  const delta::ImageViewF diff(w, h, difference.data());
+  const delta::ImageViewF vs(w, h, var_science.data());
+  const delta::ImageViewF vr(w, h, var_reference.data());
 
   const delta::ThinPlateBasis spatial(knots);
   const delta::GaussHermiteBasis basis(beta, n_max,
@@ -736,6 +724,7 @@ nb::dict decorrelate(InArray<float> difference, const Eigen::MatrixXd& knots,
   nb::dict result;
   result["difference"] = to_numpy<float>(std::move(out.pixels()), {h, w});
   result["variance"] = to_numpy<float>(std::move(out.variance()), {h, w});
+  result["timing"] = timing_dict();
   return result;
 }
 
@@ -783,19 +772,16 @@ nb::ndarray<nb::numpy, float> whiten_score_psf(
     for (std::size_t i = 0; i < kernel.size(); ++i) kernel[i] += an * p[i];
   }
 
-  delta::ImageF vs_img(w, h), vr_img(w, h);
-  std::copy(var_science.data(), var_science.data() + h * w,
-            vs_img.pixels().begin());
-  std::copy(var_reference.data(), var_reference.data() + h * w,
-            vr_img.pixels().begin());
   // Reuse the same robust block-median estimator as decorrelate (via a local
   // window centred on the frame). Fall back to a 1-pixel sample if the frame
-  // is smaller than `block`.
+  // is smaller than `block`. Reads the caller's buffers directly -- the
+  // subsampled median touches ~4k pixels, so marshalling full-frame copies
+  // for it was pure waste.
   const int bx = std::max(0, static_cast<int>(w) / 2 - block / 2);
   const int by = std::max(0, static_cast<int>(h) / 2 - block / 2);
   // Inline median of positive finite samples over the central block (mirrors
   // noise.cpp::block_variance without exposing it).
-  auto block_var = [&](const delta::ImageF& var) {
+  auto block_var = [&](const float* var) {
     const int step = std::max(1, block / 64);
     std::vector<float> vals;
     vals.reserve(static_cast<std::size_t>(block / step + 1) *
@@ -804,8 +790,7 @@ nb::ndarray<nb::numpy, float> whiten_score_psf(
       if (y < 0 || y >= static_cast<int>(h)) continue;
       for (int x = bx; x < bx + block; x += step) {
         if (x < 0 || x >= static_cast<int>(w)) continue;
-        const float v =
-            var.data()[static_cast<std::size_t>(y) * w + x];
+        const float v = var[static_cast<std::size_t>(y) * w + x];
         if (std::isfinite(v) && v > 0.0f) vals.push_back(v);
       }
     }
@@ -814,8 +799,8 @@ nb::ndarray<nb::numpy, float> whiten_score_psf(
     std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
     return static_cast<double>(vals[mid]);
   };
-  const double vs = block_var(vs_img);
-  const double vr = block_var(vr_img);
+  const double vs = block_var(var_science.data());
+  const double vr = block_var(var_reference.data());
 
   const std::vector<float> p(psf.data(), psf.data() + psf.size());
   std::vector<float> out =
@@ -838,10 +823,8 @@ nb::ndarray<nb::numpy, float> matched_filter(InArray<float> image,
   if (variance.shape(0) != h || variance.shape(1) != w)
     throw std::runtime_error("matched_filter: variance must match image shape");
 
-  delta::ImageF img(w, h);
-  std::copy(image.data(), image.data() + h * w, img.pixels().begin());
-  delta::ImageF var(w, h);
-  std::copy(variance.data(), variance.data() + h * w, var.pixels().begin());
+  const delta::ImageViewF img(w, h, image.data());
+  const delta::ImageViewF var(w, h, variance.data());
   const std::vector<float> p(psf.data(), psf.data() + psf.size());
   delta::ImageF out;
   {
@@ -975,4 +958,8 @@ NB_MODULE(_core, m) {
   m.def("matched_filter", &matched_filter, "image"_a, "psf"_a, "variance"_a,
         "Match-filtered score image (per-pixel S/N map). variance must be a "
         "same-shape float32 image of per-pixel noise variance.");
+  m.def("drain_timing", &timing_dict,
+        "Drain accumulated DELTA_TIMING sub-stage timers into a {label: "
+        "seconds} dict (None when timing is disabled). For callers of "
+        "functions that return bare arrays (e.g. matched_filter).");
 }

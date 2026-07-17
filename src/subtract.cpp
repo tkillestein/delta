@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 #include "delta/convolve.hpp"
@@ -16,18 +17,33 @@ namespace delta {
 // consumer was the convolution. The strided sample (stride 7, as before) leaves
 // the fill value, and hence the whole result, bit-for-bit identical to the
 // previous full-frame sanitised copy.
-float reference_fill_value(const ImageF& reference) {
+float reference_fill_value(const ImageViewF& reference) {
   const std::size_t n = reference.size();
   const float* src = reference.data();
   const bool has_mask = reference.has_mask();
-  const MaskType* m = has_mask ? reference.mask().data() : nullptr;
+  const MaskType* m = has_mask ? reference.mask() : nullptr;
 
-  std::vector<float> sample;
-  sample.reserve(n / 7 + 1);
-  for (std::size_t i = 0; i < n; i += 7) {
-    const float v = src[i];
-    if (std::isfinite(v) && !(has_mask && m[i] != kMaskGood)) sample.push_back(v);
+  // Chunked threaded gather; the order statistic depends only on the sample
+  // multiset, so this stays value-identical to the serial stride-7 scan.
+  const std::size_t nsamp = (n + 6) / 7;  // indices i = 7*j
+  constexpr int kChunks = 64;
+  std::vector<std::vector<float>> parts(kChunks);
+#pragma omp parallel for schedule(static)
+  for (int c = 0; c < kChunks; ++c) {
+    const std::size_t j0 = nsamp * c / kChunks;
+    const std::size_t j1 = nsamp * (c + 1) / kChunks;
+    std::vector<float>& part = parts[c];
+    part.reserve(j1 - j0);
+    for (std::size_t j = j0; j < j1; ++j) {
+      const float v = src[7 * j];
+      if (std::isfinite(v) && !(has_mask && m[7 * j] != kMaskGood))
+        part.push_back(v);
+    }
   }
+  std::vector<float> sample;
+  sample.reserve(nsamp);
+  for (const auto& part : parts)
+    sample.insert(sample.end(), part.begin(), part.end());
   if (sample.empty()) return 0.0f;
   std::nth_element(sample.begin(), sample.begin() + sample.size() / 2,
                    sample.end());
@@ -51,9 +67,12 @@ Eigen::MatrixXd coeff_matrix(const Eigen::Ref<const Eigen::VectorXd>& theta,
 // output pixel is the bitwise-OR of its neighbours within +/- r along that axis.
 // This is the exact same footprint as the naive nested-box fill but runs in
 // O(N r) instead of O(N r^2), and preserves which flag bits were set.
-void dilate_mask(std::vector<MaskType>& mask, int w, int h, int r) {
+void dilate_mask(MaskType* mask, int w, int h, int r) {
   if (r <= 0) return;
-  std::vector<MaskType> tmp(mask.size(), kMaskGood);
+  const std::size_t n = static_cast<std::size_t>(w) * h;
+  // Fully overwritten by the x-pass below, so skip the zero-fill a vector
+  // would pay (same rationale as SpatialFields).
+  const std::unique_ptr<MaskType[]> tmp(new MaskType[n]);
   // x-pass: mask -> tmp. Each output row reads only its own input row, and the
   // y-pass reads a +/-r band of `tmp` it never writes, so both passes are
   // row-independent -- thread them (this O(N r) dilation is the last sizeable
@@ -407,7 +426,7 @@ SpatialFields evaluate_fields(const ThinPlateBasis& spatial,
   return out;
 }
 
-ImageF subtract(const ImageF& science, const ImageF& reference,
+ImageF subtract(const ImageViewF& science, const ImageViewF& reference,
                 const ThinPlateBasis& spatial,
                 const Eigen::Ref<const Eigen::VectorXd>& theta,
                 const GaussHermiteBasis& basis, double saturation) {
@@ -436,7 +455,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     return reference_fill_value(reference);
   }();
   const bool ref_has_mask = reference.has_mask();
-  const MaskType* ref_mask = ref_has_mask ? reference.mask().data() : nullptr;
+  const MaskType* ref_mask = ref_has_mask ? reference.mask() : nullptr;
   const int hh = static_cast<int>(h);
   const int ww = static_cast<int>(w);
 
@@ -639,7 +658,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       // For a spatially constant field every tile yields the same K, so the result
       // is identical to the exact expansion; for a varying field it is a per-tile
       // piecewise-constant approximation of the (slowly varying) coefficient maps.
-      const std::vector<float>& vr = reference.variance();
+      const float* vr = reference.variance();
       const int ks = basis.ksize();
       const int rk = basis.radius();
       // A tile takes the flat-Var(R) shortcut when its window's relative spread is
@@ -738,7 +757,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
               wmax = std::max(wmax, 0.0f);
               continue;
             }
-            const float* vrow = vr.data() + static_cast<std::size_t>(gy) * w;
+            const float* vrow = vr + static_cast<std::size_t>(gy) * w;
             for (int ix = 0; ix < iww; ++ix) {
               const int gx = bx - rk + ix;
               const float v = (gx < 0 || gx >= ww) ? 0.0f : vrow[gx];
@@ -798,7 +817,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       }
     }
     if (science.has_variance()) {
-      const std::vector<float>& vs = science.variance();
+      const float* vs = science.variance();
 #pragma omp parallel for schedule(static)
       for (std::size_t i = 0; i < var.size(); ++i) var[i] += vs[i];
     }
@@ -811,67 +830,80 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     std::vector<MaskType>& out = diff.mask();
     const int r = basis.radius();
 
-    // Science mask propagates one-to-one.
-    if (science.has_mask()) {
-      const std::vector<MaskType>& sm = science.mask();
-      for (std::size_t i = 0; i < out.size(); ++i) out[i] |= sm[i];
-    }
-    // Reference mask is dilated by the kernel half-width: a bad reference pixel
-    // contaminates every output pixel within the kernel footprint (separable
-    // OR-dilation; same footprint as a nested box fill, far cheaper).
-    if (reference.has_mask()) {
-      std::vector<MaskType> grown = reference.mask();
-      dilate_mask(grown, ww, hh, r);
-      for (std::size_t i = 0; i < out.size(); ++i) out[i] |= grown[i];
-    }
+    const std::size_t npix = out.size();
+    const bool has_sm = science.has_mask();
+    const bool has_rm = reference.has_mask();
+    const bool has_sat = saturation > 0.0;
+    const MaskType* sm = has_sm ? science.mask() : nullptr;
+    const MaskType* rm = has_rm ? reference.mask() : nullptr;
+    const float sat = static_cast<float>(saturation);
+    const float* rd = reference.data();
+    const float* sd = science.data();
+
     // `exact_bad` records the un-dilated pixels whose difference value is truly
     // garbage (no valid input data, or non-linear), as opposed to pixels merely
     // flagged by mask *growth*. Only these exact pixels are overwritten; the grown
     // footprint is preserved (see the resolution loop below).
-    std::vector<char> exact_bad(out.size(), 0);
+    //
+    // Everything below is bitwise-OR / flag writes, so the former one-pass-per-
+    // source layout (science union, reference union, saturation build, two
+    // exact_bad scans -- five serial full-frame sweeps plus two dilations) fuses
+    // into a single threaded pass with one combined dilation, bit-identically:
+    //  - science-side flags (input science mask, saturated *science* pixels)
+    //    propagate 1:1 into `out`;
+    //  - reference-side flags (input reference mask, saturated *reference*
+    //    pixels, which contaminate a whole kernel footprint once convolved)
+    //    collect into `grow_src` and dilate by the kernel half-width. OR-
+    //    dilation acts on each flag bit independently, so one dilation of the
+    //    combined layer equals the two per-layer dilations OR'd together.
+    // Buffers are fully written by the fused pass, so allocate uninitialised.
+    const std::unique_ptr<char[]> exact_bad(new char[npix]);
+    const bool need_grow = has_rm || has_sat;
+    std::unique_ptr<MaskType[]> grow_src;
+    if (need_grow) grow_src.reset(new MaskType[npix]);
 
-    // Bright/saturated cores are non-linear and never match the model; flag them
-    // so their large residual stays out of the difference (SPEC §3.6). A saturated
-    // *reference* (convolved) pixel contaminates a whole kernel footprint, so it
-    // is grown by the kernel radius; a saturated *science* (target) pixel is not
-    // convolved, so it propagates one-to-one -- growing it too is what produced
-    // the oversized boxes around every bright star.
-    if (saturation > 0.0) {
-      const float sat = static_cast<float>(saturation);
-      const float* rd = reference.data();
-      const float* sd = science.data();
-      std::vector<MaskType> hot(out.size(), kMaskGood);
-      for (std::size_t i = 0; i < out.size(); ++i)
-        if (rd[i] >= sat) hot[i] = kMaskSaturated;
-      dilate_mask(hot, ww, hh, r);
-      for (std::size_t i = 0; i < out.size(); ++i) {
-        if (sd[i] >= sat) hot[i] |= kMaskSaturated;  // target pixel: 1:1
-        if (rd[i] >= sat || sd[i] >= sat) exact_bad[i] = 1;
-        out[i] |= hot[i];
+#pragma omp parallel for schedule(static)
+    for (std::size_t i = 0; i < npix; ++i) {
+      MaskType direct = kMaskGood;  // science-side: propagates 1:1
+      MaskType grow = kMaskGood;    // reference-side: dilated below
+      char eb = 0;
+      if (has_sm && sm[i] != kMaskGood) {
+        direct |= sm[i];
+        eb = 1;
       }
+      if (has_rm && rm[i] != kMaskGood) {
+        grow |= rm[i];
+        eb = 1;
+      }
+      if (has_sat) {
+        // Bright/saturated cores are non-linear and never match the model; flag
+        // them so their large residual stays out of the difference (SPEC §3.6).
+        // Growing the *science* (target, unconvolved) side too is what produced
+        // the oversized boxes around every bright star.
+        if (rd[i] >= sat) {
+          grow |= kMaskSaturated;
+          eb = 1;
+        }
+        if (sd[i] >= sat) {
+          direct |= kMaskSaturated;
+          eb = 1;
+        }
+      }
+      out[i] |= direct;
+      if (need_grow) grow_src[i] = grow;
+      exact_bad[i] = eb;
     }
-    // No-overlap / no-data pixels: a location directly flagged in the *input*
-    // science or reference mask has no valid science-template overlap there, so
-    // its difference is meaningless (typically a huge value at the registered
-    // frame border). These are exact (un-dilated) bad pixels -- the reference
-    // mask's dilated footprint is handled separately above and is preserved.
-    if (science.has_mask()) {
-      const std::vector<MaskType>& sm = science.mask();
-      for (std::size_t i = 0; i < out.size(); ++i)
-        if (sm[i] != kMaskGood) exact_bad[i] = 1;
-    }
-    if (reference.has_mask()) {
-      const std::vector<MaskType>& rm = reference.mask();
-      for (std::size_t i = 0; i < out.size(); ++i)
-        if (rm[i] != kMaskGood) exact_bad[i] = 1;
-    }
+    if (need_grow) dilate_mask(grow_src.get(), ww, hh, r);
+
     // Edge border of one kernel half-width, and any non-finite difference pixel
     // (also garbage, so it joins the exact-fill set). The non-finite scan reads
-    // the whole float difference, so thread it over rows (each row independent).
+    // the whole float difference, so thread it over rows (each row independent);
+    // the dilated reference-side footprint folds into the same pass.
 #pragma omp parallel for schedule(static)
     for (int y = 0; y < hh; ++y) {
       for (int x = 0; x < ww; ++x) {
         const std::size_t i = static_cast<std::size_t>(y) * w + x;
+        if (need_grow) out[i] |= grow_src[i];
         if (x < r || x >= ww - r || y < r || y >= hh - r)
           out[i] |= kMaskEdge;
         if (!std::isfinite(diff.data()[i])) {
@@ -881,15 +913,31 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
       }
     }
     // Background median of the good difference, for filling the garbage pixels.
+    // The stride-7 gather is chunked over threads (the order statistic depends
+    // only on the sample multiset, so the parallel gather is value-identical);
+    // the same stride keeps the fill bit-identical to the serial scan.
     float fill = 0.0f;
     const bool has_var = diff.has_variance();
     float* dd = diff.data();
     float* vv = has_var ? diff.variance().data() : nullptr;
     {
+      const std::size_t nsamp = (npix + 6) / 7;  // indices i = 7*j
+      constexpr int kChunks = 64;
+      std::vector<std::vector<float>> parts(kChunks);
+#pragma omp parallel for schedule(static)
+      for (int c = 0; c < kChunks; ++c) {
+        const std::size_t j0 = nsamp * c / kChunks;
+        const std::size_t j1 = nsamp * (c + 1) / kChunks;
+        std::vector<float>& part = parts[c];
+        part.reserve(j1 - j0);
+        for (std::size_t j = j0; j < j1; ++j) {
+          const std::size_t i = 7 * j;
+          if (out[i] == kMaskGood && std::isfinite(dd[i])) part.push_back(dd[i]);
+        }
+      }
       std::vector<float> good;
-      good.reserve(out.size() / 7 + 1);
-      for (std::size_t i = 0; i < out.size(); i += 7)
-        if (out[i] == kMaskGood && std::isfinite(dd[i])) good.push_back(dd[i]);
+      good.reserve(nsamp);
+      for (const auto& part : parts) good.insert(good.end(), part.begin(), part.end());
       if (!good.empty()) {
         std::nth_element(good.begin(), good.begin() + good.size() / 2, good.end());
         fill = good[good.size() / 2];
@@ -903,6 +951,7 @@ ImageF subtract(const ImageF& science, const ImageF& reference,
     // preserved so PSF wings and transients close to bright stars / mask edges
     // stay assessable. (Setting the whole grown footprint to a constant boxed out
     // exactly those wings.) Filled pixels remain masked -- the value is cosmetic.
+#pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < out.size(); ++i) {
       if (out[i] == kMaskGood) continue;
       if (exact_bad[i]) {

@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "delta/timing.hpp"
+
 namespace delta {
 
 namespace {
@@ -195,7 +197,7 @@ std::vector<float> local_kernel(const ThinPlateBasis& spatial,
 // regions and the frame edge. The median is immune to a minority of fill pixels
 // and is also a cleaner white-noise level estimate than the mean (which sources
 // and the sentinel both bias high).
-double block_variance(const ImageF& var, int bx, int by, int block, int w,
+double block_variance(const ImageViewF& var, int bx, int by, int block, int w,
                       int h) {
   // The block noise level is a single robust scalar over thousands of pixels;
   // a regular subsample of the block estimates the same median to far better
@@ -223,10 +225,10 @@ double block_variance(const ImageF& var, int bx, int by, int block, int w,
 
 }  // namespace
 
-ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
+ImageF decorrelate(const ImageViewF& difference, const ThinPlateBasis& spatial,
                    const Eigen::Ref<const Eigen::VectorXd>& theta,
-                   const GaussHermiteBasis& basis, const ImageF& var_science,
-                   const ImageF& var_reference, int block,
+                   const GaussHermiteBasis& basis, const ImageViewF& var_science,
+                   const ImageViewF& var_reference, int block,
                    int kernel_cell_blocks) {
   const int w = static_cast<int>(difference.width());
   const int h = static_cast<int>(difference.height());
@@ -318,6 +320,8 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
   // central block. Built up front (one FFT per cell) over the thread team.
   std::vector<double> cell_power(static_cast<std::size_t>(ncell) * nspec);
   std::vector<double> cell_sumk2(ncell);
+  {
+    DELTA_TIME("decorrelate: kernel-power cache");
 #pragma omp parallel
   {
     Fft2d fft(block);
@@ -337,6 +341,7 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       for (float v : kern) sumk2 += static_cast<double>(v) * v;
       cell_sumk2[ci] = sumk2;
     }
+  }
   }
 
   struct BlockJob {
@@ -369,6 +374,8 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       if (y >= 0 && y < h) wy_total[y] += hwin[iy];
     }
 
+  {
+    DELTA_TIME("decorrelate: block filter+blend");
 #pragma omp parallel
   {
     Fft2d fft(block);
@@ -446,28 +453,32 @@ ImageF decorrelate(const ImageF& difference, const ThinPlateBasis& spatial,
       }
     }
   }
+  }
 
-  ImageF out(w, h);
-  out.allocate_variance();
-  std::vector<float>& out_var = out.variance();
+  // Normalise in place and adopt the accumulators as the output buffers: a
+  // separate output pair cost two more full-frame allocations, their
+  // zero-fills, and the first-touch page faults, all immediately overwritten.
+  {
+    DELTA_TIME("decorrelate: normalise");
 #pragma omp parallel for schedule(static)
-  for (int y = 0; y < h; ++y) {
-    const double wy = wy_total[y];
-    const float* arow = acc.data() + static_cast<std::size_t>(y) * w;
-    const float* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
-    float* orow = out.data() + static_cast<std::size_t>(y) * w;
-    float* ovrow = out_var.data() + static_cast<std::size_t>(y) * w;
-    for (int x = 0; x < w; ++x) {
-      const double wsum = wy * wx_total[x];
-      if (wsum > 0.0) {
-        orow[x] = static_cast<float>(arow[x] / wsum);
-        ovrow[x] = static_cast<float>(vrow[x] / wsum);
-      } else {
-        orow[x] = 0.0f;
-        ovrow[x] = 0.0f;
+    for (int y = 0; y < h; ++y) {
+      const double wy = wy_total[y];
+      float* arow = acc.data() + static_cast<std::size_t>(y) * w;
+      float* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
+      for (int x = 0; x < w; ++x) {
+        const double wsum = wy * wx_total[x];
+        if (wsum > 0.0) {
+          arow[x] = static_cast<float>(arow[x] / wsum);
+          vrow[x] = static_cast<float>(vrow[x] / wsum);
+        } else {
+          arow[x] = 0.0f;
+          vrow[x] = 0.0f;
+        }
       }
     }
   }
+  ImageF out(w, h, std::move(acc));
+  out.variance() = std::move(var_acc);
   return out;
 }
 
@@ -521,8 +532,8 @@ std::vector<float> whiten_psf(const std::vector<float>& psf, int psf_size,
   return out;
 }
 
-ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
-                      int psf_size, const ImageF& variance) {
+ImageF matched_filter(const ImageViewF& image, const std::vector<float>& psf,
+                      int psf_size, const ImageViewF& variance) {
   if (static_cast<int>(psf.size()) != psf_size * psf_size)
     throw std::runtime_error("matched_filter: psf size mismatch");
   const int w = static_cast<int>(image.width());
@@ -536,6 +547,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
   float sumpsf2 = 0.0f;
   for (float v : psf) sumpsf2 += v * v;
 
+  DELTA_TIME("score: blocked correlation");
   ImageF out(w, h);
 
   // Cache-blocked correlation: out(x) = (1/norm(x)) sum_u psf(u) image(x+u).
@@ -619,7 +631,7 @@ ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
   return out;
 }
 
-ImageF matched_filter(const ImageF& image, const std::vector<float>& psf,
+ImageF matched_filter(const ImageViewF& image, const std::vector<float>& psf,
                       int psf_size, double noise_var) {
   const int w = static_cast<int>(image.width());
   const int h = static_cast<int>(image.height());

@@ -701,11 +701,16 @@ class Subtractor:
                     )
                 whitened = dec["difference"]
                 white_var = dec["variance"]
+                _log_core_timings(dec.get("timing"))
                 # Propagate any raw-Var(D) rescale onto the whitened noise level:
                 # vs/vr mis-scaling that forced variance_scale on Var(D) applies
                 # equally to σ_D² = vs + vr ΣK².
                 if variance_scale is not None:
-                    white_var = white_var * variance_scale
+                    # In place: white_var is the C++-owned buffer moved out of
+                    # decorrelate, not caller-visible, so no full-frame
+                    # temporary is needed (unlike the input `variance` above,
+                    # which may view the caller's array).
+                    white_var *= variance_scale
             else:
                 logger.warning("decorrelation requested but no variance available; skipping")
 
@@ -742,6 +747,10 @@ class Subtractor:
                     fallback = float(np.var(whitened))
                     score_var = np.full(whitened.shape, fallback, dtype=np.float32)
                 score = _core.matched_filter(whitened, psf, score_var)
+            # matched_filter returns a bare array, so drain its DELTA_TIMING
+            # sub-stage timers explicitly (fit/subtract/decorrelate attach
+            # theirs to their result dicts).
+            _log_core_timings(_core.drain_timing())
 
         out_diff = whitened
         # When decorrelated, return the post-whitening variance so difference and

@@ -62,7 +62,7 @@ struct KernelFit {
 // selects lambda by k-fold *group* cross-validation that holds out whole stamps
 // (folds = stamp index mod cv_folds). Group CV respects the within-stamp pixel
 // correlation that makes GCV under-smooth and over-fit the spatial field.
-KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
+KernelFit fit_kernel(const ImageViewF& science, const ImageViewF& reference,
                      const ThinPlateBasis& spatial,
                      const GaussHermiteBasis& basis,
                      const std::vector<int>& stamp_x,

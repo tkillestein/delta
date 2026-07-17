@@ -139,6 +139,19 @@ ill-conditioned thin-plate `M`, the spectral GCV curve misranks λ — up to
 ~400× curve error on a P=704 probe; see the NOTE in `solve.cpp`), and
 **nanobind LTO measured ±1.5%** — indistinguishable from run noise.
 
+**The build now defaults to `-march=x86-64-v3`** (AVX2 + FMA; Haswell 2013+ /
+Excavator 2015+, skipped automatically on non-x86 targets). On the same 4-core
+host this took the 8000×6000 wall from 6.29 → **4.26 s** (model convolve and
+score roughly halved — these loops were written to vectorise and the SSE2
+baseline was the limiter), i.e. **1.96× cumulative** over the pre-pass code.
+`DELTA_X86_64_V3=OFF` restores the SSE2 baseline for pre-2013 CPUs;
+`DELTA_NATIVE=ON` still supersedes both for host-tuned builds (AVX-512 etc.).
+Unlike the rest of the pass this shifts float rounding (~1 ulp, FMA
+contraction); the full suite passes unchanged. The decorrelate output pair is
+also now adopted from the overlap-add accumulators (no fresh full-frame
+allocation), and `catalog` is attributed as its own benchmark stage instead of
+landing in "other".
+
 Two findings fall straight out of the splits:
 
 - **`noise decorrelation` is now the single tallest stage (~25%)**, ahead of `model

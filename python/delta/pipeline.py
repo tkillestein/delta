@@ -704,7 +704,11 @@ class Subtractor:
                 # vs/vr mis-scaling that forced variance_scale on Var(D) applies
                 # equally to σ_D² = vs + vr ΣK².
                 if variance_scale is not None:
-                    white_var = white_var * variance_scale
+                    # In place: white_var is the C++-owned buffer moved out of
+                    # decorrelate, not caller-visible, so no full-frame
+                    # temporary is needed (unlike the input `variance` above,
+                    # which may view the caller's array).
+                    white_var *= variance_scale
             else:
                 logger.warning("decorrelation requested but no variance available; skipping")
 

@@ -71,6 +71,7 @@ STAGES = (
     "full-frame subtraction",
     "noise decorrelation",
     "matched-filter score",
+    "catalog",
 )
 
 # C++ sub-stage timers nested under their parent (emitted only with DELTA_TIMING
@@ -90,6 +91,18 @@ SUBSTAGES = {
         "decorrelate: normalise",
     ),
     "matched-filter score": ("score: blocked correlation",),
+    "catalog": (
+        "catalog: marshal input",
+        "catalog: seed",
+        "catalog: label positive",
+        "catalog: bucket positive",
+        "catalog: summarize positive",
+        "catalog: dipole flag",
+        "catalog: label negative",
+        "catalog: bucket negative",
+        "catalog: summarize negative",
+        "catalog: marshal output",
+    ),
 }
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"

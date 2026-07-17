@@ -455,28 +455,30 @@ ImageF decorrelate(const ImageViewF& difference, const ThinPlateBasis& spatial,
   }
   }
 
-  ImageF out(w, h);
-  out.allocate_variance();
-  std::vector<float>& out_var = out.variance();
-  DELTA_TIME("decorrelate: normalise");
+  // Normalise in place and adopt the accumulators as the output buffers: a
+  // separate output pair cost two more full-frame allocations, their
+  // zero-fills, and the first-touch page faults, all immediately overwritten.
+  {
+    DELTA_TIME("decorrelate: normalise");
 #pragma omp parallel for schedule(static)
-  for (int y = 0; y < h; ++y) {
-    const double wy = wy_total[y];
-    const float* arow = acc.data() + static_cast<std::size_t>(y) * w;
-    const float* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
-    float* orow = out.data() + static_cast<std::size_t>(y) * w;
-    float* ovrow = out_var.data() + static_cast<std::size_t>(y) * w;
-    for (int x = 0; x < w; ++x) {
-      const double wsum = wy * wx_total[x];
-      if (wsum > 0.0) {
-        orow[x] = static_cast<float>(arow[x] / wsum);
-        ovrow[x] = static_cast<float>(vrow[x] / wsum);
-      } else {
-        orow[x] = 0.0f;
-        ovrow[x] = 0.0f;
+    for (int y = 0; y < h; ++y) {
+      const double wy = wy_total[y];
+      float* arow = acc.data() + static_cast<std::size_t>(y) * w;
+      float* vrow = var_acc.data() + static_cast<std::size_t>(y) * w;
+      for (int x = 0; x < w; ++x) {
+        const double wsum = wy * wx_total[x];
+        if (wsum > 0.0) {
+          arow[x] = static_cast<float>(arow[x] / wsum);
+          vrow[x] = static_cast<float>(vrow[x] / wsum);
+        } else {
+          arow[x] = 0.0f;
+          vrow[x] = 0.0f;
+        }
       }
     }
   }
+  ImageF out(w, h, std::move(acc));
+  out.variance() = std::move(var_acc);
   return out;
 }
 

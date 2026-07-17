@@ -39,6 +39,15 @@ public:
   Image(std::size_t width, std::size_t height, const T* src)
       : width_(width), height_(height), data_(src, src + width * height) {}
 
+  // Adopt an existing buffer (no allocation, no copy, no zero-fill): for
+  // producers that already hold the finished pixels in a vector (e.g. an
+  // accumulator finalised in place) and would otherwise pay a full-frame
+  // zero-initialisation plus a copy to get them into an Image.
+  Image(std::size_t width, std::size_t height, std::vector<T>&& data)
+      : width_(width), height_(height), data_(std::move(data)) {
+    if (data_.size() != width * height) data_.resize(width * height, T{});
+  }
+
   std::size_t width() const { return width_; }
   std::size_t height() const { return height_; }
   std::size_t size() const { return width_ * height_; }

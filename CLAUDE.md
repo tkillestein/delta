@@ -36,10 +36,14 @@ changes do not need a rebuild.
 
 The core is built `-O3` (see `CMakeLists.txt`); the `-O3` is re-asserted after nanobind's
 default `-Os` (last `-O` wins) because `-Os` disables the vectorisation the
-convolution/variance/score hot loops depend on. Host-CPU tuning (`-march=native`) is
-opt-in via `-DDELTA_NATIVE=ON` — it defaults **OFF**, so a plain `uv sync` yields a
-portable binary; the native build is typically 2-4x faster on the hot kernels but SIGILLs
-if run on a different (older/differently-featured) CPU.
+convolution/variance/score hot loops depend on. The ISA baseline defaults to
+**`-march=x86-64-v3`** (AVX2 + FMA; 2013+ CPUs, skipped automatically on non-x86
+targets) — roughly 1.5x wall over the SSE2 baseline since the hot loops vectorise.
+`-DDELTA_X86_64_V3=OFF` restores the fully portable SSE2 baseline; `-DDELTA_NATIVE=ON`
+supersedes both and tunes for the build host (AVX-512 etc.) but SIGILLs on a
+different (older/differently-featured) CPU. `-ffast-math` is deliberately excluded
+(IEEE NaN/inf semantics are load-bearing for `std::isfinite` masking); nanobind LTO
+was measured at noise level and is off (see `benchmarks/PERFORMANCE.md`).
 
 System deps (via `pkg-config`): C++20 compiler, CMake ≥ 3.18, Eigen (≥ 3.4), CFITSIO.
 The FFT is vendored (header-only PocketFFT, `extern/pocketfft`, BSD-3) — no system FFT
@@ -62,7 +66,12 @@ orchestrated by the Python package in `python/delta/`.
 - `spatial` — low-rank thin-plate regression spline: knots, design, bending-energy penalty.
 - `solve` — penalized GLS normal equations (Eigen) + GCV λ selection. The `M = XᵀWX`
   build is threaded over row chunks via symmetric `rankUpdate` on the whitened design,
-  and the λ grid is evaluated in parallel.
+  and the λ grid is evaluated in parallel. The effective dof uses the trace identity
+  `tr(A⁻¹M) = P − λ‖L⁻¹F‖²` (penalty half-factor `System::pen_half`) rather than a full
+  `A⁻¹M` solve. Design-taking variants (`solve_gls_*_design`) let `fit` pass a cached
+  spatial design; the point-based signatures are thin wrappers. Do NOT re-attempt
+  Demmler–Reinsch λ-grid amortisation: measured numerically unsound on realistic
+  ill-conditioned systems (NOTE in `solve.cpp`).
 - `detect` — stamp detection/selection, FWHM and convolution-direction estimation.
 - `subtract` — full-frame model evaluation, difference, variance/mask propagation. The
   model streams each component's y-pass fused into the `aₙ` accumulate (no full `B_n`
@@ -74,8 +83,11 @@ orchestrated by the Python package in `python/delta/`.
   one planless FFT workspace per thread) + match-filter score.
 - `fit` — ties stamps + basis + spatial together into the kernel solve.
 - `timing` — utility (not a SPEC module): opt-in, low-overhead sub-stage timers inside the
-  `fit_kernel` / `subtract` entry points, gated on the `DELTA_TIMING` env var (compiles to a
-  no-op when unset). Splits `B_n` precompute/convolve from the GLS solve and variance passes.
+  `fit_kernel` / `subtract` / `decorrelate` / `matched_filter` / catalog entry points, gated
+  on the `DELTA_TIMING` env var (compiles to a no-op when unset). Timers ride back on the
+  result dicts; `_core.drain_timing()` drains them for bare-array returns
+  (`matched_filter`). `benchmarks/PERFORMANCE.md` documents the profile, the measurement
+  protocol (warm min-of-N via `--reps`), and the negative results.
 
 **Python layer** (`python/delta/`):
 - `pipeline.py` — `Subtractor` class and `subtract()` convenience wrapper. This is the
@@ -115,6 +127,11 @@ solve linear in `θ = {c_nm, b_m}`. `theta` is ordered `[c_0 | … | c_{nc-1} | 
 
 - **Image storage** (`include/delta/image.hpp`): contiguous row-major, `index = y*width + x`.
   `Image<T>` carries optional variance and mask vectors; `ImageF` (float) is the working type.
+  The read-only entry points (`subtract`, `fit_kernel`, `decorrelate`, `matched_filter`) take
+  **`ImageViewF`** — a non-owning view the bindings construct directly on the caller's NumPy
+  buffers (zero-copy; an owning `Image` converts implicitly). Outputs stay owning `ImageF`
+  so their vectors move zero-copy into NumPy via `to_numpy`. Borrow contract: input buffers
+  outlive the call (nanobind guarantees this at the boundary).
 - **Masks** are first-class `uint8` bitmasks (`MaskFlag` enum; `0` = good). Bad pixels are
   excluded from the fit; the reference mask is dilated by the kernel half-width on subtraction.
 - **Convolution direction is auto-selected**: the sharper (narrower-FWHM) image is convolved

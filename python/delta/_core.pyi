@@ -37,6 +37,13 @@ class CatalogResult(TypedDict):
     mask_flags: NDArray[np.uint8]
     is_dipole: NDArray[np.uint8]
     quality: NDArray[np.uint8]
+    psf_chi2: NDArray[np.float64]
+    psf_chi2_dof: NDArray[np.int32]
+    psf_amplitude: NDArray[np.float64]
+    psf_amplitude_err: NDArray[np.float64]
+    shape_consistent: NDArray[np.uint8]
+    bright_star_dist: NDArray[np.float64]
+    near_bright_star: NDArray[np.uint8]
 
 GlsResult = TypedDict(
     "GlsResult",
@@ -190,6 +197,14 @@ def build_catalog(
     aperture_radius: int = ...,
     exclude_bad_pixels: bool = ...,
     return_negative: bool = ...,
+    fit_psf_shape: bool = ...,
+    shape_chi2_tolerance: float = ...,
+    variance: NDArray[np.float32] | None = ...,
+    psf: NDArray[np.float32] | None = ...,
+    bright_star_radius: float = ...,
+    max_shape_fit: int = ...,
+    bright_x: NDArray[np.float64] | None = ...,
+    bright_y: NDArray[np.float64] | None = ...,
 ) -> CatalogResult:
     """Connected-component source catalog from a match-filtered score image (SPEC §3.7)."""
 

@@ -322,13 +322,12 @@ nb::object timing_dict();
 
 // ---- catalog (connected-component source catalog from the score image) ---
 
-delta::CatalogParams make_catalog_params(double threshold_sigma,
-                                         double threshold_sigma_dipole,
-                                         double expected_fwhm,
-                                         double fwhm_tolerance_lo,
-                                         double fwhm_tolerance_hi,
-                                         int aperture_radius,
-                                         bool exclude_bad_pixels) {
+delta::CatalogParams make_catalog_params(
+    double threshold_sigma, double threshold_sigma_dipole,
+    double expected_fwhm, double fwhm_tolerance_lo, double fwhm_tolerance_hi,
+    int aperture_radius, bool exclude_bad_pixels, bool fit_psf_shape,
+    double shape_chi2_tolerance, double bright_star_radius,
+    int max_shape_fit) {
   delta::CatalogParams p;
   p.threshold_sigma = threshold_sigma;
   p.threshold_sigma_dipole = threshold_sigma_dipole;
@@ -337,6 +336,10 @@ delta::CatalogParams make_catalog_params(double threshold_sigma,
   p.fwhm_tolerance_hi = fwhm_tolerance_hi;
   p.aperture_radius = aperture_radius;
   p.exclude_bad_pixels = exclude_bad_pixels;
+  p.fit_psf_shape = fit_psf_shape;
+  p.shape_chi2_tolerance = shape_chi2_tolerance;
+  p.bright_star_radius = bright_star_radius;
+  p.max_shape_fit = max_shape_fit;
   return p;
 }
 
@@ -347,32 +350,75 @@ nb::dict build_catalog(InArray<float> score, InArray<float> difference,
                        double threshold_sigma, double threshold_sigma_dipole,
                        double expected_fwhm, double fwhm_tolerance_lo,
                        double fwhm_tolerance_hi, int aperture_radius,
-                       bool exclude_bad_pixels, bool return_negative) {
+                       bool exclude_bad_pixels, bool return_negative,
+                       bool fit_psf_shape, double shape_chi2_tolerance,
+                       std::optional<InArray<float>> variance,
+                       std::optional<InArray<float>> psf,
+                       double bright_star_radius, int max_shape_fit,
+                       std::optional<InArray1D<double>> bright_x,
+                       std::optional<InArray1D<double>> bright_y) {
   if (difference.shape(0) != score.shape(0) ||
       difference.shape(1) != score.shape(1)) {
     throw std::runtime_error("build_catalog: difference shape must match score");
   }
+  if (variance && (variance->shape(0) != score.shape(0) ||
+                   variance->shape(1) != score.shape(1))) {
+    throw std::runtime_error("build_catalog: variance shape must match score");
+  }
+  if (psf && psf->shape(0) != psf->shape(1)) {
+    throw std::runtime_error("build_catalog: psf must be square");
+  }
+  if (static_cast<bool>(bright_x) != static_cast<bool>(bright_y)) {
+    throw std::runtime_error("build_catalog: supply both bright_x and bright_y, or neither");
+  }
+  if (bright_x && bright_x->shape(0) != bright_y->shape(0)) {
+    throw std::runtime_error("build_catalog: bright_x and bright_y must be the same length");
+  }
+
   delta::timing::clear();
-  delta::ImageF score_img, diff_img;
+  delta::ImageF score_img, diff_img, var_img;
+  std::vector<float> psf_vec;
+  std::vector<double> bx_vec, by_vec;
   {
     DELTA_TIME("catalog: marshal input");
     score_img = make_image(score, mask);
     diff_img = delta::ImageF(difference.shape(1), difference.shape(0), difference.data());
+    if (variance)
+      var_img = delta::ImageF(variance->shape(1), variance->shape(0), variance->data());
+    if (psf) psf_vec.assign(psf->data(), psf->data() + psf->size());
+    if (bright_x) {
+      bx_vec.assign(bright_x->data(), bright_x->data() + bright_x->shape(0));
+      by_vec.assign(bright_y->data(), bright_y->data() + bright_y->shape(0));
+    }
   }
 
   const delta::CatalogParams p = make_catalog_params(
       threshold_sigma, threshold_sigma_dipole, expected_fwhm,
-      fwhm_tolerance_lo, fwhm_tolerance_hi, aperture_radius, exclude_bad_pixels);
+      fwhm_tolerance_lo, fwhm_tolerance_hi, aperture_radius, exclude_bad_pixels,
+      fit_psf_shape, shape_chi2_tolerance, bright_star_radius, max_shape_fit);
+  delta::CatalogAux aux;
+  if (variance) aux.variance = &var_img;
+  if (psf) {
+    aux.psf = &psf_vec;
+    aux.psf_size = static_cast<int>(psf->shape(0));
+  }
+  if (bright_x) {
+    aux.bright_x = &bx_vec;
+    aux.bright_y = &by_vec;
+  }
+
   std::vector<delta::CatalogEntry> entries;
   {
     nb::gil_scoped_release release;
-    entries = delta::build_catalog(score_img, diff_img, p, return_negative);
+    entries = delta::build_catalog(score_img, diff_img, p, return_negative, aux);
   }
 
   const std::size_t n = entries.size();
   std::vector<double> x, y, peak_snr, flux, expected_n_pix, fwhm_ratio;
-  std::vector<std::int32_t> peak_x, peak_y, n_pix;
+  std::vector<std::int32_t> peak_x, peak_y, n_pix, psf_chi2_dof;
   std::vector<std::uint8_t> mask_flags, fwhm_consistent, is_dipole, quality;
+  std::vector<double> psf_chi2, psf_amplitude, psf_amplitude_err, bright_star_dist;
+  std::vector<std::uint8_t> shape_consistent, near_bright_star;
   {
     DELTA_TIME("catalog: marshal output");
     x.reserve(n); y.reserve(n); peak_x.reserve(n); peak_y.reserve(n);
@@ -380,6 +426,9 @@ nb::dict build_catalog(InArray<float> score, InArray<float> difference,
     expected_n_pix.reserve(n); fwhm_ratio.reserve(n);
     mask_flags.reserve(n); fwhm_consistent.reserve(n); is_dipole.reserve(n);
     quality.reserve(n);
+    psf_chi2.reserve(n); psf_chi2_dof.reserve(n); psf_amplitude.reserve(n);
+    psf_amplitude_err.reserve(n); shape_consistent.reserve(n);
+    bright_star_dist.reserve(n); near_bright_star.reserve(n);
     for (const delta::CatalogEntry& e : entries) {
       x.push_back(e.x);
       y.push_back(e.y);
@@ -394,6 +443,13 @@ nb::dict build_catalog(InArray<float> score, InArray<float> difference,
       fwhm_consistent.push_back(e.fwhm_consistent ? 1 : 0);
       is_dipole.push_back(e.is_dipole ? 1 : 0);
       quality.push_back(e.quality);
+      psf_chi2.push_back(e.psf_chi2);
+      psf_chi2_dof.push_back(e.psf_chi2_dof);
+      psf_amplitude.push_back(e.psf_amplitude);
+      psf_amplitude_err.push_back(e.psf_amplitude_err);
+      shape_consistent.push_back(e.shape_consistent ? 1 : 0);
+      bright_star_dist.push_back(e.bright_star_dist);
+      near_bright_star.push_back(e.near_bright_star ? 1 : 0);
     }
   }
 
@@ -415,6 +471,13 @@ nb::dict build_catalog(InArray<float> score, InArray<float> difference,
   out["mask_flags"] = to_numpy<std::uint8_t>(std::move(mask_flags), {n});
   out["is_dipole"] = to_numpy<std::uint8_t>(std::move(is_dipole), {n});
   out["quality"] = to_numpy<std::uint8_t>(std::move(quality), {n});
+  out["psf_chi2"] = to_numpy<double>(std::move(psf_chi2), {n});
+  out["psf_chi2_dof"] = to_numpy<std::int32_t>(std::move(psf_chi2_dof), {n});
+  out["psf_amplitude"] = to_numpy<double>(std::move(psf_amplitude), {n});
+  out["psf_amplitude_err"] = to_numpy<double>(std::move(psf_amplitude_err), {n});
+  out["shape_consistent"] = to_numpy<std::uint8_t>(std::move(shape_consistent), {n});
+  out["bright_star_dist"] = to_numpy<double>(std::move(bright_star_dist), {n});
+  out["near_bright_star"] = to_numpy<std::uint8_t>(std::move(near_bright_star), {n});
   out["timing"] = timing;
   return out;
 }
@@ -885,11 +948,19 @@ NB_MODULE(_core, m) {
         "threshold_sigma_dipole"_a = 3.0, "expected_fwhm"_a = 3.5,
         "fwhm_tolerance_lo"_a = 0.3, "fwhm_tolerance_hi"_a = 3.0,
         "aperture_radius"_a = 0, "exclude_bad_pixels"_a = true,
-        "return_negative"_a = false,
+        "return_negative"_a = false, "fit_psf_shape"_a = false,
+        "shape_chi2_tolerance"_a = 3.0, "variance"_a = nb::none(),
+        "psf"_a = nb::none(), "bright_star_radius"_a = 0.0,
+        "max_shape_fit"_a = 5000, "bright_x"_a = nb::none(),
+        "bright_y"_a = nb::none(),
         "Connected-component source catalog from a match-filtered score "
         "image (SPEC §3.7): 8-connected positive/negative blobs, "
         "FWHM-consistency filter, dipole flagging, mask-flag aggregation, "
-        "aperture flux on `difference`.");
+        "aperture flux on `difference`. `fit_psf_shape` (needs `variance` + "
+        "`psf`) adds a per-candidate PSF chi^2 shape fit; `bright_x`/`bright_y` "
+        "add a bright-star proximity flag. Both are opt-in and run only over "
+        "the already-thresholded candidate list (skipped above "
+        "`max_shape_fit` candidates).");
 
   m.def("grid_knots", &delta::grid_knots, "x0"_a, "y0"_a, "x1"_a, "y1"_a,
         "nx"_a, "ny"_a, "Regular nx*ny grid of knots over [x0,x1]x[y0,y1].");

@@ -202,6 +202,13 @@ class DiffResult:
         fwhm_tolerance_hi: float = 3.0,
         aperture_radius: int = 0,
         exclude_bad_pixels: bool = True,
+        fit_psf_shape: bool = False,
+        shape_chi2_tolerance: float = 3.0,
+        bright_x: NDArray | None = None,
+        bright_y: NDArray | None = None,
+        bright_star_radius: float = 0.0,
+        max_shape_fit: int = 5000,
+        polarity: str = "positive",
         as_table: bool = False,
     ):
         """Rebuild the source catalog from `self.score` with custom thresholds
@@ -211,13 +218,28 @@ class DiffResult:
         The expected PSF FWHM is measured from `self.psf` (the stamp built for
         the match filter); requires the originating ``subtract()`` /
         ``Subtractor.subtract()`` call to have used ``score=True``.
+
+        ``fit_psf_shape=True`` adds a per-candidate PSF chi^2 shape fit (using
+        ``self.psf`` and ``self.variance``, so it stays consistent with what
+        the matched filter itself scored with) -- see
+        ``catalog.build_catalog`` for the false-positive rationale.
+        ``bright_x``/``bright_y`` add a bright-star proximity flag; when
+        omitted (the default) they're sourced from ``self.solution.stamp_x``/
+        ``stamp_y`` (the bright stars used for the kernel fit) if available,
+        since that's a free input -- pass empty arrays to opt out.
         """
         if self.score is None or self.psf is None:
             raise ValueError(
                 "build_catalog() requires a score image and PSF stamp; pass score=True "
                 "to subtract()"
             )
+        if fit_psf_shape and self.variance is None:
+            raise ValueError("fit_psf_shape=True requires a variance map (self.variance)")
         from .catalog import build_catalog as _build_catalog
+
+        if bright_x is None and bright_y is None and self.solution is not None:
+            bright_x = self.solution.stamp_x
+            bright_y = self.solution.stamp_y
 
         return _build_catalog(
             self.score,
@@ -230,6 +252,14 @@ class DiffResult:
             fwhm_tolerance_hi=fwhm_tolerance_hi,
             aperture_radius=aperture_radius,
             exclude_bad_pixels=exclude_bad_pixels,
+            fit_psf_shape=fit_psf_shape,
+            shape_chi2_tolerance=shape_chi2_tolerance,
+            variance=self.variance if fit_psf_shape else None,
+            bright_x=bright_x,
+            bright_y=bright_y,
+            bright_star_radius=bright_star_radius,
+            max_shape_fit=max_shape_fit,
+            polarity=polarity,
             as_table=as_table,
         )
 

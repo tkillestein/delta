@@ -33,6 +33,17 @@ built automatically whenever `score=True`; pass `source_catalog=False` to skip
 it, or call `result.build_catalog(...)` to rebuild with custom thresholds.
 `write()` includes it as a `CATALOG` table extension when present.
 
+Two further false-positive checks are opt-in on `result.build_catalog(...)`
+(off by default — they cost real per-candidate work, though only over the
+already-thresholded candidate list, not the frame): `fit_psf_shape=True` fits
+the matched filter's own PSF profile against each candidate for a real shape
+statistic (`psf_chi2`/`shape_consistent`) instead of the pixel-count-based
+FWHM check alone; `bright_x`/`bright_y` (auto-sourced from the fit's own
+bright stars when omitted) flag candidates near bright-star residuals
+(`near_bright_star`). `polarity="negative"`/`"both"` builds a
+fading-transient or merged catalog. See `delta.catalog.build_catalog` for the
+full false-positive rationale (threshold choice, trials factor).
+
 `delta.subtract` auto-detects PSF-matching stamps, measures the seeing in both
 frames, and convolves the sharper image to match the broader one — the convolution
 direction is recorded in `result.solution.direction` (`"reference"` or `"science"`)

@@ -464,12 +464,144 @@ std::vector<std::uint8_t> flag_dipole_positives(
 // the rare frame with one outsized blended component.
 constexpr int kComponentChunk = 32;
 
+// Weighted 1-parameter fit of `psf` against the pixels around (cx, cy):
+// amplitude, its formal error, and chi^2/dof against the null hypothesis
+// "this candidate is a scaled copy of the reference PSF profile". Two small
+// passes over a fixed psf_size x psf_size window (pixel-grid-aligned on the
+// rounded centroid, no subpixel registration) -- accumulate the rank-1 normal
+// equations, solve for amplitude, then accumulate chi^2 against the fitted
+// model. Pixels outside the frame, masked bad, non-finite, or with
+// non-positive variance are skipped. Returns false (leaving `out` untouched)
+// with fewer than 3 usable pixels, too few to trust a chi^2.
+bool fit_psf_shape(const ImageF& difference, const ImageF& variance,
+                   const ImageF& score, double cx, double cy,
+                   const std::vector<float>& psf, int psf_size,
+                   CatalogEntry& out) {
+  const int w = static_cast<int>(difference.width());
+  const int h = static_cast<int>(difference.height());
+  const int r = psf_size / 2;
+  const int x0 = static_cast<int>(std::lround(cx));
+  const int y0 = static_cast<int>(std::lround(cy));
+  const bool has_mask = score.has_mask();
+  const float* d_data = difference.data();
+  const float* v_data = variance.data();
+
+  double sum_wdp = 0.0, sum_wpp = 0.0;
+  int n_used = 0;
+  for (int dy = -r; dy <= r; ++dy) {
+    const int yy = y0 + dy;
+    if (yy < 0 || yy >= h) continue;
+    for (int dx = -r; dx <= r; ++dx) {
+      const int xx = x0 + dx;
+      if (xx < 0 || xx >= w) continue;
+      const std::size_t idx = static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xx);
+      if (has_mask && score.mask()[idx] != kMaskGood) continue;
+      const float v = v_data[idx];
+      const float d = d_data[idx];
+      if (!(v > 0.0f) || !is_finite(v) || !is_finite(d)) continue;
+      const float p = psf[static_cast<std::size_t>(dy + r) * static_cast<std::size_t>(psf_size) + static_cast<std::size_t>(dx + r)];
+      const double wgt = 1.0 / static_cast<double>(v);
+      sum_wdp += wgt * static_cast<double>(d) * p;
+      sum_wpp += wgt * static_cast<double>(p) * p;
+      ++n_used;
+    }
+  }
+  if (n_used < 3 || !(sum_wpp > 0.0)) return false;
+
+  const double amplitude = sum_wdp / sum_wpp;
+  double chi2 = 0.0;
+  for (int dy = -r; dy <= r; ++dy) {
+    const int yy = y0 + dy;
+    if (yy < 0 || yy >= h) continue;
+    for (int dx = -r; dx <= r; ++dx) {
+      const int xx = x0 + dx;
+      if (xx < 0 || xx >= w) continue;
+      const std::size_t idx = static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xx);
+      if (has_mask && score.mask()[idx] != kMaskGood) continue;
+      const float v = v_data[idx];
+      const float d = d_data[idx];
+      if (!(v > 0.0f) || !is_finite(v) || !is_finite(d)) continue;
+      const float p = psf[static_cast<std::size_t>(dy + r) * static_cast<std::size_t>(psf_size) + static_cast<std::size_t>(dx + r)];
+      const double resid = static_cast<double>(d) - amplitude * static_cast<double>(p);
+      chi2 += resid * resid / static_cast<double>(v);
+    }
+  }
+
+  out.psf_amplitude = amplitude;
+  out.psf_amplitude_err = std::sqrt(1.0 / sum_wpp);
+  out.psf_chi2 = chi2;
+  out.psf_chi2_dof = n_used - 1;
+  return true;
+}
+
+// Euclidean distance (px) from (x, y) to the nearest of (bx, by), or +inf
+// for an empty list. Brute force: bright-star lists are the fit's stamp
+// count (<= a few hundred by default), so a spatial index would cost more
+// to build than it saves.
+double nearest_bright_star_dist(double x, double y,
+                                const std::vector<double>& bx,
+                                const std::vector<double>& by) {
+  double best2 = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i < bx.size(); ++i) {
+    const double dx = x - bx[i];
+    const double dy = y - by[i];
+    const double d2 = dx * dx + dy * dy;
+    if (d2 < best2) best2 = d2;
+  }
+  return std::sqrt(best2);
+}
+
+// Per-candidate enrichment: PSF-shape chi^2 fit and bright-star proximity
+// (both opt-in via `aux`/`params.fit_psf_shape`). Runs only over `entries`
+// (the already-thresholded candidate list), never the frame, and is skipped
+// entirely above `params.max_shape_fit` entries -- a mis-set threshold_sigma
+// or a broken frame turning "hundreds of candidates" into "hundreds of
+// thousands" should not silently turn a cheap per-candidate pass into a
+// full-frame-sized one.
+void enrich_entries(std::vector<CatalogEntry>& entries,
+                    const ImageF& difference, const ImageF& score,
+                    const CatalogParams& params, const CatalogAux& aux) {
+  if (entries.empty()) return;
+  if (entries.size() > static_cast<std::size_t>(std::max(0, params.max_shape_fit))) return;
+
+  const bool do_shape =
+      params.fit_psf_shape && aux.psf != nullptr && aux.variance != nullptr && aux.psf_size > 0;
+  const bool do_bright =
+      aux.bright_x != nullptr && aux.bright_y != nullptr && !aux.bright_x->empty();
+  if (!do_shape && !do_bright) return;
+
+  const double bright_radius =
+      params.bright_star_radius > 0.0 ? params.bright_star_radius : 3.0 * params.expected_fwhm;
+  const int n = static_cast<int>(entries.size());
+
+#pragma omp parallel for schedule(dynamic, kComponentChunk) if (n > 1)
+  for (int i = 0; i < n; ++i) {
+    CatalogEntry& e = entries[static_cast<std::size_t>(i)];
+    if (do_shape) {
+      const bool ok = fit_psf_shape(difference, *aux.variance, score, e.x, e.y,
+                                    *aux.psf, aux.psf_size, e);
+      if (ok) {
+        e.shape_consistent = e.psf_chi2_dof > 0
+                                 ? (e.psf_chi2 / e.psf_chi2_dof <= params.shape_chi2_tolerance)
+                                 : true;
+        if (!e.shape_consistent) e.quality |= 1u << 3;
+      }
+    }
+    if (do_bright) {
+      e.bright_star_dist = nearest_bright_star_dist(e.x, e.y, *aux.bright_x, *aux.bright_y);
+      e.near_bright_star = e.bright_star_dist <= bright_radius;
+      if (e.near_bright_star) e.quality |= 1u << 4;
+    }
+  }
+}
+
 }  // namespace
 
 std::vector<CatalogEntry> build_catalog(const ImageF& score,
                                         const ImageF& difference,
                                         const CatalogParams& params,
-                                        bool return_negative) {
+                                        bool return_negative,
+                                        const CatalogAux& aux) {
   const int w = static_cast<int>(score.width());
   const int h = static_cast<int>(score.height());
 
@@ -515,7 +647,11 @@ std::vector<CatalogEntry> build_catalog(const ImageF& score,
     }
   }
 
-  if (!return_negative) return pos_entries;
+  if (!return_negative) {
+    DELTA_TIME("catalog: enrich");
+    enrich_entries(pos_entries, difference, score, params, aux);
+    return pos_entries;
+  }
 
   LabelResult neg_lr;
   { DELTA_TIME("catalog: label negative"); neg_lr = label_components(neg_seed, w, h); }
@@ -532,6 +668,30 @@ std::vector<CatalogEntry> build_catalog(const ImageF& score,
           summarize_component(neg_buckets.flat.data() + off, cnt, score, difference,
                               neg_lr.labels, lbl, w, h, -1, params);
     }
+  }
+  // Symmetric counterpart of the positive-side dipole flagging above: a
+  // negative component touching/enclosing a positive-threshold pixel is
+  // exactly as much bad-subtraction evidence as the reverse, but was
+  // previously left unflagged (`is_dipole` defaults false and only the
+  // positive pass ever set it) -- silently misleading once callers can see
+  // both polarities side by side (`polarity="both"`), since a genuine dipole
+  // pair would show `is_dipole` true on one row and false on the other.
+  // `flag_dipole_positives` is polarity-agnostic (just "labels touched by a
+  // boolean seed mask"), so it's reused here with the roles swapped.
+  {
+    DELTA_TIME("catalog: dipole flag");
+    const std::vector<std::uint8_t> touched =
+        flag_dipole_positives(pos_seed, neg_lr.labels, neg_lr.n_components, w, h);
+#pragma omp parallel for schedule(static) if (neg_lr.n_components > 1)
+    for (int lbl = 1; lbl <= neg_lr.n_components; ++lbl) {
+      CatalogEntry& e = neg_entries[static_cast<std::size_t>(lbl - 1)];
+      e.is_dipole = touched[static_cast<std::size_t>(lbl)] != 0;
+      if (e.is_dipole) e.quality |= 1u << 1;
+    }
+  }
+  {
+    DELTA_TIME("catalog: enrich");
+    enrich_entries(neg_entries, difference, score, params, aux);
   }
   return neg_entries;
 }

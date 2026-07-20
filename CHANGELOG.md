@@ -12,6 +12,21 @@ All notable changes to this project are documented here. The format is based on
 - Connected-component source catalog (`build_catalog`) from the match-filtered
   score image, with FWHM-consistency filtering, dipole flagging, and mask-flag
   aggregation (SPEC §3.7).
+- `build_catalog(fit_psf_shape=True, ...)`: an opt-in per-candidate PSF chi²
+  shape fit (reusing the matched filter's own PSF profile), giving a real
+  shape statistic (`psf_chi2`/`psf_chi2_dof`/`shape_consistent`) plus a
+  calibrated flux (`psf_amplitude`/`psf_amplitude_err`) beyond the existing
+  pixel-count-based FWHM check. Runs only over the already-thresholded
+  candidate list, capped at `max_shape_fit` candidates as a guard against
+  pathological frames.
+- `build_catalog(bright_x=..., bright_y=...)`: a bright-star proximity flag
+  (`bright_star_dist`/`near_bright_star`), since subtraction residuals
+  cluster near bright stars beyond what `mask_flags` reaches.
+  `DiffResult.build_catalog()` auto-sources these from
+  `KernelSolution.stamp_x`/`stamp_y` when omitted.
+- `build_catalog(polarity="negative"|"both")`: a negative-transient catalog
+  and a merged both-polarity catalog (with a `sign` column). `is_dipole` is
+  now reported symmetrically across both polarities.
 - Full run provenance (`DLT*` FITS header cards): fit, config, environment,
   and runtime layers, merged by `DiffResult.write()`.
 - A scalar variance rescale so the difference-image reduced chi2 is forced to 1.

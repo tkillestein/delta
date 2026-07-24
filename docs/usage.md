@@ -136,8 +136,9 @@ sources, merged in this order (later overrides earlier on key clashes):
    diagnostics baked into the solution itself.
 2. **Config** — [`Subtractor.config_cards`][delta.Subtractor.config_cards]:
    `DLTSRAD`, `DLTTHSIG`, `DLTMAXST`, `DLTSAT`, `DLTBMASK`, `DLTCLPSG`,
-   `DLTCLPIT`, `DLTMINST`, `DLTCVF`, `DLTSSCL`, `DLTDECOR`, `DLTSCORE`,
-   `DLTSCAT`, `DLTBLK` — the `Subtractor` knobs not already captured by the fit.
+   `DLTCLPIT`, `DLTMINST`, `DLTCVF`, `DLTSSCL`, `DLTMSPK`, `DLTFITBG`,
+   `DLTDECOR`, `DLTSCORE`, `DLTSCAT`, `DLTBLK` — the `Subtractor` knobs not
+   already captured by the fit.
 3. **Environment** — `delta._provenance.environment_cards()`: `DLTVERS`
    (delta version), `DLTGITC` (short git commit of the running checkout, or
    `"unknown"` outside one), `DLTPYVER`, `DLTHOST`, `DLTUSER`, `DLTPLAT`,

@@ -55,6 +55,13 @@ struct KernelFit {
 // selects lambda by k-fold *group* cross-validation that holds out whole stamps
 // (folds = stamp index mod cv_folds). Group CV respects the within-stamp pixel
 // correlation that makes GCV under-smooth and over-fit the spatial field.
+//
+// `fit_background` (default true) fits the differential-background spatial
+// field jointly with the kernel, as documented above. Set false to skip it
+// entirely (e.g. when the caller's own pipeline already matches sky levels
+// upstream): the returned theta still carries the background block, zeroed,
+// so callers that evaluate the model unconditionally see a zero background
+// field rather than needing to special-case its absence.
 KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
                      const ThinPlateBasis& spatial,
                      const GaussHermiteBasis& basis,
@@ -62,7 +69,8 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
                      const std::vector<int>& stamp_y, int stamp_radius,
                      const std::vector<double>& lambda_grid,
                      double clip_sigma = 4.0, int clip_iterations = 5,
-                     int min_stamps = 5, int cv_folds = 0);
+                     int min_stamps = 5, int cv_folds = 0,
+                     bool fit_background = true);
 
 // Per-pixel photometric scale field m(x,y) = sum_n a_n(x,y) S_n over a
 // (width x height) grid (SPEC §3.3). `component_sums` are the S_n; theta is the

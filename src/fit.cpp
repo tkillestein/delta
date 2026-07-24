@@ -85,7 +85,8 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
                      const std::vector<int>& stamp_x,
                      const std::vector<int>& stamp_y, int stamp_radius,
                      const std::vector<double>& lambda_grid, double clip_sigma,
-                     int clip_iterations, int min_stamps, int cv_folds) {
+                     int clip_iterations, int min_stamps, int cv_folds,
+                     bool fit_background) {
   const std::size_t w = science.width();
   const std::size_t h = science.height();
   if (reference.width() != w || reference.height() != h)
@@ -319,14 +320,14 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
         const Eigen::MatrixXd stamp_design = spatial.design(centroids);  // S x k
         gls = solve_gls_cv_stamped(tgt, wts, bn_mat, stamp_design, stamp_id,
                                    stamp_fold, spatial, lambda_grid, cv_folds,
-                                   warm_start);
+                                   warm_start, fit_background);
       } else {
         // Group folds: pixels inherit their stamp's fold, so whole stamps are
         // held out (leave-stamp-out CV).
         std::vector<int> grp(npix);
         for (int j = 0; j < npix; ++j) grp[j] = pix_stamp[rows[j]] % cv_folds;
         gls = solve_gls_cv(points, tgt, wts, bn_mat, spatial, lambda_grid, grp,
-                           cv_folds, warm_start);
+                           cv_folds, warm_start, fit_background);
       }
       // Recover the selected grid index (min of the CV-error curve; unevaluated
       // entries are +inf) to warm-start the next IRLS pass.
@@ -334,7 +335,8 @@ KernelFit fit_kernel(const ImageF& science, const ImageF& reference,
           std::min_element(gls.gcv_curve.begin(), gls.gcv_curve.end()) -
           gls.gcv_curve.begin());
     } else {
-      gls = solve_gls_gcv(points, tgt, wts, bn_mat, spatial, lambda_grid);
+      gls = solve_gls_gcv(points, tgt, wts, bn_mat, spatial, lambda_grid,
+                         fit_background);
     }
 
     // Model and per-pixel residual under this solution; fields = design * C.

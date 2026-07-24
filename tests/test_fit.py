@@ -86,6 +86,49 @@ def test_fit_kernel_matches_python_assembly():
     )
 
 
+def test_fit_kernel_background_off_matches_python_assembly():
+    # Same replication as test_fit_kernel_matches_python_assembly, but with the
+    # background term dropped from the solve on both sides.
+    h, w, beta, n_max, sr = 64, 64, 2.0, 2, 4
+    rng = np.random.default_rng(1)
+    ref = rng.standard_normal((h, w)).astype(np.float32)
+    sci = rng.standard_normal((h, w)).astype(np.float32)
+    var_s = rng.uniform(0.5, 2.0, (h, w)).astype(np.float32)
+    var_r = rng.uniform(0.5, 2.0, (h, w)).astype(np.float32)
+
+    knots = delta.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, 4, 4)
+    k = knots.shape[0]
+    sx, sy = np.meshgrid(np.arange(12, w - 12, 16), np.arange(12, h - 12, 16))
+    sx = sx.ravel().astype(np.int32)
+    sy = sy.ravel().astype(np.int32)
+    grid = np.logspace(-6, 4, 12)
+
+    fit = delta.fit_kernel(
+        sci,
+        ref,
+        knots,
+        sx,
+        sy,
+        sr,
+        beta,
+        n_max,
+        grid,
+        clip_iterations=0,
+        fit_background=False,
+        science_var=var_s,
+        reference_var=var_r,
+    )
+
+    bn = delta.basis_convolve(ref, beta, n_max)
+    pts, tgt, wts, rows = _gather(sci, ref, bn, sx, sy, sr, var_s, var_r)
+    ref_fit = delta.solve_gls_gcv(knots, pts, tgt, wts, rows, grid, fit_background=False)
+
+    nc = rows.shape[1]
+    assert fit["theta"].shape == ((nc + 1) * k,)
+    np.testing.assert_array_equal(fit["theta"][nc * k :], 0.0)
+    np.testing.assert_allclose(fit["theta"], ref_fit["theta"], rtol=1e-8, atol=1e-8)
+
+
 def test_fit_recovers_noiseless_model_at_stamps():
     # Science built exactly as the model from a known theta -> the fit reproduces
     # it at the stamp pixels (small RSS) at small lambda.

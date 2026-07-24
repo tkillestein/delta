@@ -40,7 +40,7 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
                 const Eigen::Ref<const Eigen::VectorXd>& target,
                 const Eigen::Ref<const Eigen::VectorXd>& weights,
                 const Eigen::Ref<const Eigen::MatrixXd>& bn,
-                const ThinPlateBasis& basis) {
+                const ThinPlateBasis& basis, bool fit_background) {
   const int n = static_cast<int>(points.rows());
   const int nc = static_cast<int>(bn.cols());
   if (target.size() != n || weights.size() != n || bn.rows() != n)
@@ -48,18 +48,20 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
 
   const Eigen::MatrixXd d = basis.design(points);  // N x k
   const int k = static_cast<int>(d.cols());
-  const int p = (nc + 1) * k;
+  const int n_fields = fit_background ? nc + 1 : nc;
+  const int p = n_fields * k;
 
   // Build the pre-whitened design Xs = W^{1/2} X (N x P): each component block is
-  // D scaled row-wise by sqrt(weight) * B_n; the trailing block is sqrt(weight) D.
-  // With Xs the normal equations are M = Xs^T Xs and rhs = Xs^T ds (ds = W^{1/2} d),
-  // so M is a symmetric rank update -- half the FLOPs of the general X^T W X.
+  // D scaled row-wise by sqrt(weight) * B_n; the trailing block (omitted when
+  // fit_background is false) is sqrt(weight) D. With Xs the normal equations are
+  // M = Xs^T Xs and rhs = Xs^T ds (ds = W^{1/2} d), so M is a symmetric rank
+  // update -- half the FLOPs of the general X^T W X.
   const Eigen::ArrayXd sw = weights.array().sqrt();
   Eigen::MatrixXd xs(n, p);
   for (int c = 0; c < nc; ++c)
     xs.block(0, c * k, n, k) =
         (d.array().colwise() * (bn.col(c).array() * sw)).matrix();
-  xs.block(0, nc * k, n, k) = (d.array().colwise() * sw).matrix();
+  if (fit_background) xs.block(0, nc * k, n, k) = (d.array().colwise() * sw).matrix();
   const Eigen::VectorXd ds = (sw * target.array()).matrix();
 
   System s;
@@ -106,11 +108,21 @@ System assemble(const Eigen::Ref<const Eigen::MatrixXd>& points,
   s.ywy = (weights.array() * target.array().square()).sum();
 
   // Penalty unit: the same k x k bending-energy block for every field
-  // (the nc kernel-coefficient fields and the background field).
+  // (the nc kernel-coefficient fields and, when fit, the background field).
   s.p0 = Eigen::MatrixXd::Zero(p, p);
   const Eigen::MatrixXd& pen = basis.penalty();
-  for (int b = 0; b <= nc; ++b) s.p0.block(b * k, b * k, k, k) = pen;
+  for (int b = 0; b < n_fields; ++b) s.p0.block(b * k, b * k, k, k) = pen;
   return s;
+}
+
+// Appends a zero background block so `theta` always has the documented
+// `(nc+1)*k` length, even when fit_background dropped it from the solve --
+// callers reconstruct the model from theta unconditionally, and a zero
+// background field is exactly "no differential background".
+void pad_zero_background(GlsResult& r, int k) {
+  const Eigen::Index old_size = r.theta.size();
+  r.theta.conservativeResize(old_size + k);
+  r.theta.tail(k).setZero();
 }
 
 GlsResult solve_at(const System& s, double lambda) {
@@ -156,8 +168,12 @@ GlsResult solve_gls(const Eigen::Ref<const Eigen::MatrixXd>& points,
                     const Eigen::Ref<const Eigen::VectorXd>& target,
                     const Eigen::Ref<const Eigen::VectorXd>& weights,
                     const Eigen::Ref<const Eigen::MatrixXd>& bn,
-                    const ThinPlateBasis& basis, double lambda) {
-  return solve_at(assemble(points, target, weights, bn, basis), lambda);
+                    const ThinPlateBasis& basis, double lambda,
+                    bool fit_background) {
+  GlsResult r =
+      solve_at(assemble(points, target, weights, bn, basis, fit_background), lambda);
+  if (!fit_background) pad_zero_background(r, r.n_spatial);
+  return r;
 }
 
 GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
@@ -165,11 +181,12 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                         const Eigen::Ref<const Eigen::VectorXd>& weights,
                         const Eigen::Ref<const Eigen::MatrixXd>& bn,
                         const ThinPlateBasis& basis,
-                        const std::vector<double>& lambda_grid) {
+                        const std::vector<double>& lambda_grid,
+                        bool fit_background) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_gcv: lambda_grid is empty");
 
-  const System s = assemble(points, target, weights, bn, basis);
+  const System s = assemble(points, target, weights, bn, basis, fit_background);
 
   // Each lambda is an independent LDLT solve + trace on the shared (read-only)
   // system; evaluate the grid in parallel, then reduce to the GCV-minimising fit.
@@ -190,6 +207,7 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   }
 
   GlsResult best = results[best_i];
+  if (!fit_background) pad_zero_background(best, best.n_spatial);
   best.lambda_grid = lambda_grid;
   best.gcv_curve = std::move(curve);
   return best;
@@ -206,8 +224,10 @@ GlsResult cv_finish(const std::vector<Eigen::MatrixXd>& mf,
                     const std::vector<Eigen::VectorXd>& rf,
                     const std::vector<double>& ysq, int n_groups,
                     const ThinPlateBasis& basis, int n, int nc, int k,
-                    const std::vector<double>& lambda_grid, int warm_start) {
-  const int p = (nc + 1) * k;
+                    const std::vector<double>& lambda_grid, int warm_start,
+                    bool fit_background) {
+  const int n_fields = fit_background ? nc + 1 : nc;
+  const int p = n_fields * k;
 
   // Full-data system (sum of folds) + the block-diagonal bending penalty.
   System s;
@@ -225,7 +245,7 @@ GlsResult cv_finish(const std::vector<Eigen::MatrixXd>& mf,
   }
   s.p0 = Eigen::MatrixXd::Zero(p, p);
   const Eigen::MatrixXd& pen = basis.penalty();
-  for (int b = 0; b <= nc; ++b) s.p0.block(b * k, b * k, k, k) = pen;
+  for (int b = 0; b < n_fields; ++b) s.p0.block(b * k, b * k, k, k) = pen;
 
   // Held-out weighted SSE for every (lambda, fold): fit on M_all - M_g, predict
   // fold g via ds_g^T ds_g - 2 theta^T rhs_g + theta^T M_g theta.
@@ -335,6 +355,7 @@ GlsResult cv_finish(const std::vector<Eigen::MatrixXd>& mf,
 
   // Final fit on all pixels at the CV-selected lambda.
   GlsResult best = solve_at(s, lambda_grid[best_i]);
+  if (!fit_background) pad_zero_background(best, k);
   best.lambda_grid = lambda_grid;
   best.gcv_curve = std::move(curve);  // holds the CV-error curve here
   return best;
@@ -349,27 +370,29 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const ThinPlateBasis& basis,
                        const std::vector<double>& lambda_grid,
                        const std::vector<int>& group, int n_groups,
-                       int warm_start) {
+                       int warm_start, bool fit_background) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_cv: lambda_grid is empty");
   const int n = static_cast<int>(points.rows());
   if (n_groups < 2 || static_cast<int>(group.size()) != n)
-    return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid);
+    return solve_gls_gcv(points, target, weights, bn, basis, lambda_grid,
+                         fit_background);
 
   const int nc = static_cast<int>(bn.cols());
   const Eigen::MatrixXd d = basis.design(points);  // N x k
   const int k = static_cast<int>(d.cols());
-  const int p = (nc + 1) * k;
+  const int n_fields = fit_background ? nc + 1 : nc;
+  const int p = n_fields * k;
 
   // Whitened design Xs = W^{1/2} X and target ds = W^{1/2} y (see assemble()).
   // Xs is an N x P matrix rebuilt every IRLS pass; building it serially was ~19%
-  // of the GLS solve. The nc+1 column blocks are independent (block c is D scaled
-  // row-wise by sqrt(w)*B_c, the trailing block by sqrt(w) alone), so build them
-  // in parallel.
+  // of the GLS solve. The n_fields column blocks are independent (block c is D scaled
+  // row-wise by sqrt(w)*B_c, the trailing background block -- omitted when
+  // fit_background is false -- by sqrt(w) alone), so build them in parallel.
   const Eigen::ArrayXd sw = weights.array().sqrt();
   Eigen::MatrixXd xs(n, p);
 #pragma omp parallel for schedule(static)
-  for (int c = 0; c <= nc; ++c) {
+  for (int c = 0; c < n_fields; ++c) {
     const Eigen::ArrayXd col =
         (c < nc) ? (bn.col(c).array() * sw).eval() : sw;
     xs.block(0, c * k, n, k) = (d.array().colwise() * col).matrix();
@@ -446,7 +469,7 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
   }
 
   return cv_finish(mf, rf, ysq, n_groups, basis, n, nc, k, lambda_grid,
-                   warm_start);
+                   warm_start, fit_background);
 }
 
 GlsResult solve_gls_cv_stamped(
@@ -456,15 +479,15 @@ GlsResult solve_gls_cv_stamped(
     const Eigen::Ref<const Eigen::MatrixXd>& stamp_design,
     const std::vector<int>& stamp_id, const std::vector<int>& stamp_fold,
     const ThinPlateBasis& basis, const std::vector<double>& lambda_grid,
-    int n_groups, int warm_start) {
+    int n_groups, int warm_start, bool fit_background) {
   if (lambda_grid.empty())
     throw std::runtime_error("solve_gls_cv_stamped: lambda_grid is empty");
   const int n = static_cast<int>(target.size());
   const int nc = static_cast<int>(bn.cols());
-  const int nf = nc + 1;
+  const int n_fields = fit_background ? nc + 1 : nc;
   const int k = static_cast<int>(stamp_design.cols());
   const int ns = static_cast<int>(stamp_design.rows());
-  const int p = nf * k;
+  const int p = n_fields * k;
   if (weights.size() != n || bn.rows() != n ||
       static_cast<int>(stamp_id.size()) != n)
     throw std::runtime_error("solve_gls_cv_stamped: row counts disagree");
@@ -472,11 +495,12 @@ GlsResult solve_gls_cv_stamped(
     throw std::runtime_error("solve_gls_cv_stamped: stamp_fold size mismatch");
 
   // Per-stamp moments (the only O(N) pass): A_s = Σ_{i∈s} w_i B_i B_i^T with
-  // B_i = [bn_i, 1] (nf), r_s = Σ w_i t_i B_i, and ds2_s = Σ w_i t_i^2.
-  std::vector<Eigen::MatrixXd> a_stamp(ns, Eigen::MatrixXd::Zero(nf, nf));
-  std::vector<Eigen::VectorXd> r_stamp(ns, Eigen::VectorXd::Zero(nf));
+  // B_i = [bn_i, (1 if fit_background)] (n_fields), r_s = Σ w_i t_i B_i, and
+  // ds2_s = Σ w_i t_i^2.
+  std::vector<Eigen::MatrixXd> a_stamp(ns, Eigen::MatrixXd::Zero(n_fields, n_fields));
+  std::vector<Eigen::VectorXd> r_stamp(ns, Eigen::VectorXd::Zero(n_fields));
   std::vector<double> ds2(ns, 0.0);
-  Eigen::VectorXd b(nf);
+  Eigen::VectorXd b(n_fields);
   for (int i = 0; i < n; ++i) {
     const int s = stamp_id[i];
     if (s < 0 || s >= ns)
@@ -484,7 +508,7 @@ GlsResult solve_gls_cv_stamped(
     const double wi = weights(i);
     const double ti = target(i);
     for (int c = 0; c < nc; ++c) b(c) = bn(i, c);
-    b(nc) = 1.0;
+    if (fit_background) b(nc) = 1.0;
     a_stamp[s].selfadjointView<Eigen::Lower>().rankUpdate(b, wi);
     r_stamp[s].noalias() += (wi * ti) * b;
     ds2[s] += wi * ti * ti;
@@ -508,8 +532,8 @@ GlsResult solve_gls_cv_stamped(
       const Eigen::VectorXd d = stamp_design.row(s).transpose();
       const Eigen::MatrixXd dd = d * d.transpose();  // k x k, rank-1
       const Eigen::MatrixXd& as = a_stamp[s];
-      for (int c = 0; c < nf; ++c) {
-        for (int cp = 0; cp < nf; ++cp)
+      for (int c = 0; c < n_fields; ++c) {
+        for (int cp = 0; cp < n_fields; ++cp)
           m.block(c * k, cp * k, k, k).noalias() += as(c, cp) * dd;
         r.segment(c * k, k).noalias() += r_stamp[s](c) * d;
       }
@@ -519,7 +543,7 @@ GlsResult solve_gls_cv_stamped(
   }
 
   return cv_finish(mf, rf, ysq, n_groups, basis, n, nc, k, lambda_grid,
-                   warm_start);
+                   warm_start, fit_background);
 }
 
 }  // namespace delta

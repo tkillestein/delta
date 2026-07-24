@@ -210,6 +210,7 @@ def solve_gls(
     weights: NDArray[np.float64],
     bn: NDArray[np.float64],
     lam: float,
+    fit_background: bool = ...,
 ) -> GlsResult:
     """Penalised GLS at fixed lambda over the factorized A&L model."""
 
@@ -220,6 +221,7 @@ def solve_gls_gcv(
     weights: NDArray[np.float64],
     bn: NDArray[np.float64],
     lambda_grid: NDArray[np.float64],
+    fit_background: bool = ...,
 ) -> GlsResult:
     """Penalised GLS selecting lambda by GCV over lambda_grid."""
 
@@ -232,6 +234,7 @@ def solve_gls_cv(
     lambda_grid: NDArray[np.float64],
     group: NDArray[np.int32],
     n_groups: int,
+    fit_background: bool = ...,
 ) -> GlsResult:
     """Penalised GLS selecting lambda by k-fold group cross-validation."""
 
@@ -267,13 +270,15 @@ def fit_kernel(
     clip_iterations: int = ...,
     min_stamps: int = ...,
     cv_folds: int = ...,
+    fit_background: bool = ...,
     science_var: NDArray[np.float32] | None = ...,
     reference_var: NDArray[np.float32] | None = ...,
     science_mask: NDArray[np.uint8] | None = ...,
     reference_mask: NDArray[np.uint8] | None = ...,
 ) -> KernelFit:
     """Fit the matching kernel + background via penalised GLS with per-stamp
-    sigma clipping. The returned dict adds reduced_chi2, n_stamps_total/used/
+    sigma clipping. fit_background=False skips the differential-background
+    field. The returned dict adds reduced_chi2, n_stamps_total/used/
     rejected and per-stamp stamp_x/stamp_y/stamp_chi2/stamp_accepted."""
 
 def photometric_scale(

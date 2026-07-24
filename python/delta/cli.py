@@ -216,6 +216,23 @@ def subtract(
         Direction,
         typer.Option("--direction", help="Which image to convolve (auto = the sharper one)."),
     ] = Direction.auto,
+    fit_background: Annotated[
+        bool,
+        typer.Option(
+            "--fit-background/--no-fit-background",
+            help="Jointly fit a differential-background spatial field. Disable if the inputs "
+            "already have matched sky levels (e.g. background-subtracted upstream) -- an "
+            "unconstrained background otherwise tends to overfit small/galaxy-dominated frames.",
+        ),
+    ] = True,
+    min_stamps_per_knot: Annotated[
+        float,
+        typer.Option(
+            "--min-stamps-per-knot",
+            help="Cap thin-plate knots-per-axis to sqrt(n_stamps / this), so a sparsely-"
+            "detected frame can't over-fit a fine spatial grid. <= 0 disables the cap.",
+        ),
+    ] = 1.0,
     # -- post-processing ---------------------------------------------------
     decorrelate: Annotated[
         bool, typer.Option("--decorrelate/--no-decorrelate", help="ZOGY-style noise decorrelation.")
@@ -278,6 +295,8 @@ def subtract(
         threshold_sigma=threshold_sigma,
         max_stamps=max_stamps,
         saturation=saturation,
+        fit_background=fit_background,
+        min_stamps_per_knot=min_stamps_per_knot,
         decorrelate=decorrelate,
         score=score,
         block=block,

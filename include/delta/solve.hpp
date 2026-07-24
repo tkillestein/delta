@@ -30,11 +30,19 @@ struct GlsResult {
 //   target  : (N)    image being matched to (science or reference)
 //   weights : (N)    inverse-variance weights (W = diag(weights))
 //   bn      : (N, nc) per-pixel basis-convolved template values B_n
+//
+// `fit_background` (default true) includes the trailing background field in the
+// design. When false the background is not fit at all (not fixed-then-fit, simply
+// absent from the normal equations); `theta` is still returned at the full
+// `(nc+1)*k` length documented above with its background block set to zero, so
+// callers that reconstruct the model from `theta` do not need to special-case
+// this -- the background field just evaluates to zero everywhere.
 GlsResult solve_gls(const Eigen::Ref<const Eigen::MatrixXd>& points,
                     const Eigen::Ref<const Eigen::VectorXd>& target,
                     const Eigen::Ref<const Eigen::VectorXd>& weights,
                     const Eigen::Ref<const Eigen::MatrixXd>& bn,
-                    const ThinPlateBasis& basis, double lambda);
+                    const ThinPlateBasis& basis, double lambda,
+                    bool fit_background = true);
 
 // As above but selecting lambda by minimising GCV over `lambda_grid`.
 GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
@@ -42,7 +50,8 @@ GlsResult solve_gls_gcv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                         const Eigen::Ref<const Eigen::VectorXd>& weights,
                         const Eigen::Ref<const Eigen::MatrixXd>& bn,
                         const ThinPlateBasis& basis,
-                        const std::vector<double>& lambda_grid);
+                        const std::vector<double>& lambda_grid,
+                        bool fit_background = true);
 
 // Select lambda by k-fold *group* cross-validation rather than GCV. `group[i]`
 // assigns pixel i to a fold (0..n_groups-1); folds should be whole stamps so the
@@ -67,7 +76,7 @@ GlsResult solve_gls_cv(const Eigen::Ref<const Eigen::MatrixXd>& points,
                        const ThinPlateBasis& basis,
                        const std::vector<double>& lambda_grid,
                        const std::vector<int>& group, int n_groups,
-                       int warm_start = -1);
+                       int warm_start = -1, bool fit_background = true);
 
 // Per-stamp factorised group-CV solve (SPEC §3.2-3.3 approximation). Stamps are
 // small (≈30 px) relative to the knot spacing (which sets the field length-scale),
@@ -92,6 +101,6 @@ GlsResult solve_gls_cv_stamped(
     const Eigen::Ref<const Eigen::MatrixXd>& stamp_design,
     const std::vector<int>& stamp_id, const std::vector<int>& stamp_fold,
     const ThinPlateBasis& basis, const std::vector<double>& lambda_grid,
-    int n_groups, int warm_start = -1);
+    int n_groups, int warm_start = -1, bool fit_background = true);
 
 }  // namespace delta

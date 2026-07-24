@@ -260,3 +260,55 @@ def test_write_fits_provenance(tmp_path):
     # Caller-supplied extra_cards, e.g. input paths / invocation, from the CLI.
     assert header["DLTSCI"] == "sci.fits"
     assert "delta subtract" in header["DLTCMD"]
+
+
+def _few_stars_pair(n_stars, h=180, w=180, seed=0, sig_ref=1.6, sig_sci=1.6, bg=100.0):
+    """A sparse point-source field (few detections, no differential background) --
+    the regime issue #54 reports: a small/galaxy-dominated frame where only a
+    handful of stamps clear the detection threshold."""
+    rng = np.random.default_rng(seed)
+    margin = 25
+    pos = rng.uniform(margin, min(h, w) - margin, size=(n_stars, 2))
+    ref, _ = _stars(h, w, pos, total=20000.0, sigma=sig_ref)
+    sci, _ = _stars(h, w, pos, total=20000.0, sigma=sig_sci)
+    ref = ref + bg + rng.normal(0, 3.0, (h, w))
+    sci = sci + bg + rng.normal(0, 3.0, (h, w))
+    return ref.astype(np.float32), sci.astype(np.float32)
+
+
+def test_fit_background_false_zeroes_background_field():
+    # With matched (zero differential) sky levels, disabling the background fit
+    # must not change the difference image meaningfully, and the background block
+    # of theta must be exactly zero (issue #54: an unconstrained background field
+    # otherwise tends to overfit a sparsely-sampled/small frame).
+    ref, sci = _few_stars_pair(6, seed=2)
+    kw = dict(n_knots=4, stamp_radius=10, threshold_sigma=5.0)
+    on = delta.subtract(sci, ref, gain=2.0, **kw)
+    off = delta.subtract(sci, ref, gain=2.0, fit_background=False, **kw)
+
+    k = off.solution.knots.shape[0]
+    nc = off.solution.n_components
+    assert off.solution.theta.shape == ((nc + 1) * k,)
+    np.testing.assert_array_equal(off.solution.theta[nc * k :], 0.0)
+
+    # Both fits stay well-behaved -- dropping the (unneeded, here) background
+    # block must not blow up the fit.
+    assert np.all(np.isfinite(off.difference))
+    assert off.solution.reduced_chi2 < 5.0
+    assert on.solution.reduced_chi2 < 5.0
+
+
+def test_min_stamps_per_knot_caps_sparse_frame_knots():
+    # A handful of stamps can't constrain a fine knot grid; the cap should pull
+    # the requested 6x6 grid down. Disabling the cap (<= 0) keeps the full grid.
+    ref, sci = _few_stars_pair(4, seed=3)
+    capped = delta.Subtractor(
+        n_knots=6, stamp_radius=8, threshold_sigma=5.0, min_stamps_per_knot=2.0
+    ).fit(sci, ref, gain=2.0)
+    uncapped = delta.Subtractor(
+        n_knots=6, stamp_radius=8, threshold_sigma=5.0, min_stamps_per_knot=0.0
+    ).fit(sci, ref, gain=2.0)
+
+    assert uncapped.knots.shape[0] == 36
+    assert capped.knots.shape[0] < 36
+    assert capped.knots.shape[0] >= 9  # floors at 3x3

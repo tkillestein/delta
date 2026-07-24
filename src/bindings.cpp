@@ -465,10 +465,10 @@ nb::dict gls_result_to_dict(const delta::GlsResult& r) {
 nb::dict solve_gls(const Eigen::MatrixXd& knots, const Eigen::MatrixXd& points,
                    const Eigen::VectorXd& target,
                    const Eigen::VectorXd& weights, const Eigen::MatrixXd& bn,
-                   double lam) {
+                   double lam, bool fit_background) {
   const delta::ThinPlateBasis basis(knots);
   return gls_result_to_dict(
-      delta::solve_gls(points, target, weights, bn, basis, lam));
+      delta::solve_gls(points, target, weights, bn, basis, lam, fit_background));
 }
 
 // Penalised GLS selecting lambda by GCV over `lambda_grid`.
@@ -477,12 +477,13 @@ nb::dict solve_gls_gcv(const Eigen::MatrixXd& knots,
                        const Eigen::VectorXd& target,
                        const Eigen::VectorXd& weights,
                        const Eigen::MatrixXd& bn,
-                       const Eigen::VectorXd& lambda_grid) {
+                       const Eigen::VectorXd& lambda_grid,
+                       bool fit_background) {
   const delta::ThinPlateBasis basis(knots);
   const std::vector<double> grid(lambda_grid.data(),
                                  lambda_grid.data() + lambda_grid.size());
   return gls_result_to_dict(
-      delta::solve_gls_gcv(points, target, weights, bn, basis, grid));
+      delta::solve_gls_gcv(points, target, weights, bn, basis, grid, fit_background));
 }
 
 // As solve_gls_gcv but selecting lambda by k-fold group cross-validation; `group`
@@ -491,13 +492,15 @@ nb::dict solve_gls_cv(const Eigen::MatrixXd& knots, const Eigen::MatrixXd& point
                       const Eigen::VectorXd& target,
                       const Eigen::VectorXd& weights, const Eigen::MatrixXd& bn,
                       const Eigen::VectorXd& lambda_grid,
-                      InArray1D<std::int32_t> group, int n_groups) {
+                      InArray1D<std::int32_t> group, int n_groups,
+                      bool fit_background) {
   const delta::ThinPlateBasis basis(knots);
   const std::vector<double> grid(lambda_grid.data(),
                                  lambda_grid.data() + lambda_grid.size());
   const std::vector<int> grp(group.data(), group.data() + group.size());
   return gls_result_to_dict(
-      delta::solve_gls_cv(points, target, weights, bn, basis, grid, grp, n_groups));
+      delta::solve_gls_cv(points, target, weights, bn, basis, grid, grp, n_groups,
+                          -1, fit_background));
 }
 
 // ---- subtract (full-frame spatially-varying subtraction) -------------------
@@ -581,7 +584,7 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
                     double beta, int n_max,
                     const Eigen::VectorXd& lambda_grid, int radius,
                     double clip_sigma, int clip_iterations, int min_stamps,
-                    int cv_folds,
+                    int cv_folds, bool fit_background,
                     std::optional<InArray<float>> science_var,
                     std::optional<InArray<float>> reference_var,
                     std::optional<InArray<std::uint8_t>> science_mask,
@@ -600,7 +603,8 @@ nb::dict fit_kernel(InArray<float> science, InArray<float> reference,
   delta::timing::clear();
   const delta::KernelFit fit =
       delta::fit_kernel(sci, ref, spatial, basis, sx, sy, stamp_radius, grid,
-                        clip_sigma, clip_iterations, min_stamps, cv_folds);
+                        clip_sigma, clip_iterations, min_stamps, cv_folds,
+                        fit_background);
 
   nb::dict out = gls_result_to_dict(fit.gls);
   out["timing"] = timing_dict();
@@ -891,13 +895,16 @@ NB_MODULE(_core, m) {
         "Evaluate a fitted TPS field at points: design(points) @ coeffs.");
 
   m.def("solve_gls", &solve_gls, "knots"_a, "points"_a, "target"_a, "weights"_a,
-        "bn"_a, "lam"_a,
-        "Penalised GLS at fixed lambda over the factorized A&L model.");
+        "bn"_a, "lam"_a, "fit_background"_a = true,
+        "Penalised GLS at fixed lambda over the factorized A&L model. "
+        "fit_background=False drops the background field (theta's background "
+        "block comes back zeroed).");
   m.def("solve_gls_gcv", &solve_gls_gcv, "knots"_a, "points"_a, "target"_a,
-        "weights"_a, "bn"_a, "lambda_grid"_a,
+        "weights"_a, "bn"_a, "lambda_grid"_a, "fit_background"_a = true,
         "Penalised GLS selecting lambda by GCV over lambda_grid.");
   m.def("solve_gls_cv", &solve_gls_cv, "knots"_a, "points"_a, "target"_a,
         "weights"_a, "bn"_a, "lambda_grid"_a, "group"_a, "n_groups"_a,
+        "fit_background"_a = true,
         "Penalised GLS selecting lambda by k-fold group cross-validation "
         "(group = fold id per pixel); gcv_curve holds the CV-error curve.");
 
@@ -913,12 +920,14 @@ NB_MODULE(_core, m) {
         "stamp_x"_a, "stamp_y"_a, "stamp_radius"_a, "beta"_a, "n_max"_a,
         "lambda_grid"_a, "radius"_a = 0, "clip_sigma"_a = 4.0,
         "clip_iterations"_a = 5, "min_stamps"_a = 5, "cv_folds"_a = 0,
+        "fit_background"_a = true,
         "science_var"_a = nb::none(), "reference_var"_a = nb::none(),
         "science_mask"_a = nb::none(), "reference_mask"_a = nb::none(),
         "Fit the matching kernel + background from stamp pixels via penalised "
-        "GLS, with iterative per-stamp sigma clipping. Returns the solver result "
-        "plus component_sums, n_pixels, per-stamp chi^2 and goodness-of-fit "
-        "diagnostics (reduced_chi2, n_stamps_used/total/rejected).");
+        "GLS, with iterative per-stamp sigma clipping. fit_background=False "
+        "skips the differential-background field entirely. Returns the solver "
+        "result plus component_sums, n_pixels, per-stamp chi^2 and "
+        "goodness-of-fit diagnostics (reduced_chi2, n_stamps_used/total/rejected).");
   m.def("photometric_scale", &photometric_scale, "knots"_a, "theta"_a,
         "component_sums"_a, "height"_a, "width"_a,
         "Per-pixel photometric scale field sum_n a_n(x,y) S_n, shape (H,W).");

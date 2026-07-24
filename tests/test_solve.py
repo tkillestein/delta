@@ -147,3 +147,54 @@ def test_gcv_fixed_lambda_matches_solve_gls():
     np.testing.assert_allclose(single["theta"], via_gcv["theta"], rtol=1e-9)
     np.testing.assert_allclose(single["gcv"], via_gcv["gcv"], rtol=1e-9)
     np.testing.assert_allclose(single["effective_dof"], via_gcv["effective_dof"], rtol=1e-9)
+
+
+def test_fit_background_false_zeroes_background_block_and_matches_reduced_design():
+    # fit_background=False must (a) return theta at the documented (nc+1)*k length
+    # with the trailing k-block exactly zero, and (b) match a solve against a
+    # design with the background block dropped entirely (not just fixed at zero).
+    knots = delta.grid_knots(0.0, 0.0, 80.0, 80.0, 4, 4)
+    k = knots.shape[0]
+    rng = np.random.default_rng(9)
+    n = 500
+    points = rng.uniform(0, 80, size=(n, 2))
+    bn = rng.standard_normal((n, 3))
+    x_full = _build_design(knots, points, bn)
+    x_nobg = x_full[:, : 3 * k]  # drop the background block
+    theta_true = rng.standard_normal(x_nobg.shape[1])
+    target = x_nobg @ theta_true + 0.05 * rng.standard_normal(n)
+    weights = rng.uniform(0.5, 2.0, n)
+
+    res = delta.solve_gls(knots, points, target, weights, bn, lam=1e-6, fit_background=False)
+    assert res["theta"].shape == (4 * k,)
+    np.testing.assert_array_equal(res["theta"][3 * k :], 0.0)
+
+    ref = np.linalg.lstsq(
+        x_nobg.T @ (weights[:, None] * x_nobg) + 1e-6 * np.eye(3 * k),
+        x_nobg.T @ (weights * target),
+        rcond=None,
+    )[0]
+    np.testing.assert_allclose(res["theta"][: 3 * k], ref, rtol=1e-4, atol=1e-4)
+
+
+def test_fit_background_false_gcv_and_cv_also_zero_background():
+    knots = delta.grid_knots(0.0, 0.0, 80.0, 80.0, 4, 4)
+    k = knots.shape[0]
+    rng = np.random.default_rng(10)
+    n = 400
+    points = rng.uniform(0, 80, size=(n, 2))
+    bn = rng.standard_normal((n, 2))
+    grid = np.logspace(-6, 6, 13)
+    target = rng.standard_normal(n)
+    weights = np.ones(n)
+
+    gcv = delta.solve_gls_gcv(knots, points, target, weights, bn, grid, fit_background=False)
+    assert gcv["theta"].shape == (3 * k,)
+    np.testing.assert_array_equal(gcv["theta"][2 * k :], 0.0)
+
+    group = (np.arange(n) % 5).astype(np.int32)
+    cv = delta.solve_gls_cv(
+        knots, points, target, weights, bn, grid, group, 5, fit_background=False
+    )
+    assert cv["theta"].shape == (3 * k,)
+    np.testing.assert_array_equal(cv["theta"][2 * k :], 0.0)

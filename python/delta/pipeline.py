@@ -41,6 +41,8 @@ _CONFIG_KEYS = frozenset(
         "min_stamps",
         "cv_folds",
         "spatial_scale",
+        "min_stamps_per_knot",
+        "fit_background",
         "decorrelate",
         "score",
         "source_catalog",
@@ -285,6 +287,8 @@ class Subtractor:
         min_stamps: int = 5,
         cv_folds: int = 5,
         spatial_scale: float | None = None,
+        min_stamps_per_knot: float = 1.0,
+        fit_background: bool = True,
         decorrelate: bool = False,
         score: bool = False,
         source_catalog: bool = True,
@@ -322,6 +326,21 @@ class Subtractor:
         # placed no finer than `spatial_scale` pixels apart (a coarse spatial
         # basis can't over-fit small-scale structure). None keeps `n_knots`.
         self.spatial_scale = spatial_scale
+        # A second, independent knot-count guard: a sparsely-populated frame (few
+        # detections -- a small or galaxy-dominated field where only a handful of
+        # clumps clear threshold) can't constrain a fine knot grid, whatever
+        # `spatial_scale` says. Caps knots-per-axis to sqrt(n_stamps /
+        # min_stamps_per_knot) so both the kernel's spatial fields and the
+        # differential background stay identifiable instead of overfitting
+        # whatever structure happens to sit under the sparse stamps (issue #54).
+        # <= 0 disables the cap.
+        self.min_stamps_per_knot = min_stamps_per_knot
+        # Jointly fits a differential-background spatial field by default (SPEC
+        # §3.3). Set False to skip it -- e.g. when the caller's own pipeline
+        # already matches sky levels upstream, so there is no real differential
+        # background left to fit and it otherwise absorbs whatever spatial
+        # structure (a bright host galaxy, in particular) sits under the stamps.
+        self.fit_background = fit_background
         self.decorrelate = decorrelate
         self.score = score
         # Source catalog from the score image (SPEC §3.7), built by default
@@ -348,6 +367,8 @@ class Subtractor:
             "DLTMINST": self.min_stamps,
             "DLTCVF": self.cv_folds,
             "DLTSSCL": self.spatial_scale if self.spatial_scale is not None else 0.0,
+            "DLTMSPK": self.min_stamps_per_knot,
+            "DLTFITBG": self.fit_background,
             "DLTDECOR": self.decorrelate,
             "DLTSCORE": self.score,
             "DLTSCAT": self.source_catalog,
@@ -446,6 +467,17 @@ class Subtractor:
             nkx = int(np.clip(round((w - 1) / self.spatial_scale) + 1, 3, self.n_knots))
             nky = int(np.clip(round((h - 1) / self.spatial_scale) + 1, 3, self.n_knots))
             logger.debug("spatial_scale={:.0f}px -> {}x{} knots", self.spatial_scale, nkx, nky)
+        if self.min_stamps_per_knot > 0:
+            cap = max(3, int(np.floor(np.sqrt(n_stamps / self.min_stamps_per_knot))))
+            if cap < nkx or cap < nky:
+                logger.debug(
+                    "{} stamps -> knot cap {} per axis (min_stamps_per_knot={})",
+                    n_stamps,
+                    cap,
+                    self.min_stamps_per_knot,
+                )
+            nkx = min(nkx, cap)
+            nky = min(nky, cap)
         knots = _core.grid_knots(0.0, 0.0, w - 1.0, h - 1.0, nkx, nky)
         stamp_x = np.ascontiguousarray(sel["x"], dtype=np.int32)
         stamp_y = np.ascontiguousarray(sel["y"], dtype=np.int32)
@@ -466,6 +498,7 @@ class Subtractor:
                 clip_iterations=self.clip_iterations,
                 min_stamps=self.min_stamps,
                 cv_folds=self.cv_folds,
+                fit_background=self.fit_background,
                 science_var=tvar,
                 reference_var=cvar,
                 science_mask=tmask,
@@ -820,7 +853,8 @@ def subtract(science, reference, **kwargs) -> DiffResult:
     Configuration keywords (``n_max``, ``beta``, ``n_knots``, ``stamp_radius``,
     ``threshold_sigma``, ``max_stamps``, ``saturation``, ``bright_mask``,
     ``lambda_grid``, ``clip_sigma``, ``clip_iterations``, ``min_stamps``, ``cv_folds``,
-    ``spatial_scale``, ``decorrelate``, ``score``, ``block``, ``rescale_variance``)
+    ``spatial_scale``, ``min_stamps_per_knot``, ``fit_background``, ``decorrelate``,
+    ``score``, ``block``, ``rescale_variance``)
     are split from the per-call inputs
     (``science_var``, ``reference_var``, ``science_mask``, ``reference_mask``,
     ``gain``, ``read_noise``, ``catalog``, ``direction``).
